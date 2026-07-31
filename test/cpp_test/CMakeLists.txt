@@ -96,6 +96,10 @@ else()
 endif()
 set(PYTHON_DIR "python$ENV{PYTHON_VERSION}")
 set(PYTHON_LIB_DIR "/usr/local/${PYTHON_DIR}/lib/python3.11/site-packages")
+set(ASCEND_CANN_INCLUDE_NAME $ENV{VCPKG_TARGET_TRIPLET})
+if("$ENV{VCPKG_TARGET_TRIPLET}" MATCHES "x64-linux")
+  set(ASCEND_CANN_INCLUDE_NAME "x86_64-linux")
+endif()
 
 # Common include directories/compile options/link options/libraries
 set(COMMON_INCLUDE_DIRS
@@ -103,7 +107,7 @@ set(COMMON_INCLUDE_DIRS
     "${INCLUDE_BASE_DIR}/aclnn"
     "${INCLUDE_BASE_DIR}/aclnn/op_dev"
     "${INCLUDE_BASE_DIR}/platform"
-    "${ASCEND_PATH}/$ENV{VCPKG_TARGET_TRIPLET}/include/exe_graph/runtime"
+    "${ASCEND_PATH}/${ASCEND_CANN_INCLUDE_NAME}/include/exe_graph/runtime"
     "${PYTHON_LIB_DIR}/torch/include/torch/csrc/api/include"
     "${PYTHON_LIB_DIR}/torch_npu/include"
     "${PYTHON_LIB_DIR}/torch/include"
