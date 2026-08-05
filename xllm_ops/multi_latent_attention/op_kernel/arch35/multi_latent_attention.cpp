@@ -23,7 +23,7 @@ using XllmOps::MlaArch35::MLADecoderAiv;
 // arch35 (A5 / ascend950 / DAV_3510) implementation entry point.
 // This function contains the full TilingKey dispatch logic using
 // runtime ASCEND_IS_AIC / ASCEND_IS_AIV detection.
-__attribute__((noinline)) __aicore__ void mla_arch35_entry(
+__attribute__((noinline)) static __aicore__ void mla_arch35_entry(
     GM_ADDR query, GM_ADDR queryRope, GM_ADDR kvCache,
     GM_ADDR kvCacheRope, GM_ADDR block_tables,
     GM_ADDR contextLens, GM_ADDR mask, GM_ADDR qSeqlen,
