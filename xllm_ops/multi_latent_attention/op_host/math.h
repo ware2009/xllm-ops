@@ -14,7 +14,7 @@ T CeilDiv(T dividend, T divisor)
     return (divisor == 0) ? 0 : ((dividend + divisor - 1) / divisor);
 }
 
-size_t RoundUp(size_t size, size_t divisor)
+inline size_t RoundUp(size_t size, size_t divisor)
 {
     if (divisor == 0 || (size + divisor - 1) < size) {
         printf("divisor is 0 or (size + divisor - 1) < size");
@@ -23,7 +23,7 @@ size_t RoundUp(size_t size, size_t divisor)
     return (size + divisor - 1) / divisor * divisor;
 }
 
-size_t RoundDown(size_t size, size_t divisor)
+inline size_t RoundDown(size_t size, size_t divisor)
 {
     if (divisor == 0) {
         return size;
@@ -31,7 +31,7 @@ size_t RoundDown(size_t size, size_t divisor)
     return size / divisor * divisor;
 }
 
-void SetRandseeds(uint32_t &randseed)
+inline void SetRandseeds(uint32_t &randseed)
 {
     if (randseed == 0xffffffff) {
         struct timeval tv;
