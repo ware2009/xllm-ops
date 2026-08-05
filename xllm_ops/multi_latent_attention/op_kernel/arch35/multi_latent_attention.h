@@ -96,6 +96,7 @@ public:
         __gm__ uint8_t *__restrict__ tiling_para_gm)
     {
         // TODO: A5 Cube SetArgs implementation
+        
     }
 
     __aicore__ __attribute__((always_inline)) inline void Run()
