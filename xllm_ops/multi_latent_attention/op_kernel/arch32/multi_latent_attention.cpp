@@ -20,7 +20,7 @@ limitations under the License.
 // arch32 (A2/A3) implementation entry point.
 // This function contains the full TilingKey dispatch logic using
 // compile-time #ifdef __DAV_C220_CUBE__ / __DAV_C220_VEC__ detection.
-__attribute__((noinline)) void mla_arch32_entry(
+__attribute__((noinline)) __aicore__ void mla_arch32_entry(
     GM_ADDR query, GM_ADDR queryRope, GM_ADDR kvCache,
     GM_ADDR kvCacheRope, GM_ADDR block_tables,
     GM_ADDR contextLens, GM_ADDR mask, GM_ADDR qSeqlen,
