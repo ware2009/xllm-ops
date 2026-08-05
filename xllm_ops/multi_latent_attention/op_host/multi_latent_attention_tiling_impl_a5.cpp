@@ -23,6 +23,8 @@ limitations under the License.
 #include "math.h"
 #include "tiling/platform/platform_ascendc.h"
 
+#if defined(CATLASS_ARCH) && (CATLASS_ARCH == 3510)
+
 namespace AtbOps {
 
 // ============================================================================
@@ -351,3 +353,5 @@ ge::graphStatus MLATilingA5(gert::TilingContext *context)
 }
 
 } // namespace AtbOps
+
+#endif // CATLASS_ARCH == 3510

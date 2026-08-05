@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef MLA_TILING_IMPL_A5_H
 #define MLA_TILING_IMPL_A5_H
 
+#if defined(CATLASS_ARCH) && (CATLASS_ARCH == 3510)
+
 #include "multi_latent_attention_tiling_dependency.h"
 #include "mla.h"
 #include "exe_graph/runtime/tiling_context.h"
@@ -42,5 +44,7 @@ ge::graphStatus GetMLATilingParamA5(OpParam::MLA param, const MLAInfo &mmInfo,
     uint32_t &blockDim, uint32_t *tilingParam, uint64_t tilingParamSize);
 
 } // namespace AtbOps
+
+#endif // CATLASS_ARCH == 3510
 
 #endif // MLA_TILING_IMPL_A5_H
