@@ -202,30 +202,10 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     sed -i 's/using HcclOpParam = HcclOpResParam;/using HcclOpParam = HcclOpResParamCustom;/g' "$TARGET_FILE"
     sed -i 's/(HcclRankRelationResV2 \*)/(HcclRankRelationResV2Custom *)/g' "$TARGET_FILE"
 
-    TARGET_DIR="$SCRIPT_DIR/mc2/dispatch_ffn_combine_bf16/op_kernel/utils/"
-    TARGET_FILE="$TARGET_DIR/$(basename "$HCCL_STRUCT_FILE_PATH")"
-    cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
-    sed -i 's/struct HcclOpResParam {/struct HcclOpResParamCustom {/g' "$TARGET_FILE"
-    sed -i 's/struct HcclRankRelationResV2 {/struct HcclRankRelationResV2Custom {/g' "$TARGET_FILE"
-    sed -i 's/using HcclOpParam = HcclOpResParam;/using HcclOpParam = HcclOpResParamCustom;/g' "$TARGET_FILE"
-    sed -i 's/(HcclRankRelationResV2 \*)/(HcclRankRelationResV2Custom *)/g' "$TARGET_FILE"
-
-    TARGET_DIR="$SCRIPT_DIR/mc2/dispatch_ffn_combine_w4_a8/op_kernel/utils/"
-    TARGET_FILE="$TARGET_DIR/$(basename "$HCCL_STRUCT_FILE_PATH")"
-    cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
-    sed -i 's/struct HcclOpResParam {/struct HcclOpResParamCustom {/g' "$TARGET_FILE"
-    sed -i 's/struct HcclRankRelationResV2 {/struct HcclRankRelationResV2Custom {/g' "$TARGET_FILE"
-    sed -i 's/using HcclOpParam = HcclOpResParam;/using HcclOpParam = HcclOpResParamCustom;/g' "$TARGET_FILE"
-    sed -i 's/(HcclRankRelationResV2 \*)/(HcclRankRelationResV2Custom *)/g' "$TARGET_FILE"
-
-    # for dispatch_normal and combine_normal
-    TARGET_DIR="$SCRIPT_DIR/mc2/moe_dispatch_normal/op_kernel/utils/"
-    cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
-
-    TARGET_DIR="$SCRIPT_DIR/mc2/moe_combine_normal/op_kernel/utils/"
-    echo "$TARGET_DIR"
-    cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
-    
+    # NOTE: dispatch_ffn_combine_bf16, dispatch_ffn_combine_w4_a8,
+    #       moe_dispatch_normal, moe_combine_normal directories do not exist
+    #       in this repo. The cp/sed blocks for them have been removed to
+    #       avoid "No such file or directory" build errors.
     CUSTOM_OPS_ARRAY=(
         "sparse_flash_attention"
         "moe_init_routing_custom"
