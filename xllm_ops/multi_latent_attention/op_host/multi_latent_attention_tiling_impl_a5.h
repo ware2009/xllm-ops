@@ -33,7 +33,8 @@ namespace AtbOps {
 // 2. Tile size 扩大：TILING_BLOCKSIZE_CALC=25 填充 256（GEMM1/GEMM2 tile 从 128 提升到 256）
 // 3. Workspace 重估：A5 tile 256 后 WORKSPACE_BLOCK_SIZE_DB 相应调整
 // 4. 新增 A5 专用 tiling 字段：TILING_BLOCKSIZE_CALC（索引25）填充 embed_split_size_qk/v
-// 5. TilingKey 编码简化：A5 仅支持 3 种 dataType（HALF/BF16/INT8），无 kNz/ring
+// 5. TilingKey 编码简化：A5 支持 3 种 dataType（HALF/BF16/INT8），无 kNz/ring
+//    注：当前优先适配 BF16，INT8 路径 L1 buffer 已保留，待 BF16 端到端验证后启用
 // ============================================================================
 
 // A5 Tiling 主入口

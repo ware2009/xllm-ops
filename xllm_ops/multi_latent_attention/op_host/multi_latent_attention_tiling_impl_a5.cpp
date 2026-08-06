@@ -16,7 +16,6 @@ limitations under the License.
 #include <numeric>
 #include <algorithm>
 #include "multi_latent_attention_tiling_impl_a5.h"
-#include "multi_latent_attention_tiling_impl.h"
 #include "mla.h"
 #include "exe_graph/runtime/tiling_context.h"
 #include "common.h"
@@ -336,11 +335,12 @@ ge::graphStatus MLATilingA5(gert::TilingContext *context)
 
     // ========================================================================
     // A5 TilingKey 编码
-    // A5 简化：仅 dataType(0-2)，无 kNz/ring 位
+    // A5 支持 dataType(0-2: HALF/BF16/INT8)，无 kNz/ring 位
     // A3: dataType + (kNz << 4) + (mtpTp1Flag << 2) + (isRing << 5)
+    // 注：当前优先适配 BF16，INT8 路径 L1 buffer 已保留，待 BF16 端到端验证后启用
     // ============================================================================
     uint32_t dataType = static_cast<uint32_t>(mmInfo.type);
-    // A5: 确保 dataType 映射到 0-2（A5 不支持 INT8_BF16=3）
+    // A5: 确保 dataType 映射到 0-2（暂不支持 INT8_BF16=3，降级为 INT8）
     if (dataType > A5_NUM2) {
         dataType = A5_NUM2; // 降级为 INT8
     }
