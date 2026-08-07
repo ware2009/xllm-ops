@@ -769,6 +769,106 @@ private:
         m = RoundUp<16>(ctx.row_num);
     }
 
+    // 公共函数：将 Q 主体数据从 GM 搬运到 L1（ND→NZ 格式转换）
+    // 覆盖三种场景：
+    //   1. cur_q_seqlen == 1 → gm_to_l1 单矩阵搬运
+    //   2. cur_q_seqlen > 1 && q_heads < 128 → DataCopy 批量多矩阵搬运
+    //   3. cur_q_seqlen > 1 && q_heads >= 128 → for循环逐token搬运（规避 stride 位宽限制）
+    __aicore__ __attribute__((always_inline)) inline void LoadQMainFromGMToL1(
+        AscendC::LocalTensor<IN_DTYPE> &l1_dst,
+        AscendC::GlobalTensor<IN_DTYPE> &gm_src,
+        uint64_t src_offset,
+        uint32_t cur_q_seqlen,
+        uint32_t cur_head_num)
+    {
+        if (cur_q_seqlen == 1) {
+            gm_to_l1<ArchType::ASCEND_V220, IN_DTYPE, DataFormat::ND, DataFormat::NZ>(
+                l1_dst,
+                gm_src[src_offset],
+                cur_head_num,                     // nValue
+                RoundUp<16>(cur_head_num),        // dstNzC0Stride
+                0,                                // dstNzMatrixStride, unused
+                512,                              // dValue
+                0,                                // dstNzMatrixStride, unused
+                512                               // srcDValue
+            );
+        } else {
+            if (q_heads < 128) {
+                AscendC::DataCopy(
+                    l1_dst,
+                    gm_src[src_offset],
+                    AscendC::Nd2NzParams(
+                        cur_q_seqlen,                            // ndNum
+                        cur_head_num,                            // nValue
+                        512,                                     // dValue
+                        512 * q_heads,                           // srcNdMatrixStride
+                        512,                                     // srcDValue
+                        RoundUp<16>(cur_head_num * cur_q_seqlen), // dstNzC0Stride
+                        cur_q_seqlen,                            // dstNzNStride
+                        16                                       // dstNzMatrixStride
+                    )
+                );
+            } else {
+                for (uint32_t ii = 0; ii < cur_q_seqlen; ii++) {
+                    AscendC::DataCopy(
+                        l1_dst[ii * 16], // offset one datablock
+                        gm_src[src_offset + ii * q_heads * 512],
+                        AscendC::Nd2NzParams(
+                            1,                                      // ndNum
+                            cur_head_num,                           // nValue
+                            512,                                    // dValue
+                            0,                                      // srcNdMatrixStride
+                            512,                                    // srcDValue
+                            RoundUp<16>(cur_q_seqlen * cur_head_num), // dstNzC0Stride
+                            cur_q_seqlen,                            // dstNzNStride
+                            16                                       // dstNzMatrixStride
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    // 公共函数：将 Q Rope 数据从 GM 搬运到 L1（ND→NZ 格式转换）
+    // INT8 场景：用 gm_to_l1 搬到独立的 l1q_rope_buf_addr_tensor
+    // 非INT8 场景：用 DataCopy 搬到 l1q_buf_addr_tensor 的 Q 主体之后
+    __aicore__ __attribute__((always_inline)) inline void LoadQRopeFromGMToL1(
+        AscendC::LocalTensor<IN_DTYPE> &l1_q,
+        AscendC::LocalTensor<IN_ROPE_DTYPE> &l1_q_rope,
+        AscendC::GlobalTensor<IN_ROPE_DTYPE> &gm_src,
+        uint64_t src_offset,
+        uint32_t cur_q_seqlen,
+        uint32_t cur_head_num)
+    {
+        if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
+            gm_to_l1<ArchType::ASCEND_V220, IN_ROPE_DTYPE, DataFormat::ND, DataFormat::NZ>(
+                l1_q_rope,
+                gm_src[src_offset],
+                cur_head_num,                     // nValue
+                RoundUp<16>(cur_head_num),        // dstNzC0Stride
+                0,                                // dstNzMatrixStride, unused
+                64,                               // dValue
+                0,                                // dstNzMatrixStride, unused
+                64                                // srcDValue
+            );
+        } else {
+            AscendC::DataCopy(
+                l1_q[RoundUp<16>(cur_head_num * cur_q_seqlen) * 512],
+                gm_src[src_offset],
+                AscendC::Nd2NzParams(
+                    cur_head_num,                              // ndNum
+                    cur_q_seqlen,                              // nValue
+                    64,                                        // dValue
+                    64,                                        // srcNdMatrixStride
+                    64 * q_heads,                              // srcDValue
+                    RoundUp<16>(cur_head_num * cur_q_seqlen),  // dstNzC0Stride
+                    1,                                         // dstNzNStride
+                    16 * cur_q_seqlen                          // dstNzMatrixStride
+                )
+            );
+        }
+    }
+
     __aicore__ __attribute__((always_inline)) inline void LoadQData(MLAContext &ctx)
     {
         uint32_t cur_q_seqlen = ctx.cur_q_seqlen;
@@ -777,81 +877,65 @@ private:
         uint64_t q_rope_offset = ctx.q_rope_offset;
 
         // copy Q
-        if (cur_q_seqlen == 1) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_DTYPE, DataFormat::ND, DataFormat::NZ>(
-                l1q_buf_addr_tensor,
-                q_gm_tensor[q_offset],
-                cur_head_num,        // nValue
-                RoundUp<16>(cur_head_num),// dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                512,                   // dValue
-                0,                     // dstNzMatrixStride, unused
-                512                   // srcDValue
-            );
-        } else {
-            if (q_heads < 128) {
-                AscendC::DataCopy(
-                    l1q_buf_addr_tensor,
-                    q_gm_tensor[q_offset],
-                    AscendC::Nd2NzParams(
-                        cur_q_seqlen,                // ndNum
-                        cur_head_num,                 // nValue
-                        512,                            // dValue
-                        512 * q_heads,        // srcNdMatrixStride
-                        512,    // srcDValue
-                        RoundUp<16>(cur_head_num * cur_q_seqlen), // dstNzC0Stride
-                        cur_q_seqlen,                   // dstNzNStride
-                        16             // dstNzMatrixStride
-                    )
-                );
-            } else {
-                for (uint32_t ii = 0; ii < cur_q_seqlen; ii++) {
-                    AscendC::DataCopy(
-                        l1q_buf_addr_tensor[ii * 16], // offset one datablock
-                        q_gm_tensor[q_offset + ii * q_heads * 512],
-                        AscendC::Nd2NzParams(
-                            1,                // ndNum
-                            cur_head_num,                 // nValue
-                            512,                            // dValue
-                            0,        // srcNdMatrixStride
-                            512,    // srcDValue
-                            RoundUp<16>(cur_q_seqlen * cur_head_num), // dstNzC0Stride
-                            cur_q_seqlen,                   // dstNzNStride
-                            16             // dstNzMatrixStride
-                        )
-                    );
-                }
-            }
-        }
-        if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_ROPE_DTYPE, DataFormat::ND, DataFormat::NZ>(
-                l1q_rope_buf_addr_tensor,
-                q_rope_gm_tensor[q_rope_offset],
-                cur_head_num,        // nValue
-                RoundUp<16>(cur_head_num),// dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                64,                   // dValue
-                0,                     // dstNzMatrixStride, unused
-                64                   // srcDValue
-            );
-        } else {
-            AscendC::DataCopy(
-                l1q_buf_addr_tensor[RoundUp<16>(cur_head_num * cur_q_seqlen) * 512],
-                q_rope_gm_tensor[q_rope_offset],
-                AscendC::Nd2NzParams(
-                    cur_head_num,                // ndNum, 32
-                    cur_q_seqlen,                 // nValue, 4
-                    64,                            // dValue
-                    64,                 // srcNdMatrixStride
-                    64 * q_heads,                            // srcDValue
-                    RoundUp<16>(cur_head_num * cur_q_seqlen),    // dstNzC0Stride
-                    1,                              // dstNzNStride
-                    16 * cur_q_seqlen             // dstNzMatrixStride
-                )
-            );
-        }
+        LoadQMainFromGMToL1(l1q_buf_addr_tensor, q_gm_tensor, q_offset, cur_q_seqlen, cur_head_num);
+        LoadQRopeFromGMToL1(l1q_buf_addr_tensor, l1q_rope_buf_addr_tensor, q_rope_gm_tensor, q_rope_offset, cur_q_seqlen, cur_head_num);
         SET_FLAG(MTE2, MTE1, EVENT_ID0);
         WAIT_FLAG(MTE2, MTE1, EVENT_ID0);
+    }
+
+    // 公共函数：将 KV 主体数据从 GM 搬运到 L1
+    // ND_FORMAT 场景：ND→NZ 格式转换（gm_to_l1<ND, NZ>）
+    // INT8 / 非INT8 NZ 场景：NZ→NZ 格式搬运（gm_to_l1<NZ, NZ>）
+    template <typename DTYPE>
+    __aicore__ __attribute__((always_inline)) inline void LoadKVMainFromGMToL1(
+        AscendC::LocalTensor<DTYPE> &l1_dst,
+        AscendC::GlobalTensor<DTYPE> &gm_src,
+        uint32_t n_value,           // 实际行数
+        uint32_t dst_nz_c0_stride,  // L1 对齐行数（dstNzC0Stride）
+        uint32_t d_value,           // 列数（512）
+        uint32_t src_d_value,       // GM 行 stride（ND场景为stride_kv，NZ场景为0）
+        bool is_nd_to_nz)           // true=ND→NZ, false=NZ→NZ
+    {
+        if (is_nd_to_nz) {
+            gm_to_l1<ArchType::ASCEND_V220, DTYPE, DataFormat::ND, DataFormat::NZ>(
+                l1_dst,
+                gm_src,
+                n_value,                // nValue
+                dst_nz_c0_stride,       // dstNzC0Stride
+                0,                      // dstNzMatrixStride, unused
+                d_value,                // dValue
+                0,                      // dstNzMatrixStride, unused
+                src_d_value             // srcDValue
+            );
+        } else {
+            gm_to_l1<ArchType::ASCEND_V220, DTYPE, DataFormat::NZ, DataFormat::NZ>(
+                l1_dst,
+                gm_src,
+                n_value,                // nValue
+                dst_nz_c0_stride,       // dstNzC0Stride
+                0,                      // dstNzMatrixStride, unused
+                d_value,                // dValue
+                0,                      // dstNzMatrixStride, unused
+                0                       // srcDValue (NZ→NZ always 0)
+            );
+        }
+    }
+
+    // 公共函数：将 KV Rope 数据从 GM 搬运到 L1
+    // ND_FORMAT 场景：ND→NZ 格式转换（gm_to_l1<ND, NZ>），d_value=64, src_d_value=stride_kv_rope
+    // INT8 / 非INT8 NZ 场景：NZ→NZ 格式搬运（gm_to_l1<NZ, NZ>），d_value=64, src_d_value=0
+    template <typename DTYPE>
+    __aicore__ __attribute__((always_inline)) inline void LoadKVRopeFromGMToL1(
+        AscendC::LocalTensor<DTYPE> &l1_dst,
+        AscendC::GlobalTensor<DTYPE> &gm_src,
+        uint32_t n_value,           // 实际行数
+        uint32_t dst_nz_c0_stride,  // L1 对齐行数（dstNzC0Stride）
+        uint32_t d_value,           // 列数（64）
+        uint32_t src_d_value,       // GM 行 stride（ND场景为stride_kv_rope，NZ场景为0）
+        bool is_nd_to_nz)           // true=ND→NZ, false=NZ→NZ
+    {
+        // 逻辑与 LoadKVMainFromGMToL1 完全一致，仅参数不同（d_value=64）
+        LoadKVMainFromGMToL1(l1_dst, gm_src, n_value, dst_nz_c0_stride, d_value, src_d_value, is_nd_to_nz);
     }
 
     __aicore__ __attribute__((always_inline)) inline void LoadKVData(
@@ -870,75 +954,41 @@ private:
 
         WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);  // wait for v -> L0B
         if constexpr (KInputType == InputFormat::ND_FORMAT) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::ND, DataFormat::NZ>(
+            // 分支1: ND→NZ，K 主体搬到 l1kv_buf，Rope 紧随其后
+            LoadKVMainFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576],
                 k_gm_tensor[kv_offset],
-                qk_n,         // nValue
-                qk_round_n,             // dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                512,            // dValue
-                0,                     // dstNzMatrixStride, unused
-                stride_kv            // srcDValue
-            );
+                qk_n, qk_round_n, 512, stride_kv, true /*ND→NZ*/);
             SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
             WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);  // wait for v -> L0B
-            gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::ND, DataFormat::NZ>(
+            LoadKVRopeFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576 + 512 * qk_round_n],
                 k_rope_gm_tensor[kv_offset_rope],
-                qk_n,         // nValue
-                qk_round_n,             // dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                64,            // dValue
-                0,                     // dstNzMatrixStride, unused
-                stride_kv_rope            // srcDValue
-            );
+                qk_n, qk_round_n, 64, stride_kv_rope, true /*ND→NZ*/);
         } else if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
+            // 分支2: NZ→NZ，K 主体搬到 l1kv_buf(512布局)，Rope 搬到独立 l1kv_rope_buf
+            LoadKVMainFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 512],
                 k_gm_tensor[kv_offset],
-                qk_round_n_l1,         // nValue
-                block_size,         // dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                512,            // dValue
-                0,                     // dstNzMatrixStride, unused
-                0            // srcDValue
-            );
+                qk_round_n_l1, block_size, 512, 0, false /*NZ→NZ*/);
             SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
             WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);  // wait for v -> L0B
-            gm_to_l1<ArchType::ASCEND_V220, IN_ROPE_DTYPE, DataFormat::NZ, DataFormat::NZ>(
+            LoadKVRopeFromGMToL1(
                 l1kv_rope_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64],
                 k_rope_gm_tensor[kv_offset_rope],
-                qk_round_n,         // nValue
-                block_size,             // dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                64,            // dValue
-                0,                     // dstNzMatrixStride, unused
-                0            // srcDValue
-            );
+                qk_round_n, block_size, 64, 0, false /*NZ→NZ*/);
         } else {
-            gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
+            // 分支3: NZ→NZ，K 主体搬到 l1kv_buf(576布局)，Rope 紧随其后
+            LoadKVMainFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576],
                 k_gm_tensor[kv_offset],
-                qk_round_n,         // nValue
-                block_size,             // dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                512,            // dValue
-                0,                     // dstNzMatrixStride, unused
-                0            // srcDValue
-            );
-
+                qk_round_n, block_size, 512, 0, false /*NZ→NZ*/);
             SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
             WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);  // wait for v -> L0B
-            gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
+            LoadKVRopeFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576 + 512 * qk_round_n],
                 k_rope_gm_tensor[kv_offset_rope],
-                qk_round_n,         // nValue
-                block_size,             // dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                64,            // dValue
-                0,                     // dstNzMatrixStride, unused
-                0            // srcDValue
-            );
+                qk_round_n, block_size, 64, 0, false /*NZ→NZ*/);
         }
 
         SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag + 2);
@@ -1340,68 +1390,8 @@ private:
         m = RoundUp<16>(row_num);
 
         // copy Q
-        if (cur_q_seqlen == 1) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_DTYPE, DataFormat::ND, DataFormat::NZ>(
-                l1q_buf_addr_tensor,
-                q_gm_tensor[q_offset],
-                cur_head_num,        // nValue
-                RoundUp<16>(cur_head_num),// dstNzC0Stride
-                0,                     // dstNzMatrixStride, unused
-                512,                   // dValue
-                0,                     // dstNzMatrixStride, unused
-                512                   // srcDValue
-            );
-        } else {
-            if (q_heads < 128) {
-                AscendC::DataCopy(
-                    l1q_buf_addr_tensor,
-                    q_gm_tensor[q_offset],
-                    AscendC::Nd2NzParams(
-                        cur_q_seqlen,                // ndNum
-                        cur_head_num,                 // nValue
-                        512,                            // dValue
-                        512 * q_heads,        // srcNdMatrixStride
-                        512,    // srcDValue
-                        RoundUp<16>(cur_head_num * cur_q_seqlen), // dstNzC0Stride
-                        cur_q_seqlen,                   // dstNzNStride
-                        16             // dstNzMatrixStride
-                    )
-                );
-            } else {
-                for (uint32_t ii =0; ii < cur_q_seqlen; ii++) {
-                    AscendC::DataCopy(
-                        l1q_buf_addr_tensor[ii * 16], // offset one datablock
-                        q_gm_tensor[q_offset + ii * q_heads * 512],
-                        AscendC::Nd2NzParams(
-                            1,                // ndNum
-                            cur_head_num,                 // nValue
-                            512,                            // dValue
-                            0,        // srcNdMatrixStride
-                            512,    // srcDValue
-                            RoundUp<16>(cur_q_seqlen * cur_head_num), // dstNzC0Stride
-                            cur_q_seqlen,                   // dstNzNStride
-                            16             // dstNzMatrixStride
-                        )
-                    );
-                }
-            }
-
-        }
-
-        AscendC::DataCopy(
-            l1q_buf_addr_tensor[RoundUp<16>(cur_head_num * cur_q_seqlen) * 512],
-            q_rope_gm_tensor[q_rope_offset],
-            AscendC::Nd2NzParams(
-                cur_head_num,                // ndNum, 32
-                cur_q_seqlen,                 // nValue, 4
-                64,                            // dValue
-                64,                 // srcNdMatrixStride
-                64 * q_heads,                            // srcDValue
-                RoundUp<16>(cur_head_num * cur_q_seqlen),    // dstNzC0Stride
-                1,                              // dstNzNStride
-                16 * cur_q_seqlen             // dstNzMatrixStride
-            )
-        );
+        LoadQMainFromGMToL1(l1q_buf_addr_tensor, q_gm_tensor, q_offset, cur_q_seqlen, cur_head_num);
+        LoadQRopeFromGMToL1(l1q_buf_addr_tensor, l1q_rope_buf_addr_tensor, q_rope_gm_tensor, q_rope_offset, cur_q_seqlen, cur_head_num);
 
         SET_FLAG(MTE2, MTE1, EVENT_ID0);
         WAIT_FLAG(MTE2, MTE1, EVENT_ID0);
