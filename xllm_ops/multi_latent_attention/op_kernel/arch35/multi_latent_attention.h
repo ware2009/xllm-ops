@@ -19,6 +19,8 @@ limitations under the License.
 #include "kernel_operator.h"
 #include "multi_latent_attention_npu.h"
 #include "multi_latent_attention_bs.h"
+#include "../common/common_utils.h"
+#include "../common/common.h"
 
 #ifdef __CCE_KT_TEST__
 #define __aicore__
@@ -118,6 +120,7 @@ constexpr int32_t L0C_FLOAT_BUF_SIZE_A5 = 65536;    // 256K / 4B = 64K elements
 constexpr int32_t L0C_UINT8_BUF_SIZE_A5 = 262144;  // 256 KB
 
 // --- L1 buffer sizes (512 KB, same as A3) ---
+constexpr int32_t L1_UINT8_TOTAL_SIZE_A5 = 524288;  // 512 KB total L1
 constexpr int32_t L1_HALF_BUF_SIZE_A5 = 65536;      // 256 * 256
 constexpr int32_t L1_HALF_BUF_SIZE_DECODER_A5 = 16384;  // 128 * 128
 constexpr int32_t L1_KV_HALF_BUF_SIZE_A5 = 73728;   // 2 * 128 * 256
@@ -325,20 +328,39 @@ public:
         o_tmp_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm2CopyType *>(o_temp_gm));
         block_tables_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(block_tables_in_gm));
 
-        // --- L1 buffer allocation ---
+        // --- A5 Buffer initialization (TPipe + TBuf + InitBuffer + Get) ---
+        // L1: single TBuf<TPosition::A1>, sub-tensors via tensor[offset]
+        // L0A/L0B/L0C: separate TBuf, single Get (no offset needed)
+        pipe.InitBuffer(l1TBuf, L1_UINT8_TOTAL_SIZE_A5);   // L1 = 512KB
+        pipe.InitBuffer(l0aTBuf, L0AB_UINT8_BUF_SIZE_A5);  // L0A = 32KB
+        pipe.InitBuffer(l0bTBuf, L0AB_UINT8_BUF_SIZE_A5);  // L0B = 32KB
+        pipe.InitBuffer(l0cTBuf, L0C_UINT8_BUF_SIZE_A5);   // L0C = 256KB
+
+        // Get base tensors (required before sub-buffer offset assignment)
+        auto l1BaseTensor = l1TBuf.Get<uint8_t>();
+        l0a_buf_tensor = l0aTBuf.Get<IN_DTYPE>();
+        l0b_buf_tensor = l0bTBuf.Get<IN_DTYPE>();
+        // L0C is shared between mm1 and mm2 via ping-pong offset
+        auto l0cBaseTensor = l0cTBuf.Get<uint8_t>();
+        // L0C total size in bytes = L0C_UINT8_BUF_SIZE_A5; each half for ping-pong
+        constexpr uint32_t l0cHalfSize = L0C_UINT8_BUF_SIZE_A5 / 2;
+        mm1_l0c_buf_tensor = l0cBaseTensor.ReinterpretCast<mm1OutputType>();
+        mm2_l0c_buf_tensor = l0cBaseTensor[l0cHalfSize].ReinterpretCast<mm2OutputType>();
+
+        // --- L1 sub-buffer allocation ---
         // BF16/HALF path: Q+RoPE contiguous in l1q, KV+RoPE contiguous in l1kv
         // INT8 path: separate Q/Q_rope/KV/KV_rope buffers with dedicated offsets
         if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
             s_rope_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(s_rope_out_gm));
-            l1q_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_DTYPE>(0);
-            l1q_rope_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_ROPE_DTYPE>(128 * 512 * 2);
-            l1kv_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_DTYPE>(128 * 576 * 2);
-            l1kv_rope_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_ROPE_DTYPE>(128 * 576 * 2 + 128 * 512 * 2);
-            l1p_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_DTYPE>(128 * 576 * 6);
+            l1q_buf_addr_tensor = l1BaseTensor.ReinterpretCast<IN_DTYPE>();
+            l1q_rope_buf_addr_tensor = l1BaseTensor[128 * 512 * 2].ReinterpretCast<IN_ROPE_DTYPE>();
+            l1kv_buf_addr_tensor = l1BaseTensor[128 * 576 * 2].ReinterpretCast<IN_KVDTYPE>();
+            l1kv_rope_buf_addr_tensor = l1BaseTensor[128 * 576 * 2 + 128 * 512 * 2].ReinterpretCast<IN_ROPE_DTYPE>();
+            l1p_buf_addr_tensor = l1BaseTensor[128 * 576 * 6].ReinterpretCast<IN_DTYPE>();
         } else {
-            l1q_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_DTYPE>(l1q_buf_addr_offset);
-            l1kv_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_KVDTYPE>(l1kv_buf_addr_offset);
-            l1p_buf_addr_tensor = buf.GetBuffer<BufferType::ASCEND_CB, IN_DTYPE>(l1p_buf_addr_offset);
+            l1q_buf_addr_tensor = l1BaseTensor[l1q_buf_addr_offset].ReinterpretCast<IN_DTYPE>();
+            l1kv_buf_addr_tensor = l1BaseTensor[l1kv_buf_addr_offset].ReinterpretCast<IN_KVDTYPE>();
+            l1p_buf_addr_tensor = l1BaseTensor[l1p_buf_addr_offset].ReinterpretCast<IN_DTYPE>();
         }
 
         // --- Read tiling parameters from GM ---
@@ -439,9 +461,9 @@ public:
         SET_FLAG(FIX, MTE1, EVENT_ID4);
         SET_FLAG(FIX, MTE1, EVENT_ID5);
 
-        // MTE3 -> FIX: MTE3 (UB->L1) releases FixPipe for L0C->UB consumption
-        // (A3 used MTE2->FIX; A5 uses MTE3->FIX)
-        SET_FLAG(MTE3, FIX, EVENT_ID0);
+        // M -> FIX: Scalar releases FixPipe for L0C->UB consumption
+        // (A3 used MTE2->FIX; A5 has no MTE3->FIX, use M->FIX instead)
+        SET_FLAG(M, FIX, EVENT_ID0);
 
         // --- Task loop ---
         uint64_t cur_batch = 0;
@@ -497,7 +519,7 @@ public:
         WAIT_FLAG(FIX, MTE1, EVENT_ID3);
         WAIT_FLAG(FIX, MTE1, EVENT_ID4);
         WAIT_FLAG(FIX, MTE1, EVENT_ID5);
-        WAIT_FLAG(MTE3, FIX, EVENT_ID0);
+        WAIT_FLAG(M, FIX, EVENT_ID0);
         PIPE_BARRIER(ALL);
     }
 
@@ -539,7 +561,7 @@ public:
         SET_FLAG(FIX, MTE1, EVENT_ID3);
         SET_FLAG(FIX, MTE1, EVENT_ID4);
         SET_FLAG(FIX, MTE1, EVENT_ID5);
-        SET_FLAG(MTE3, FIX, EVENT_ID0);
+        SET_FLAG(M, FIX, EVENT_ID0);
 
         // --- Tail optimization setup ---
         uint32_t tail = totalTaskNum % block_num;
@@ -621,7 +643,7 @@ public:
         WAIT_FLAG(FIX, MTE1, EVENT_ID3);
         WAIT_FLAG(FIX, MTE1, EVENT_ID4);
         WAIT_FLAG(FIX, MTE1, EVENT_ID5);
-        WAIT_FLAG(MTE3, FIX, EVENT_ID0);
+        WAIT_FLAG(M, FIX, EVENT_ID0);
         PIPE_BARRIER(ALL);
     }
 
@@ -718,19 +740,30 @@ private:
     const uint32_t l1kv_rope_buf_addr_offset = 278528;
     const uint32_t l1p_buf_addr_offset = 442368;
 
-    // --- L1 buffer tensors ---
-    AsdopsBuffer<ArchType::ASCEND_V220> buf;
+    // --- A5 Buffer management (TPipe + TBuf<TPosition>) ---
+    // A5 replaces A2's AsdopsBuffer<ArchType::ASCEND_V220> with the standard
+    // TPipe + TBuf<TPosition::xxx> pattern. TPosition enum mapping:
+    //   A1=L1, A2=L0A, B2=L0B, CO1=L0C
+    // L1 is a single large TBuf; sub-buffers are carved out via tensor[offset].
+    // L0A/L0B/L0C each get their own TBuf (separate address spaces on A5).
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::A1> l1TBuf;    // L1 unified buffer
+    AscendC::TBuf<AscendC::TPosition::A2> l0aTBuf;   // L0A
+    AscendC::TBuf<AscendC::TPosition::B2> l0bTBuf;    // L0B
+    AscendC::TBuf<AscendC::TPosition::CO1> l0cTBuf;  // L0C (shared by mm1/mm2)
+
+    // L1 sub-tensors (assigned in SetArgs after pipe.InitBuffer)
     AscendC::LocalTensor<IN_DTYPE> l1q_buf_addr_tensor;
     AscendC::LocalTensor<IN_ROPE_DTYPE> l1q_rope_buf_addr_tensor;
     AscendC::LocalTensor<IN_KVDTYPE> l1kv_buf_addr_tensor;
     AscendC::LocalTensor<IN_ROPE_DTYPE> l1kv_rope_buf_addr_tensor;
     AscendC::LocalTensor<IN_DTYPE> l1p_buf_addr_tensor;
 
-    // --- L0A/L0B/L0C tensors ---
-    AscendC::LocalTensor<IN_DTYPE> l0a_buf_tensor = buf.GetBuffer<BufferType::ASCEND_L0A, IN_DTYPE>(0);
-    AscendC::LocalTensor<IN_DTYPE> l0b_buf_tensor = buf.GetBuffer<BufferType::ASCEND_L0B, IN_DTYPE>(0);
-    AscendC::LocalTensor<mm1OutputType> mm1_l0c_buf_tensor = buf.GetBuffer<BufferType::ASCEND_L0C, mm1OutputType>(0);
-    AscendC::LocalTensor<mm2OutputType> mm2_l0c_buf_tensor = buf.GetBuffer<BufferType::ASCEND_L0C, mm2OutputType>(0);
+    // L0A/L0B/L0C tensors (assigned in SetArgs after pipe.InitBuffer)
+    AscendC::LocalTensor<IN_DTYPE> l0a_buf_tensor;
+    AscendC::LocalTensor<IN_DTYPE> l0b_buf_tensor;
+    AscendC::LocalTensor<mm1OutputType> mm1_l0c_buf_tensor;
+    AscendC::LocalTensor<mm2OutputType> mm2_l0c_buf_tensor;
 
     // --- Tiling parameters (read from GM in SetArgs) ---
     uint32_t num_batches{0};
@@ -839,8 +872,12 @@ private:
     UbufAllocA5<BlockFlow> ubufAlloc;
 };
 
+} // namespace MlaArch35
+} // namespace XllmOps
+
 // ============================================================================
 // UbufAllocA5<BlockStack::FOUR_FLOW> — 4-buffer variant for Ring / multi-block
+// (Must be at global scope to match the primary template at line 170)
 // ============================================================================
 template<>
 struct UbufAllocA5<BlockStack::FOUR_FLOW> {
@@ -870,7 +907,5 @@ struct UbufAllocA5<BlockStack::FOUR_FLOW> {
     const uint32_t tv32_ubuf_offset = 10 * UB_UINT8_BLOCK_SIZE_MLA_A5;
 };
 
-} // namespace MlaArch35
-} // namespace XllmOps
 
 #endif // MULTI_LATENT_ATTENTION_ARCH35_H

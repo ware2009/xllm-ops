@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef MLA_TILING_IMPL_A5_H
 #define MLA_TILING_IMPL_A5_H
 
+#include "mla_arch_config.h"  // CMake-generated: defines CATLASS_ARCH=3510 on A5
+
 #if defined(CATLASS_ARCH) && (CATLASS_ARCH == 3510)
 
 #include "multi_latent_attention_tiling_dependency.h"
@@ -36,6 +38,15 @@ namespace AtbOps {
 // 5. TilingKey 编码简化：A5 支持 3 种 dataType（HALF/BF16/INT8），无 kNz/ring
 //    注：当前优先适配 BF16，INT8 路径 L1 buffer 已保留，待 BF16 端到端验证后启用
 // ============================================================================
+
+// Helper functions (defined in multi_latent_attention_tiling_impl.cpp)
+// These are shared between A3 and A5 tiling implementations but not declared
+// in any header, so we declare them here for A5 to link against.
+OpParam::MLA GetParamFromTilingContext(gert::TilingContext *context);
+ge::graphStatus GetTilingKeyTypeBase(MLAInfo &mmInfo, const gert::Tensor *qTensor,
+                                     const gert::Tensor *qRopeTensor);
+ge::graphStatus GetMLAInfo(gert::TilingContext *context, MLAInfo &mmInfo, OpParam::MLA &param);
+uint64_t GetTilingSize(OpParam::MLA param);
 
 // A5 Tiling 主入口
 ge::graphStatus MLATilingA5(gert::TilingContext *context);

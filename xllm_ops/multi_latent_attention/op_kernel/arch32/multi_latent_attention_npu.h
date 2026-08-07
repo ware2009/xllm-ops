@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mixkernels/include/common.h"
+#include "../common/common.h"
 #include "mixkernels/include/common_func.h"
 #include "mixkernels/include/simd.h"
 #include "mixkernels/include/iterator.h"

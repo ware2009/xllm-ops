@@ -52,198 +52,198 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
 
     SetAtomicnone();
     SetMasknorm();
-    if (ASCEND_IS_AIV) {
+    if ASCEND_IS_AIV {
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
-    if (ASCEND_IS_AIC) {
+    if ASCEND_IS_AIC {
         SetPadding<uint64_t>(0);
         SetNdpara(1, 0, 0);
     }
 
     if(TILING_KEY_IS(0)){ // fp16 ND Normal
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(1)) { // bf16 ND Normal
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::ND_FORMAT> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(16)) { // fp16 NZ Normal
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(17)) { // bf16 NZ Normal
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::NZ_FORMAT> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
         }
     } else if(TILING_KEY_IS(4)){ // fp16 ND TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT, true> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half, false, BlockStack::FOUR_FLOW, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(5)) { // bf16 ND TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::ND_FORMAT, true> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, false, BlockStack::FOUR_FLOW, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(20)) { // fp16 NZ TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT, true> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half, false, BlockStack::FOUR_FLOW, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(21)) { // bf16 NZ TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::NZ_FORMAT, true> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, false, BlockStack::FOUR_FLOW, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(32)) { // fp16 ND Ring
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(33)) { // bf16 ND Ring
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::ND_FORMAT> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(48)) { // fp16 NZ Ring
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(49)) { // bf16 NZ Ring
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::NZ_FORMAT> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, true> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(36)) { // fp16 ND Ring TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half, true, BlockStack::FOUR_FLOW> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(37)) { // bf16 ND Ring TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::ND_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, true, BlockStack::FOUR_FLOW> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(52)) { // fp16 NZ Ring TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half, true, BlockStack::FOUR_FLOW> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(53)) { // bf16 NZ Ring TP1
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, __bf16, __bf16, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_BF16_DATA, __bf16, __bf16, true, BlockStack::FOUR_FLOW> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.SetArgs2(lse_gm);
             pa_aiv.RunTP1();
         }
     } else if (TILING_KEY_IS(18)) { // int8_t(IN) fp16(OUT) NZ
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_INT8_DATA, int8_t, half, half, int8_t, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_INT8_DATA, int8_t, half> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
         }
     } else if (TILING_KEY_IS(19)) { // int8_t(IN) bf16(OUT) NZ
-        if (ASCEND_IS_AIC) {
+        if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_INT8_DATA, int8_t, __bf16, __bf16, int8_t, InputFormat::NZ_FORMAT> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.Run();
-        } else if (ASCEND_IS_AIV) {
+        } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_INT8_DATA, int8_t, __bf16> pa_aiv {};
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
