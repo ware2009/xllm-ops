@@ -769,106 +769,11 @@ private:
         m = RoundUp<16>(ctx.row_num);
     }
 
-    // 公共函数：将 Q 主体数据从 GM 搬运到 L1（ND→NZ 格式转换）
-    // 覆盖三种场景：
-    //   1. cur_q_seqlen == 1 → gm_to_l1 单矩阵搬运
-    //   2. cur_q_seqlen > 1 && q_heads < 128 → DataCopy 批量多矩阵搬运
-    //   3. cur_q_seqlen > 1 && q_heads >= 128 → for循环逐token搬运（规避 stride 位宽限制）
-    __aicore__ __attribute__((always_inline)) inline void LoadQMainFromGMToL1(
-        AscendC::LocalTensor<IN_DTYPE> &l1_dst,
-        AscendC::GlobalTensor<IN_DTYPE> &gm_src,
-        uint64_t src_offset,
-        uint32_t cur_q_seqlen,
-        uint32_t cur_head_num)
-    {
-        if (cur_q_seqlen == 1) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_DTYPE, DataFormat::ND, DataFormat::NZ>(
-                l1_dst,
-                gm_src[src_offset],
-                cur_head_num,                     // nValue
-                RoundUp<16>(cur_head_num),        // dstNzC0Stride
-                0,                                // dstNzMatrixStride, unused
-                512,                              // dValue
-                0,                                // dstNzMatrixStride, unused
-                512                               // srcDValue
-            );
-        } else {
-            if (q_heads < 128) {
-                AscendC::DataCopy(
-                    l1_dst,
-                    gm_src[src_offset],
-                    AscendC::Nd2NzParams(
-                        cur_q_seqlen,                            // ndNum
-                        cur_head_num,                            // nValue
-                        512,                                     // dValue
-                        512 * q_heads,                           // srcNdMatrixStride
-                        512,                                     // srcDValue
-                        RoundUp<16>(cur_head_num * cur_q_seqlen), // dstNzC0Stride
-                        cur_q_seqlen,                            // dstNzNStride
-                        16                                       // dstNzMatrixStride
-                    )
-                );
-            } else {
-                for (uint32_t ii = 0; ii < cur_q_seqlen; ii++) {
-                    AscendC::DataCopy(
-                        l1_dst[ii * 16], // offset one datablock
-                        gm_src[src_offset + ii * q_heads * 512],
-                        AscendC::Nd2NzParams(
-                            1,                                      // ndNum
-                            cur_head_num,                           // nValue
-                            512,                                    // dValue
-                            0,                                      // srcNdMatrixStride
-                            512,                                    // srcDValue
-                            RoundUp<16>(cur_q_seqlen * cur_head_num), // dstNzC0Stride
-                            cur_q_seqlen,                            // dstNzNStride
-                            16                                       // dstNzMatrixStride
-                        )
-                    );
-                }
-            }
-        }
-    }
+    // === 第一层：LoadQData 编排层 ===
+    // 业务函数（LoadQMainFromGMToL1 / LoadQRopeFromGMToL1 / PlatformSetQLoadComplete）
+    // 已迁移至 bs.h / arch32.h，通过 include 展开
 
-    // 公共函数：将 Q Rope 数据从 GM 搬运到 L1（ND→NZ 格式转换）
-    // INT8 场景：用 gm_to_l1 搬到独立的 l1q_rope_buf_addr_tensor
-    // 非INT8 场景：用 DataCopy 搬到 l1q_buf_addr_tensor 的 Q 主体之后
-    __aicore__ __attribute__((always_inline)) inline void LoadQRopeFromGMToL1(
-        AscendC::LocalTensor<IN_DTYPE> &l1_q,
-        AscendC::LocalTensor<IN_ROPE_DTYPE> &l1_q_rope,
-        AscendC::GlobalTensor<IN_ROPE_DTYPE> &gm_src,
-        uint64_t src_offset,
-        uint32_t cur_q_seqlen,
-        uint32_t cur_head_num)
-    {
-        if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-            gm_to_l1<ArchType::ASCEND_V220, IN_ROPE_DTYPE, DataFormat::ND, DataFormat::NZ>(
-                l1_q_rope,
-                gm_src[src_offset],
-                cur_head_num,                     // nValue
-                RoundUp<16>(cur_head_num),        // dstNzC0Stride
-                0,                                // dstNzMatrixStride, unused
-                64,                               // dValue
-                0,                                // dstNzMatrixStride, unused
-                64                                // srcDValue
-            );
-        } else {
-            AscendC::DataCopy(
-                l1_q[RoundUp<16>(cur_head_num * cur_q_seqlen) * 512],
-                gm_src[src_offset],
-                AscendC::Nd2NzParams(
-                    cur_head_num,                              // ndNum
-                    cur_q_seqlen,                              // nValue
-                    64,                                        // dValue
-                    64,                                        // srcNdMatrixStride
-                    64 * q_heads,                              // srcDValue
-                    RoundUp<16>(cur_head_num * cur_q_seqlen),  // dstNzC0Stride
-                    1,                                         // dstNzNStride
-                    16 * cur_q_seqlen                          // dstNzMatrixStride
-                )
-            );
-        }
-    }
-
+    // 业务函数：加载 Q 数据（主体 + Rope）从 GM 到 L1
     __aicore__ __attribute__((always_inline)) inline void LoadQData(MLAContext &ctx)
     {
         uint32_t cur_q_seqlen = ctx.cur_q_seqlen;
@@ -879,64 +784,11 @@ private:
         // copy Q
         LoadQMainFromGMToL1(l1q_buf_addr_tensor, q_gm_tensor, q_offset, cur_q_seqlen, cur_head_num);
         LoadQRopeFromGMToL1(l1q_buf_addr_tensor, l1q_rope_buf_addr_tensor, q_rope_gm_tensor, q_rope_offset, cur_q_seqlen, cur_head_num);
-        SET_FLAG(MTE2, MTE1, EVENT_ID0);
-        WAIT_FLAG(MTE2, MTE1, EVENT_ID0);
+        PlatformSetQLoadComplete();
     }
 
-    // 公共函数：将 KV 主体数据从 GM 搬运到 L1
-    // ND_FORMAT 场景：ND→NZ 格式转换（gm_to_l1<ND, NZ>）
-    // INT8 / 非INT8 NZ 场景：NZ→NZ 格式搬运（gm_to_l1<NZ, NZ>）
-    template <typename DTYPE>
-    __aicore__ __attribute__((always_inline)) inline void LoadKVMainFromGMToL1(
-        AscendC::LocalTensor<DTYPE> &l1_dst,
-        AscendC::GlobalTensor<DTYPE> &gm_src,
-        uint32_t n_value,           // 实际行数
-        uint32_t dst_nz_c0_stride,  // L1 对齐行数（dstNzC0Stride）
-        uint32_t d_value,           // 列数（512）
-        uint32_t src_d_value,       // GM 行 stride（ND场景为stride_kv，NZ场景为0）
-        bool is_nd_to_nz)           // true=ND→NZ, false=NZ→NZ
-    {
-        if (is_nd_to_nz) {
-            gm_to_l1<ArchType::ASCEND_V220, DTYPE, DataFormat::ND, DataFormat::NZ>(
-                l1_dst,
-                gm_src,
-                n_value,                // nValue
-                dst_nz_c0_stride,       // dstNzC0Stride
-                0,                      // dstNzMatrixStride, unused
-                d_value,                // dValue
-                0,                      // dstNzMatrixStride, unused
-                src_d_value             // srcDValue
-            );
-        } else {
-            gm_to_l1<ArchType::ASCEND_V220, DTYPE, DataFormat::NZ, DataFormat::NZ>(
-                l1_dst,
-                gm_src,
-                n_value,                // nValue
-                dst_nz_c0_stride,       // dstNzC0Stride
-                0,                      // dstNzMatrixStride, unused
-                d_value,                // dValue
-                0,                      // dstNzMatrixStride, unused
-                0                       // srcDValue (NZ→NZ always 0)
-            );
-        }
-    }
-
-    // 公共函数：将 KV Rope 数据从 GM 搬运到 L1
-    // ND_FORMAT 场景：ND→NZ 格式转换（gm_to_l1<ND, NZ>），d_value=64, src_d_value=stride_kv_rope
-    // INT8 / 非INT8 NZ 场景：NZ→NZ 格式搬运（gm_to_l1<NZ, NZ>），d_value=64, src_d_value=0
-    template <typename DTYPE>
-    __aicore__ __attribute__((always_inline)) inline void LoadKVRopeFromGMToL1(
-        AscendC::LocalTensor<DTYPE> &l1_dst,
-        AscendC::GlobalTensor<DTYPE> &gm_src,
-        uint32_t n_value,           // 实际行数
-        uint32_t dst_nz_c0_stride,  // L1 对齐行数（dstNzC0Stride）
-        uint32_t d_value,           // 列数（64）
-        uint32_t src_d_value,       // GM 行 stride（ND场景为stride_kv_rope，NZ场景为0）
-        bool is_nd_to_nz)           // true=ND→NZ, false=NZ→NZ
-    {
-        // 逻辑与 LoadKVMainFromGMToL1 完全一致，仅参数不同（d_value=64）
-        LoadKVMainFromGMToL1(l1_dst, gm_src, n_value, dst_nz_c0_stride, d_value, src_d_value, is_nd_to_nz);
-    }
+    // === 第一层：LoadKVData 编排层 ===
+    // 业务函数已迁移至 bs.h / arch32.h
 
     __aicore__ __attribute__((always_inline)) inline void LoadKVData(
         MLAContext &ctx, uint32_t n_idx, uint32_t l1_kv_pingpong_flag)
@@ -952,15 +804,14 @@ private:
         int64_t kv_offset = (int64_t)block_table_id * block_size * stride_kv;
         int64_t kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
 
-        WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);  // wait for v -> L0B
+        PlatformWaitKVLoadReady(l1_kv_pingpong_flag);
         if constexpr (KInputType == InputFormat::ND_FORMAT) {
             // 分支1: ND→NZ，K 主体搬到 l1kv_buf，Rope 紧随其后
             LoadKVMainFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576],
                 k_gm_tensor[kv_offset],
                 qk_n, qk_round_n, 512, stride_kv, true /*ND→NZ*/);
-            SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-            WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);  // wait for v -> L0B
+            PlatformSetKVMainLoadComplete(l1_kv_pingpong_flag);
             LoadKVRopeFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576 + 512 * qk_round_n],
                 k_rope_gm_tensor[kv_offset_rope],
@@ -971,8 +822,7 @@ private:
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 512],
                 k_gm_tensor[kv_offset],
                 qk_round_n_l1, block_size, 512, 0, false /*NZ→NZ*/);
-            SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-            WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);  // wait for v -> L0B
+            PlatformSetKVMainLoadComplete(l1_kv_pingpong_flag);
             LoadKVRopeFromGMToL1(
                 l1kv_rope_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64],
                 k_rope_gm_tensor[kv_offset_rope],
@@ -983,353 +833,101 @@ private:
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576],
                 k_gm_tensor[kv_offset],
                 qk_round_n, block_size, 512, 0, false /*NZ→NZ*/);
-            SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-            WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);  // wait for v -> L0B
+            PlatformSetKVMainLoadComplete(l1_kv_pingpong_flag);
             LoadKVRopeFromGMToL1(
                 l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 576 + 512 * qk_round_n],
                 k_rope_gm_tensor[kv_offset_rope],
                 qk_round_n, block_size, 64, 0, false /*NZ→NZ*/);
         }
 
-        SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag + 2);
+        PlatformSetKVRopeLoadComplete(l1_kv_pingpong_flag);
     }
 
+    // ==================== ComputeQK 三层架构拆分 ====================
+    // === 第一层：QKParams 结构体 ===
+    struct QKParams {
+        uint32_t qk_n;
+        uint32_t qk_round_n;
+        uint32_t qk_round_n_l1;
+        uint64_t hidden_size;
+        uint64_t k_round_n;
+        uint32_t row_num;
+        uint32_t embed_split_size;
+        uint32_t round_embed_split_size;
+        uint32_t q_load_coeff;
+        uint64_t hidden_split_time;
+        uint32_t l1_kv_pingpong_flag;
+    };
+
+    // [QK 第三层平台函数 + 第二层业务函数] 已迁移至 arch32.h / bs.h
+    // （include 指令统一放在 PVParams 结构体之后，确保所有 Params 类型可见）
+
+    // === 第一层：ComputeQK 编排层 ===
     __aicore__ __attribute__((always_inline)) inline void ComputeQK(
         MLAContext &ctx, uint32_t n_idx, uint32_t l1_kv_pingpong_flag)
     {
-        uint32_t qk_n = ctx.qk_n;
-        uint32_t qk_round_n = ctx.qk_round_n;
-        uint32_t qk_round_n_l1 = ctx.qk_round_n_l1;
-        uint64_t hidden_size = ctx.hidden_size;
-        uint64_t k_round_n = ctx.k_round_n;
-        uint32_t row_num = ctx.row_num;
-        // m is class member, use directly
+        QKParams params;
+        InitQKParams(ctx, l1_kv_pingpong_flag, params);
 
-        uint32_t embed_split_size = 128;
-        uint32_t round_embed_split_size = RoundUp<T_BLOCK_SIZE>(embed_split_size);
-        uint32_t q_load_coeff = m;
-
-        uint64_t hidden_split_time = (hidden_size + 128 - 1) / 128;
-        uint64_t embed_split_idx = 0;
-        for (embed_split_idx = 0; embed_split_idx < hidden_split_time; ++embed_split_idx) {
+        for (uint64_t embed_split_idx = 0; embed_split_idx < params.hidden_split_time; ++embed_split_idx) {
             if (embed_split_idx == 4) {
-                embed_split_size = 64;
-                round_embed_split_size = 64;
+                params.embed_split_size = 64;
+                params.round_embed_split_size = 64;
             }
-            WAIT_FLAG(M, MTE1, embed_split_idx % 2);
-
-            for (uint64_t loa_load_idx = 0; loa_load_idx < q_load_coeff / BLOCK_SIZE; ++loa_load_idx) {
-                l1_to_l0_a<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                    l0a_buf_tensor[embed_split_idx % 2 * 16384 + loa_load_idx * round_embed_split_size * BLOCK_SIZE],
-                    l1q_buf_addr_tensor[embed_split_idx * m * 128 + loa_load_idx * T_CUBE_MATRIX_SIZE],
-                    0,
-                    round_embed_split_size / T_BLOCK_SIZE,                                 // repeat
-                    0,
-                    q_load_coeff / BLOCK_SIZE,                            // srcStride
-                    0,
-                    0                                                     // dstStride
-                );
-            }
-
-            SET_FLAG(MTE1, M, embed_split_idx % 2);
-
-            if (embed_split_idx == 0) {
-                WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-            }
-            if (embed_split_idx == 4) {
-                WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag + 2);
-            }
-            WAIT_FLAG(M, MTE1, embed_split_idx % 2 + 2);
-            l1_to_l0_b<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                l0b_buf_tensor[embed_split_idx % 2 * 16384],
-                l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * hidden_size + embed_split_idx * k_round_n * 128],
-                0,
-                round_embed_split_size * k_round_n / T_CUBE_MATRIX_SIZE,  // repeat
-                0,
-                1,                                        // srcStride
-                0,
-                0                                        // dstStride
-            );
-            if (embed_split_idx == 4) {
-                SET_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);
-            }
-            SET_FLAG(MTE1, M, embed_split_idx % 2 + 2);
-            WAIT_FLAG(MTE1, M, embed_split_idx % 2);
-            WAIT_FLAG(MTE1, M, embed_split_idx % 2 + 2);
-            if (embed_split_idx == 0) {
-                WAIT_FLAG(FIX, M, l1_kv_pingpong_flag);
-            }
-            if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-                mmad<ArchType::ASCEND_V220, IN_DTYPE, IN_DTYPE, mm1OutputType, false>(
-                    mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                    l0a_buf_tensor[embed_split_idx % 2 * 16384],
-                    l0b_buf_tensor[embed_split_idx % 2 * 16384],
-                    m,     // m
-                    qk_round_n_l1,  // n
-                    embed_split_size,   // k
-                    embed_split_idx == 0     // cmatrixInitVal
-                );
-            } else {
-                mmad<ArchType::ASCEND_V220, IN_DTYPE, IN_DTYPE, mm1OutputType, false>(
-                    mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                    l0a_buf_tensor[embed_split_idx % 2 * 16384],
-                    l0b_buf_tensor[embed_split_idx % 2 * 16384],
-                    m,     // m
-                    qk_n,  // n
-                    embed_split_size,   // k
-                    embed_split_idx == 0     // cmatrixInitVal
-                );
-            }
-
-            PIPE_BARRIER(M);
-            SET_FLAG(M, MTE1, embed_split_idx % 2);
-            SET_FLAG(M, MTE1, embed_split_idx % 2 + 2);
-
-            // copy S to gm
-            if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-                if (embed_split_idx == 3) {
-                    SET_FLAG(M, FIX, l1_kv_pingpong_flag);
-                    WAIT_FLAG(M, FIX, l1_kv_pingpong_flag);
-
-                    l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, mm1CopyType, mm1OutputType>(
-                        s_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER + (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER / 2],
-                        mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                        m,           // MSize
-                        qk_n,  // NSize
-                        RoundUp<16>(m), // srcStride
-                        qk_round_n  // dstStride_dst_D
-                    );
-                    SET_FLAG(FIX, M, l1_kv_pingpong_flag);
-                }
-            }
-            if (embed_split_idx == 4) {
-                SET_FLAG(M, FIX, l1_kv_pingpong_flag);
-                WAIT_FLAG(M, FIX, l1_kv_pingpong_flag);
-
-                l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, mm1CopyType, mm1OutputType>(
-                    s_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER + (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER / 2],
-                    mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                    m,           // MSize
-                    qk_round_n,  // NSize
-                    RoundUp<16>(m), // srcStride
-                    qk_round_n  // dstStride_dst_D
-                );
-                SET_FLAG(FIX, M, l1_kv_pingpong_flag);
-            }
+            LoadQDataToL0A(params, embed_split_idx, false);
+            LoadKVDataToL0B(params, embed_split_idx, false);
+            ComputeQKMMad(params, embed_split_idx, false);
+            CopyQKResultToGM(params, embed_split_idx, n_idx, false);
         }
-        if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-            embed_split_idx = 4;
-            embed_split_size = 64;
-            round_embed_split_size = 64;
-            WAIT_FLAG(M, MTE1, embed_split_idx % 2);
 
-            for (uint64_t loa_load_idx = 0; loa_load_idx < q_load_coeff / BLOCK_SIZE; ++loa_load_idx) {
-                l1_to_l0_a<ArchType::ASCEND_V220, IN_ROPE_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                    l0a_buf_tensor.template ReinterpretCast<IN_ROPE_DTYPE>()[embed_split_idx % 2 * 16384 * 2 + loa_load_idx * round_embed_split_size * BLOCK_SIZE],
-                    l1q_rope_buf_addr_tensor[loa_load_idx * CUBE_MATRIX_SIZE],
-                    0,
-                    round_embed_split_size / BLOCK_SIZE,                                 // repeat
-                    0,
-                    q_load_coeff / BLOCK_SIZE,                            // srcStride
-                    0,
-                    0                                                     // dstStride
-                );
-            }
-
-            SET_FLAG(MTE1, M, embed_split_idx % 2);
-
-            WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag + 2);
-            WAIT_FLAG(M, MTE1, embed_split_idx % 2 + 2);
-            l1_to_l0_b<ArchType::ASCEND_V220, IN_ROPE_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                l0b_buf_tensor.template ReinterpretCast<IN_ROPE_DTYPE>()[embed_split_idx % 2 * 16384 * 2],
-                l1kv_rope_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64],
-                0,
-                round_embed_split_size * qk_round_n / CUBE_MATRIX_SIZE,  // repeat
-                0,
-                1,                                        // srcStride
-                0,
-                0                                        // dstStride
-            );
-
-            SET_FLAG(MTE1, MTE2, l1_kv_pingpong_flag + 2);
-            SET_FLAG(MTE1, M, embed_split_idx % 2 + 2);
-            WAIT_FLAG(MTE1, M, embed_split_idx % 2);
-            WAIT_FLAG(MTE1, M, embed_split_idx % 2 + 2);
-            if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-                WAIT_FLAG(FIX, M, l1_kv_pingpong_flag);
-            }
-            mmad<ArchType::ASCEND_V220, IN_ROPE_DTYPE, IN_ROPE_DTYPE, float, false>(
-                mm1_l0c_buf_tensor.template ReinterpretCast<float>()[l1_kv_pingpong_flag * 16384],
-                l0a_buf_tensor.template ReinterpretCast<IN_ROPE_DTYPE>()[embed_split_idx % 2 * 16384 * 2],
-                l0b_buf_tensor.template ReinterpretCast<IN_ROPE_DTYPE>()[embed_split_idx % 2 * 16384 * 2],
-                m,     // m
-                qk_n,  // n
-                embed_split_size,   // k
-                1     // cmatrixInitVal
-            );
-            PIPE_BARRIER(M);
-            SET_FLAG(M, MTE1, embed_split_idx % 2);
-            SET_FLAG(M, MTE1, embed_split_idx % 2 + 2);
-
-            SET_FLAG(M, FIX, l1_kv_pingpong_flag);
-            WAIT_FLAG(M, FIX, l1_kv_pingpong_flag);
-            if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-                l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, float, float>(
-                    s_rope_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER + (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER / 2],
-                    mm1_l0c_buf_tensor.template ReinterpretCast<float>()[l1_kv_pingpong_flag * 16384],
-                    m,           // MSize
-                    qk_round_n,  // NSize
-                    RoundUp<16>(m), // srcStride
-                    qk_round_n  // dstStride_dst_D
-                );
-            } else {
-                l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, mm1CopyType, mm1OutputType>(
-                    s_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER + (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER / 2],
-                    mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                    m,           // MSize
-                    qk_round_n,  // NSize
-                    RoundUp<16>(m), // srcStride
-                    qk_round_n  // dstStride_dst_D
-                );
-            }
-            SET_FLAG(FIX, M, l1_kv_pingpong_flag);
-        }
+        ComputeQRope(params, n_idx);
         FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_DECODER);
     }
 
+    // ==================== ComputePV 三层架构拆分 ====================
+    // === 第一层：PVParams 结构体 ===
+    struct PVParams {
+        uint32_t qk_n_2;
+        uint32_t qk_round_n_2;
+        uint32_t qk_round_n_2_l1;
+        uint64_t k_round_n;
+        uint32_t row_num;
+        uint64_t hidden_size;
+        uint32_t l1_kv_pingpong_flag;
+        uint32_t l0_p_pingpong_flag;
+        uint32_t embed_split_size;
+        uint32_t round_embed_split_size;
+        uint32_t l0c_pingpong_flag;
+        uint32_t l0b_pingpong_flag;
+        uint64_t l1kv_offset;
+    };
+
+    // [PV 第三层平台函数 + 第二层业务函数] 已迁移至 arch32.h / bs.h
+    // === 以下 include 第三层和第二层子文件（放在 QKParams/PVParams 之后，确保类型可见）===
+    #include "multi_latent_attention_arch32.h"
+    #include "multi_latent_attention_bs.h"
+
+    // === 第一层：ComputePV 编排层 ===
     __aicore__ __attribute__((always_inline)) inline void ComputePV(
         MLAContext &ctx, uint32_t n_idx)
     {
-        uint32_t qk_n_2 = ctx.qk_n_2;
-        uint32_t qk_round_n_2 = ctx.qk_round_n_2;
-        uint32_t qk_round_n_2_l1 = ctx.qk_round_n_2_l1;
-        uint64_t k_round_n = ctx.k_round_n;
-        uint32_t row_num = ctx.row_num;
-        // m is class member, use directly
-        uint64_t hidden_size = ctx.hidden_size;
+        PVParams params;
+        InitPVParams(ctx, n_idx, params);
 
-        if (n_idx == ctx.n_loop) {
-            qk_n_2 = (ctx.cur_kv_seqlen - (n_idx - 1) * ctx.pp_n_scalar);
-            qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-            qk_round_n_2_l1 = RoundUp<T_BLOCK_SIZE>(qk_n_2);
-        }
-        k_round_n = qk_round_n_2_l1;
-        uint32_t l1_kv_pingpong_flag = (n_idx - 1) % 2;
-        uint32_t l0_p_pingpong_flag = (n_idx - 1) % 2;
-        uint32_t embed_split_size = 128;
-        embed_split_loop_v = 4;
-        uint32_t round_embed_split_size = RoundUp<T_BLOCK_SIZE>(embed_split_size);
         for (uint32_t embed_split_idx = 0; embed_split_idx < embed_split_loop_v; ++embed_split_idx) {
-            uint32_t l0c_pingpong_flag = (n_idx + embed_split_idx) % 2;
-            uint32_t l0b_pingpong_flag = (embed_split_idx + 1) % 2;
-            uint64_t l1kv_offset = embed_split_idx * k_round_n * round_embed_split_size;
-            WAIT_FLAG(M, MTE1, l0b_pingpong_flag + 2);
-            AscendC::LoadData2dTransposeParams loadDataParams;
-            loadDataParams.dstGap = 0;
-            loadDataParams.startIndex = 0;
-            loadDataParams.dstFracGap = 0;
-            if (k_round_n <= round_embed_split_size) { // Nz -> nZ
-                loadDataParams.repeatTimes = round_embed_split_size / T_BLOCK_SIZE;
-                loadDataParams.srcStride = k_round_n / T_BLOCK_SIZE;
-                uint16_t dstGap = sizeof(IN_DTYPE) == 1 ? 1 : 0;
-                loadDataParams.dstGap = dstGap;
-                for (uint32_t l0b_load_idx = 0; l0b_load_idx < k_round_n / T_BLOCK_SIZE; ++l0b_load_idx) {
-                    // along embd dim
-                    AscendC::LoadDataWithTranspose(
-                            l0b_buf_tensor[l0b_pingpong_flag * 16384 + l0b_load_idx * RoundUp<16>(embed_split_size) * T_BLOCK_SIZE],
-                            l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * hidden_size + l1kv_offset + l0b_load_idx * T_BLOCK_SIZE * T_BLOCK_SIZE],
-                            loadDataParams);
-                }
-            } else {
-                for (uint32_t l0b_load_idx = 0; l0b_load_idx < round_embed_split_size / T_BLOCK_SIZE; ++l0b_load_idx) {
-                    // along kv_len_blk dim
-                    loadDataParams.repeatTimes = qk_round_n_2 / T_BLOCK_SIZE;
-                    loadDataParams.srcStride = 1;
-                    loadDataParams.dstGap = round_embed_split_size / BLOCK_SIZE - 1;
-                    AscendC::LoadDataWithTranspose(
-                        l0b_buf_tensor[l0b_pingpong_flag * 16384 + l0b_load_idx * T_BLOCK_SIZE * T_BLOCK_SIZE],
-                        l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * hidden_size + l1kv_offset + l0b_load_idx * qk_round_n_2 * T_BLOCK_SIZE],
-                        loadDataParams);
-                }
-            }
-            if (embed_split_idx == embed_split_loop_v - 1) {
-                SET_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);
-            }
-            // move p from gm to l1
-            uint32_t p_move_head_num = row_num;
+            params.l0c_pingpong_flag = (n_idx + embed_split_idx) % 2;
+            params.l0b_pingpong_flag = (embed_split_idx + 1) % 2;
+            params.l1kv_offset = embed_split_idx * params.k_round_n * params.round_embed_split_size;
+
+            LoadKVTransposeToL0B(params, embed_split_idx);
+
             if (embed_split_idx == 0) {
-                WaitFlagDev(SOFTMAX_READY_DECODER);
-
-                WAIT_FLAG(MTE1, MTE2, EVENT_ID7);
-                gm_to_l1<ArchType::ASCEND_V220, IN_DTYPE, DataFormat::ND, DataFormat::NZ>(
-                    l1p_buf_addr_tensor,
-                    p_gm_tensor[(uint64_t)block_idx * TMP_SIZE * T_BLOCK_OFFSET + ((n_idx - 1) % 2) * TMP_SIZE * T_BLOCK_OFFSET / 2],
-                    p_move_head_num,         // nValue
-                    RoundUp<BLOCK_SIZE>(p_move_head_num),// dstNzC0Stride
-                    0,                     // dstNzMatrixStride, unused
-                    k_round_n,           // dValue
-                    0,                     // dstNzMatrixStride, unused
-                    qk_round_n_2 * 2 / sizeof(IN_DTYPE)           // srcDValue
-                );
-                SET_FLAG(MTE2, MTE1, EVENT_ID7);
-                WAIT_FLAG(MTE2, MTE1, EVENT_ID7);
-                // move p from l1 to l0a
-                WAIT_FLAG(M, MTE1, l0_p_pingpong_flag);
-                uint32_t p_load_coeff = RoundUp<16>(p_move_head_num);
-                if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
-                    l1_to_l0_a<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::NZ, DataFormat::ZZ>(
-                        l0a_buf_tensor[l0_p_pingpong_flag * 16384], l1p_buf_addr_tensor, RoundUp<BLOCK_SIZE>(p_move_head_num),
-                        qk_round_n_2_l1, // repeat
-                        0,
-                        0, // srcStride
-                        0,
-                        0 // dstStride
-                    );
-                } else {
-                    for (uint64_t loa_load_idx = 0; loa_load_idx < p_load_coeff / BLOCK_SIZE; ++loa_load_idx) {
-                        l1_to_l0_a<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                            l0a_buf_tensor[l0_p_pingpong_flag * 16384 + loa_load_idx * qk_round_n_2 * BLOCK_SIZE],
-                            l1p_buf_addr_tensor[loa_load_idx * T_CUBE_MATRIX_SIZE],
-                            0,
-                            qk_round_n_2 / T_BLOCK_SIZE,                                 // repeat
-                            0,
-                            p_load_coeff / BLOCK_SIZE,                               // srcStride
-                            0,
-                            0                                                        // dstStride
-                        );
-                    }
-                }
-                SET_FLAG(MTE1, MTE2, EVENT_ID7);
+                LoadPDataToL0A(params, n_idx);
             }
-            SET_FLAG(MTE1, M, l0b_pingpong_flag);
-            WAIT_FLAG(MTE1, M, l0b_pingpong_flag);
-            WAIT_FLAG(FIX, M, l0c_pingpong_flag);
-            mmad<ArchType::ASCEND_V220, IN_DTYPE, IN_DTYPE, mm2OutputType, false>(
-                mm2_l0c_buf_tensor[l0c_pingpong_flag * 16384],
-                l0a_buf_tensor[l0_p_pingpong_flag * 16384],
-                l0b_buf_tensor[l0b_pingpong_flag * 16384],
-                m,     // m
-                embed_split_size,   // n
-                qk_n_2,  // k
-                1      // cmatrixInitVal
-            );
-            SET_FLAG(M, MTE1, l0b_pingpong_flag + 2);
-            if (embed_split_idx == embed_split_loop_v - 1) {
-                SET_FLAG(M, MTE1, l0_p_pingpong_flag);
-            }
-            SET_FLAG(M, FIX, l0c_pingpong_flag);
-            WAIT_FLAG(M, FIX, l0c_pingpong_flag);
 
-            // copy O to gm
-            l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, mm2CopyType, mm2OutputType>(
-                o_tmp_gm_tensor[(uint64_t)block_idx * TMP_SIZE * 2 + embed_split_idx * round_embed_split_size + ((n_idx - 1) % 2) * TMP_SIZE],
-                mm2_l0c_buf_tensor[l0c_pingpong_flag * 16384],
-                m,        // MSize
-                RoundUp<16>(embed_split_size),  // NSize 32B align
-                RoundUp<16>(m),       // srcStride
-                round_v  // dstStride_dst_D
-            );
-            SET_FLAG(FIX, M, l0c_pingpong_flag);
+            ComputePVMmad(params, embed_split_idx);
+
+            CopyPVResultToGM(params, embed_split_idx, n_idx);
         }
         FftsCrossCoreSync<PIPE_FIX, 2>(UPDATE_READY_DECODER);
     }
