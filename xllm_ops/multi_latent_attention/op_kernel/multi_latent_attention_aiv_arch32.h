@@ -10,6 +10,22 @@
 // 本文件仅被 MLADecoderAiv 类 include，包含 Vector 侧平台同步函数。
 // AIC 侧平台函数在 multi_latent_attention_arch32.h 中。
 
+// 平台函数：非TP1 SoftmaxStage1 前置管道同步
+// 在 SoftmaxStage1 调用之前执行：等待 QK 就绪 + 等待 MTE3→MTE2 管道同步
+__aicore__ __attribute__((always_inline)) inline void PlatformSoftmaxStage1PreSync()
+{
+    WaitFlagDev(QK_READY_DECODER);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID3);
+}
+
+// 平台函数：非TP1 SoftmaxStage1 后置管道同步
+// 在 SoftmaxStage1 调用之后执行：核间同步 + 设置 MTE3→MTE2 管道 flag
+__aicore__ __attribute__((always_inline)) inline void PlatformSoftmaxStage1PostSync()
+{
+    FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_DECODER);
+    SET_FLAG(MTE3, MTE2, EVENT_ID3);
+}
+
 // 平台函数：Vector 非TP1 管道同步初始化（Run 方法头部 9 条 SET_FLAG）
 __aicore__ __attribute__((always_inline)) inline void PlatformInitVectorPipeSync()
 {

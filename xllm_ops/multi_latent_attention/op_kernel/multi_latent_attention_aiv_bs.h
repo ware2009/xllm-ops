@@ -13,7 +13,7 @@
 // ====== 非 TP1 路径：Phase 1 / Phase 2 业务调度 ======
 
 // 业务函数：非TP1 Phase 1 — Softmax Stage1 调度
-// 包含 mask 计算、WaitFlag、SoftmaxStage1 调用（ping-pong）、FftsCrossCoreSync、SET_FLAG
+// 包含 mask 计算、平台同步调用、SoftmaxStage1 调用（ping-pong）
 __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
     VectorContext &ctx, uint32_t n_idx, uint32_t start_kv)
 {
@@ -34,6 +34,7 @@ __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
     uint32_t qk_n = ctx.qk_n;
     uint32_t qk_round_n = ctx.qk_round_n;
 
+    // mask 边界判断
     bool need_mask = false;
     uint32_t mask_start_offset = 0;
     if (n_idx == (n_loop - 2)) {
@@ -46,9 +47,11 @@ __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
         need_mask = true;
         mask_start_offset = (qk_n - 1) * MASK_COLUMNS;
     }
-    WaitFlagDev(QK_READY_DECODER);
-    /* ************ softmax1 stage1  ************* */
-    WAIT_FLAG(MTE3, MTE2, EVENT_ID3);
+
+    // 平台同步：SoftmaxStage1 前置同步（WaitFlagDev + WAIT_FLAG）
+    PlatformSoftmaxStage1PreSync();
+
+    // SoftmaxStage1 调用（ping-pong）
     if (sub_m > 0) {
         if (mask_type == 3) {
             mask_start_offset = mask_offset + n_idx * pp_n_scalar;
@@ -83,9 +86,9 @@ __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
             );
         }
     }
-    FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_DECODER);
 
-    SET_FLAG(MTE3, MTE2, EVENT_ID3);
+    // 平台同步：SoftmaxStage1 后置同步（FftsCrossCoreSync + SET_FLAG）
+    PlatformSoftmaxStage1PostSync();
 }
 
 // 业务函数：非TP1 Phase 2 — Softmax Stage2 调度
