@@ -37,3 +37,35 @@ __aicore__ __attribute__((always_inline)) inline void PlatformWaitVectorPipeSync
     WAIT_FLAG(MTE3, V, EVENT_ID2);
     WAIT_FLAG(V, MTE2, EVENT_ID2);
 }
+
+// 平台函数：Vector TP1 管道同步初始化（RunTP1 方法头部 10 条 SET_FLAG）
+// 与非TP1 相比多出 SET_FLAG(MTE3, MTE2, EVENT_ID1)
+__aicore__ __attribute__((always_inline)) inline void PlatformInitVectorPipeSyncTP1()
+{
+    SET_FLAG(MTE3, V, EVENT_ID0);
+    SET_FLAG(MTE3, MTE2, EVENT_ID0);
+    SET_FLAG(MTE3, MTE2, EVENT_ID1);
+    SET_FLAG(MTE3, MTE2, EVENT_ID2);
+    SET_FLAG(MTE3, MTE2, EVENT_ID3);
+    SET_FLAG(MTE3, MTE2, EVENT_ID4);
+    SET_FLAG(V, MTE2, EVENT_ID4);
+    SET_FLAG(V, MTE2, EVENT_ID0);
+    SET_FLAG(MTE3, V, EVENT_ID2);
+    SET_FLAG(V, MTE2, EVENT_ID2);
+}
+
+// 平台函数：等待 Vector TP1 管道同步完成（RunTP1 方法尾部 10 条 WAIT_FLAG）
+// 与非TP1 相比多出 WAIT_FLAG(MTE3, MTE2, EVENT_ID1)
+__aicore__ __attribute__((always_inline)) inline void PlatformWaitVectorPipeSyncTP1()
+{
+    WAIT_FLAG(MTE3, V, EVENT_ID0);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID0);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID1);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID2);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID3);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID4);
+    WAIT_FLAG(V, MTE2, EVENT_ID0);
+    WAIT_FLAG(V, MTE2, EVENT_ID4);
+    WAIT_FLAG(MTE3, V, EVENT_ID2);
+    WAIT_FLAG(V, MTE2, EVENT_ID2);
+}

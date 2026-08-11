@@ -1134,16 +1134,7 @@ public:
 
     __aicore__ __attribute__((always_inline)) inline void RunTP1()
     {
-        SET_FLAG(MTE3, V, EVENT_ID0);
-        SET_FLAG(MTE3, MTE2, EVENT_ID0);
-        SET_FLAG(MTE3, MTE2, EVENT_ID1);
-        SET_FLAG(MTE3, MTE2, EVENT_ID2);
-        SET_FLAG(MTE3, MTE2, EVENT_ID3);
-        SET_FLAG(MTE3, MTE2, EVENT_ID4);
-        SET_FLAG(V, MTE2, EVENT_ID4);
-        SET_FLAG(V, MTE2, EVENT_ID0);
-        SET_FLAG(MTE3, V, EVENT_ID2);
-        SET_FLAG(V, MTE2, EVENT_ID2);
+        PlatformInitVectorPipeSyncTP1();
 
         uint32_t tail = totalTaskNum % block_num;
         if constexpr (EnableOptimization) {
@@ -1391,18 +1382,177 @@ public:
             }
         }
 
-        WAIT_FLAG(MTE3, V, EVENT_ID0);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID0);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID1);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID2);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID3);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID4);
-        WAIT_FLAG(V, MTE2, EVENT_ID0);
-        WAIT_FLAG(V, MTE2, EVENT_ID4);
-        WAIT_FLAG(MTE3, V, EVENT_ID2);
-        WAIT_FLAG(V, MTE2, EVENT_ID2);
+        PlatformWaitVectorPipeSyncTP1();
     }
 private:
+
+    // ====== AIV refactor: context struct + sub-functions ======
+
+    struct VectorContext {
+        // input params
+        uint32_t cur_batch;
+        uint32_t start_head;
+        uint32_t cur_nIndx;
+        uint32_t cur_q_seqlen;
+        uint32_t cur_kv_seqlen;
+        uint32_t cur_head_num;
+        uint32_t offset_tiling;
+
+        // addresses
+        uint64_t addr_o_scalar;
+        uint64_t addr_mask_scalar;
+        uint32_t mask_offset;
+
+        // loop & size
+        uint32_t pp_n_scalar;
+        uint32_t sub_n_loop;
+        uint32_t real_n_loop;
+        uint32_t n_loop;
+
+        // QK dims
+        uint32_t qk_n;
+        uint32_t qk_round_n;
+        uint32_t qk_n_2;
+        uint32_t qk_round_n_2;
+
+        // head split
+        uint32_t sub_head_num;
+        uint32_t sub_m;
+        uint32_t head_idx;
+        uint64_t o_offset;
+
+        // tail info
+        uint32_t tail_len;
+        bool prev_tail_mask;
+    };
+
+    __aicore__ __attribute__((always_inline)) inline void InitVectorContext(
+        VectorContext &ctx, uint32_t cur_batch, uint32_t start_head, uint32_t cur_nIndx,
+        uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
+        uint32_t offset_tiling)
+    {
+        ctx.cur_batch = cur_batch;
+        ctx.start_head = start_head;
+        ctx.cur_nIndx = cur_nIndx;
+        ctx.cur_q_seqlen = cur_q_seqlen;
+        ctx.cur_kv_seqlen = cur_kv_seqlen;
+        ctx.cur_head_num = cur_head_num;
+        ctx.offset_tiling = offset_tiling;
+
+        // addr
+        uint32_t addr_o_high32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 4 + offset_tiling));
+        uint32_t addr_o_loww32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 5 + offset_tiling));
+        ctx.addr_o_scalar = (uint64_t)(((uint64_t)addr_o_high32) << 32 | addr_o_loww32);
+
+        uint32_t addr_mask_high32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 6 + offset_tiling));
+        uint32_t addr_mask_loww32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 7 + offset_tiling));
+        ctx.addr_mask_scalar = (uint64_t)(((uint64_t)addr_mask_high32) << 32 | addr_mask_loww32);
+        ctx.mask_offset = ctx.addr_mask_scalar;
+
+        // loop & size
+        ctx.pp_n_scalar = block_size;
+        ctx.sub_n_loop = ctx.pp_n_scalar / block_size;
+        ctx.real_n_loop = (cur_kv_seqlen + block_size - 1) / block_size;
+        ctx.n_loop = (cur_kv_seqlen + ctx.pp_n_scalar - 1) / ctx.pp_n_scalar;
+
+        // QK dims
+        ctx.qk_n = ctx.pp_n_scalar;
+        ctx.qk_round_n = RoundUp<BLOCK_SIZE>(ctx.qk_n);
+        ctx.qk_n_2 = ctx.pp_n_scalar;
+        ctx.qk_round_n_2 = RoundUp<BLOCK_SIZE>(ctx.qk_n_2);
+
+        // head split
+        ctx.sub_head_num = (sub_block_idx == 1) ? (cur_head_num - cur_head_num / 2) : cur_head_num / 2;
+        ctx.sub_m = ctx.sub_head_num * cur_q_seqlen;
+        ctx.head_idx = (sub_block_idx == 0) ? start_head : start_head + cur_head_num / 2 * cur_q_seqlen;
+        ctx.o_offset = ctx.addr_o_scalar + start_head * embedding_size + sub_block_idx * cur_head_num / 2 * embedding_size;
+
+        // tail info
+        ctx.tail_len = cur_kv_seqlen - (ctx.n_loop - 1) * ctx.pp_n_scalar;
+        ctx.prev_tail_mask = (ctx.n_loop > 1 && ctx.tail_len < cur_q_seqlen - 1);
+    }
+
+    struct VectorTP1Context {
+        // input params
+        uint32_t cur_batch;
+        uint32_t start_head;
+        uint32_t cur_nIndx;
+        uint32_t cur_q_seqlen;
+        uint32_t cur_kv_seqlen;
+        uint32_t cur_head_num;
+        uint32_t offset_tiling;
+
+        // addresses
+        uint64_t addr_o_scalar;
+        uint64_t addr_mask_scalar;
+        uint32_t mask_offset;
+
+        // loop & size
+        uint32_t pp_n_scalar;
+        uint32_t sub_n_loop;
+        uint32_t real_n_loop;
+        uint32_t n_loop;
+
+        // QK dims
+        uint32_t qk_n;
+        uint32_t qk_round_n;
+        uint32_t qk_n_2;
+        uint32_t qk_round_n_2;
+
+        // head split
+        uint32_t sub_head_num;
+        uint32_t sub_m;
+        uint32_t head_idx;
+        uint64_t o_offset;
+
+        // TP1 specific
+        uint32_t s_block_stack;
+        uint32_t m_slice;
+        uint32_t m_end;
+    };
+
+    __aicore__ __attribute__((always_inline)) inline void InitVectorTP1Context(
+        VectorTP1Context &ctx, uint32_t cur_batch, uint32_t start_head, uint32_t cur_nIndx,
+        uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
+        uint32_t offset_tiling)
+    {
+        ctx.cur_batch = cur_batch;
+        ctx.start_head = start_head;
+        ctx.cur_nIndx = cur_nIndx;
+        ctx.cur_q_seqlen = cur_q_seqlen;
+        ctx.cur_kv_seqlen = cur_kv_seqlen;
+        ctx.cur_head_num = cur_head_num;
+        ctx.offset_tiling = offset_tiling;
+
+        // addr
+        uint32_t prev_task = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
+        ctx.addr_o_scalar = prev_task * q_heads * embedding_size;
+        ctx.addr_mask_scalar = 0;
+        ctx.mask_offset = 0;
+
+        // loop & size
+        ctx.pp_n_scalar = block_size;
+        ctx.sub_n_loop = ctx.pp_n_scalar / block_size;
+        ctx.real_n_loop = (cur_kv_seqlen + block_size - 1) / block_size;
+        ctx.n_loop = (cur_kv_seqlen + ctx.pp_n_scalar - 1) / ctx.pp_n_scalar;
+
+        // QK dims
+        ctx.qk_n = ctx.pp_n_scalar;
+        ctx.qk_round_n = RoundUp<BLOCK_SIZE>(ctx.qk_n);
+        ctx.qk_n_2 = ctx.pp_n_scalar;
+        ctx.qk_round_n_2 = RoundUp<BLOCK_SIZE>(ctx.qk_n_2);
+
+        // head split
+        ctx.sub_head_num = (sub_block_idx == 1) ? (cur_head_num - cur_head_num / 2) : cur_head_num / 2;
+        ctx.sub_m = ctx.sub_head_num * cur_q_seqlen;
+        ctx.head_idx = (sub_block_idx == 0) ? start_head : start_head + cur_head_num / 2 * cur_q_seqlen;
+        ctx.o_offset = ctx.addr_o_scalar + start_head * embedding_size + sub_block_idx * cur_head_num / 2 * embedding_size;
+
+        // TP1 specific
+        ctx.s_block_stack = 4;
+        ctx.m_slice = FLOAT_VECTOR_SIZE / ctx.s_block_stack;
+        ctx.m_end = (ctx.sub_m + ctx.m_slice - 1) / ctx.m_slice;
+    }
 
     // [AIV 第三层平台函数 + 第二层业务函数] 已迁移至 aiv_arch32.h / aiv_bs.h
     #include "multi_latent_attention_aiv_arch32.h"
@@ -2933,142 +3083,19 @@ private:
         uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
         uint32_t offset_tiling, uint32_t embed_split_size_v, uint32_t embed_split_loop_v)
     {
-        uint32_t addr_o_high32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 4 + offset_tiling));
-        uint32_t addr_o_loww32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 5 + offset_tiling));
-        uint64_t addr_o_scalar = (uint64_t)(((uint64_t)addr_o_high32) << 32 | addr_o_loww32);
+        VectorContext ctx;
+        InitVectorContext(ctx, cur_batch, start_head, cur_nIndx,
+            cur_q_seqlen, cur_kv_seqlen, cur_head_num, offset_tiling);
 
-        uint32_t addr_mask_high32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 6 + offset_tiling));
-        uint32_t addr_mask_loww32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 7 + offset_tiling));
-        uint64_t addr_mask_scalar = (uint64_t)(((uint64_t)addr_mask_high32) << 32 | addr_mask_loww32);
-
-        uint32_t mask_offset = addr_mask_scalar;
-
-        uint32_t pp_n_scalar = block_size; // 64
-        uint32_t sub_n_loop = pp_n_scalar / block_size;
-        uint32_t real_n_loop = (cur_kv_seqlen + block_size - 1) / block_size;
-
-        uint32_t n_loop = (cur_kv_seqlen + pp_n_scalar - 1) / pp_n_scalar;
-
-        uint32_t qk_n = pp_n_scalar;
-        uint32_t qk_round_n = RoundUp<BLOCK_SIZE>(qk_n);
-
-        uint32_t qk_n_2 = pp_n_scalar;
-        uint32_t qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-
-        // split head num to two vectors
-        uint32_t sub_head_num = (sub_block_idx == 1) ? (cur_head_num - cur_head_num / 2) : cur_head_num / 2; // 16
-        uint32_t sub_m = sub_head_num * cur_q_seqlen; // 16 * 3 = 48
-
-        uint32_t head_idx = (sub_block_idx == 0) ? start_head : start_head + cur_head_num / 2 * cur_q_seqlen; // not used
-
-        o_offset = addr_o_scalar + start_head * embedding_size + sub_block_idx * cur_head_num / 2 * embedding_size; // for NSD -> SND
-
-        uint32_t sub_m_d128 = (sub_m + 127) / 128;  // up aligned to 128
-        uint32_t sub_m_d64 = (sub_m + 63) / 64;     // up aligned to 128
-        uint32_t round_sub_m = (sub_m + 15) / 16 * 16;
-
+        o_offset = ctx.o_offset;
         uint32_t start_kv = 0;
-        /* if tail length smalller than q_len - 1, then need to mask the last two tile*/
-        uint32_t tail_len = cur_kv_seqlen - (n_loop - 1) * pp_n_scalar;
-        bool prev_tail_mask = (n_loop > 1 && tail_len < cur_q_seqlen - 1);
-        for (uint32_t n_idx = 0; n_idx < n_loop + 1; n_idx++) {
-            if (n_idx != n_loop) {
-                bool need_mask = false;
-                uint32_t mask_start_offset = 0;
-                if (n_idx == (n_loop - 2)) {
-                    need_mask = prev_tail_mask;
-                    mask_start_offset = need_mask ? (tail_len + MASK_COLUMNS - 1) * MASK_COLUMNS : 0;
-                }
-                if (n_idx == (n_loop - 1)) {
-                    qk_n = (cur_kv_seqlen - n_idx * pp_n_scalar);
-                    qk_round_n = RoundUp<16>(qk_n);
-                    need_mask = true;
-                    mask_start_offset = (qk_n - 1) * MASK_COLUMNS;
-                }
-                WaitFlagDev(QK_READY_DECODER);
-                /* ************ softmax1 stage1  ************* */
-                WAIT_FLAG(MTE3, MTE2, EVENT_ID3);
-                if (sub_m > 0) {
-                    if (mask_type == 3) {
-                        mask_start_offset = mask_offset + n_idx * pp_n_scalar;
-                    }
-                    // input QK shape (sub_m, qk_round_n)
-                    if (n_idx % 2 == 0){
-                        SoftmaxStage1(
-                            p_gm_tensor[(uint64_t)block_idx * TMP_SIZE * T_BLOCK_OFFSET +
-                                (uint64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n * T_BLOCK_OFFSET + (uint64_t)(n_idx % 2) * TMP_SIZE * T_BLOCK_OFFSET / 2],
-                            s_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER +
-                                (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n + (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER / 2],
-                            s_rope_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER +
-                                (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n + (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER / 2],
-                            mask_gm_tensor[mask_start_offset],
-                            dm32_ubuf_tensor, ll_ubuf_tensor, pm32_ubuf_tensor,
-                            n_idx, qk_n, qk_round_n, sub_m, 0, sub_n_loop, cur_batch, start_kv, real_n_loop, head_idx, pm_flag_scalar1, cur_q_seqlen, cur_kv_seqlen, need_mask
-                        );
-                    } else {
-                        SoftmaxStage1(
-                            p_gm_tensor[(uint64_t)block_idx * TMP_SIZE * T_BLOCK_OFFSET  +
-                                (uint64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n * T_BLOCK_OFFSET +
-                                TMP_SIZE * T_BLOCK_OFFSET / 2],
-                            s_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER +
-                                (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n +
-                                TMP_SIZE_DECODER / 2],
-                            s_rope_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER +
-                                (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n +
-                                TMP_SIZE_DECODER / 2],
-                            mask_gm_tensor[mask_start_offset],
-                            dm32_stage2_ubuf_tensor, ll_stage2_ubuf_tensor, pm32_ubuf_stage2_tensor,
-                            n_idx, qk_n, qk_round_n, sub_m, 0, sub_n_loop, cur_batch, start_kv, real_n_loop, head_idx, pm_flag_scalar2, cur_q_seqlen, cur_kv_seqlen, need_mask
-                        );
-                    }
-                }
-                FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_DECODER);
 
-                SET_FLAG(MTE3, MTE2, EVENT_ID3);
+        for (uint32_t n_idx = 0; n_idx < ctx.n_loop + 1; n_idx++) {
+            if (n_idx != ctx.n_loop) {
+                ScheduleSoftmaxStage1(ctx, n_idx, start_kv);
             }
-            /* ************ softmax2 stage1  ************* */
-
-            uint32_t process_row_num = 16;
-            uint32_t numhead_per_process = process_row_num / cur_q_seqlen;
             if (n_idx != 0) {
-                if (n_idx == n_loop) {
-                    qk_n_2 = (cur_kv_seqlen - (n_idx - 1) * pp_n_scalar);
-                    qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-                }
-                WaitFlagDev(UPDATE_READY_DECODER);
-                if (sub_m > 0) {
-                    uint32_t head_loop = (sub_m + process_row_num - 1) / process_row_num;
-
-                    uint32_t head_res_row_num = 0;
-                    uint32_t head_start_sblock_idx = 0;
-                    uint32_t tail_res_row_num = 0;
-
-                    for (uint32_t head_loop_idx = 0; head_loop_idx < head_loop; ++head_loop_idx) {
-                        uint32_t head_offset = head_loop_idx * process_row_num * round_v;
-                        uint32_t cur_sub_m = head_loop_idx == (head_loop - 1) ? sub_m - head_loop_idx * process_row_num : process_row_num; // 15 or 3
-
-                        // complete head num
-                        head_start_sblock_idx = tail_res_row_num;
-                        head_res_row_num = (cur_q_seqlen - tail_res_row_num) % cur_q_seqlen;
-                        uint32_t cur_numhead_per_process = (cur_sub_m - head_res_row_num) / cur_q_seqlen;
-                        tail_res_row_num = cur_sub_m - cur_numhead_per_process * cur_q_seqlen - head_res_row_num;
-
-                        uint32_t out_o_offset = head_loop_idx * numhead_per_process * round_v; // modified, round_v = 512
-
-                        SoftmaxStage2MLAHeadLoop(
-                            o_tmp_gm_tensor[(uint64_t)(block_idx * TMP_SIZE * 2 + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_offset + ((n_idx - 1) % 2) * TMP_SIZE)],
-                            go_gm_tensor[(uint64_t)(block_idx * TMP_SIZE + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_offset)],
-                            o_gm_tensor[(uint64_t)(o_offset + out_o_offset)],
-                            dm32_ubuf_tensor[(uint64_t)((n_idx - 1) % 2 * 128 + head_loop_idx * process_row_num)],
-                            ll_ubuf_tensor[(uint64_t)((n_idx - 1) % 2 * 256 + head_loop_idx * process_row_num)],
-                            pm32_ubuf_tensor[(uint64_t)((n_idx - 1) % 2 * 128 + head_loop_idx * process_row_num)],
-                            n_idx - 1, n_loop, qk_n_2, RoundUp<T_BLOCK_SIZE>(qk_round_n_2), cur_sub_m, o_offset,
-                            head_idx + head_loop_idx * process_row_num,
-                            pm_flag_scalar1, head_loop, head_loop_idx, cur_q_seqlen, sub_head_num, cur_head_num,
-                            cur_numhead_per_process,
-                            head_res_row_num, head_start_sblock_idx, tail_res_row_num);
-                    }
-                }
+                ScheduleSoftmaxStage2(ctx, n_idx);
             }
         }
     }
@@ -3350,129 +3377,18 @@ private:
         uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
         uint32_t offset_tiling, uint32_t embed_split_size_v, uint32_t embed_split_loop_v)
     {
-        uint32_t prev_task = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
-        uint64_t addr_o_scalar = prev_task * q_heads * embedding_size;
-        uint64_t addr_mask_scalar = 0;
-        uint32_t mask_offset = addr_mask_scalar;
+        VectorTP1Context ctx;
+        InitVectorTP1Context(ctx, cur_batch, start_head, cur_nIndx,
+            cur_q_seqlen, cur_kv_seqlen, cur_head_num, offset_tiling);
 
-        uint32_t pp_n_scalar = block_size; // 64
-        uint32_t sub_n_loop = pp_n_scalar / block_size;
-        uint32_t real_n_loop = (cur_kv_seqlen + block_size - 1) / block_size;
+        o_offset = ctx.o_offset;
 
-        uint32_t n_loop = (cur_kv_seqlen + pp_n_scalar - 1) / pp_n_scalar;
-
-        uint32_t qk_n = pp_n_scalar;
-        uint32_t qk_round_n = RoundUp<BLOCK_SIZE>(qk_n);
-
-        uint32_t qk_n_2 = pp_n_scalar;
-        uint32_t qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-
-        // split head num to two vectors
-        uint32_t sub_head_num = (sub_block_idx == 1) ? (cur_head_num - cur_head_num / 2) : cur_head_num / 2; // 16
-        uint32_t sub_m = sub_head_num * cur_q_seqlen; // 16 * 3 = 48
-
-        uint32_t head_idx = (sub_block_idx == 0) ? start_head : start_head + cur_head_num / 2 * cur_q_seqlen; // not used
-
-        o_offset = addr_o_scalar + start_head * embedding_size + sub_block_idx * cur_head_num / 2 * embedding_size; // for NSD -> SND
-
-        uint32_t sub_m_d128 = (sub_m + 127) / 128;  // up aligned to 128
-        uint32_t sub_m_d64 = (sub_m + 63) / 64;     // up aligned to 128
-        uint32_t round_sub_m = (sub_m + 15) / 16 * 16;
-
-        uint32_t start_kv = 0;
-        uint32_t s_block_stack = 4;
-        uint32_t m_slice = FLOAT_VECTOR_SIZE / s_block_stack;
-        uint32_t m_end = (sub_m + m_slice - 1) / m_slice;
-        for (uint32_t n_idx = 0; n_idx < n_loop + s_block_stack; n_idx += s_block_stack) {
-            if (n_idx < n_loop) {
-                if (n_idx + s_block_stack > n_loop - 1) {
-                    qk_n = (cur_kv_seqlen - n_idx * pp_n_scalar);
-                } else {
-                    qk_n =  pp_n_scalar * s_block_stack;
-                }
-                qk_round_n = RoundUp<16>(qk_n);
-                if (sub_m == 0) {
-                    WaitFlagDev(QK_READY_DECODER);
-                }
-                uint32_t pingpong_flag = 0;
-                for (uint32_t m_ind = 0; m_ind < m_end; m_ind++) {
-                    uint32_t row_offset = m_ind * m_slice;
-                    uint32_t curr_m = m_ind == m_end - 1 ? sub_m - row_offset : m_slice;
-                    uint32_t s_ub_offset = pingpong_flag * 8192;
-                    uint32_t p_gm_offset = (uint64_t)block_idx * TMP_SIZE * 2 +
-                                            (uint64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n + row_offset * qk_round_n + (uint64_t)((n_idx / s_block_stack) % 2) * TMP_SIZE;
-                    uint32_t s_gm_offset = (int64_t)block_idx * TMP_SIZE_DECODER * 4 +
-                                            (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n + row_offset * qk_round_n + (uint64_t)((n_idx / s_block_stack) % 2) * TMP_SIZE_DECODER * 2;
-                    if (m_ind == 0) {
-                        WaitFlagDev(QK_READY_DECODER);
-                    }
-                    if (curr_m == 0) {
-                        continue;
-                    }
-                    OnlineSoftmaxStage1<float, float, IN_DTYPE, IN_DTYPE, MaskType::MASK_TYPE_NONE> (
-                        ls32_ubuf_tensor[s_ub_offset],
-                        mask_ubuf_tensor,
-                        mask_ubuf_tensor.template ReinterpretCast<float>(),
-                        lm32_ubuf_tensor[row_offset],
-                        hm32_ubuf_tensor[row_offset],
-                        gm32_ubuf_tensor[row_offset],
-                        dm32_ubuf_tensor[((n_idx / s_block_stack) % 2) * UB_FLOAT_LINE_SIZE + row_offset],
-                        ls32_ubuf_tensor[s_ub_offset],
-                        ll_ubuf_tensor[row_offset],
-                        gl32_ubuf_tensor[row_offset],
-                        lp_ubuf_tensor[s_ub_offset * 2],
-                        tv32_ubuf_tensor,
-                        s_gm_tensor[s_gm_offset],
-                        p_gm_tensor[p_gm_offset],
-                        n_idx == 0, this->tor,
-                        curr_m, qk_n, qk_round_n, pingpong_flag
-                    );
-                    pingpong_flag = 1 - pingpong_flag;
-                }
-                FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_DECODER);
+        for (uint32_t n_idx = 0; n_idx < ctx.n_loop + ctx.s_block_stack; n_idx += ctx.s_block_stack) {
+            if (n_idx < ctx.n_loop) {
+                ScheduleOnlineSoftmaxStage1(ctx, n_idx);
             }
-            /* ************ softmax2 stage1  ************* */
-            // PIPE_BARRIER(ALL);
-            uint32_t process_row_num = 16;
-            uint32_t numhead_per_process = process_row_num / cur_q_seqlen;
-
-            if (n_idx >= s_block_stack) {
-                if (n_idx == n_loop) {
-                    qk_n_2 = (cur_kv_seqlen - (n_idx - 1) * pp_n_scalar);
-                    qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-                }
-                WaitFlagDev(UPDATE_READY_DECODER);
-                if (sub_m > 0) {
-                    uint32_t head_loop = (sub_m + process_row_num - 1) / process_row_num;
-
-                    uint32_t head_res_row_num = 0;
-                    uint32_t head_start_sblock_idx = 0;
-                    uint32_t tail_res_row_num = 0;
-
-                    for (uint32_t head_loop_idx = 0; head_loop_idx < head_loop; ++head_loop_idx) {
-                        uint32_t head_offset = head_loop_idx * process_row_num * round_v;
-                        uint32_t cur_sub_m = head_loop_idx == (head_loop - 1) ? sub_m - head_loop_idx * process_row_num : process_row_num; // 15 or 3
-
-                        // complete head num
-                        head_start_sblock_idx = tail_res_row_num;
-                        head_res_row_num = (cur_q_seqlen - tail_res_row_num) % cur_q_seqlen;
-                        uint32_t cur_numhead_per_process = (cur_sub_m - head_res_row_num) / cur_q_seqlen;
-                        tail_res_row_num = cur_sub_m - cur_numhead_per_process * cur_q_seqlen - head_res_row_num;
-
-                        uint32_t out_o_offset = head_loop_idx * numhead_per_process * round_v; // modified, round_v = 512
-
-                        SoftmaxStage2MLAHeadLoopTP1(
-                            o_tmp_gm_tensor[(uint64_t)(block_idx * TMP_SIZE * 2 + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_offset + ((n_idx / s_block_stack - 1) % 2) * TMP_SIZE)],
-                            go_gm_tensor[(uint64_t)(block_idx * TMP_SIZE + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_offset)],
-                            o_gm_tensor[(uint64_t)(o_offset + out_o_offset)],
-                            dm32_ubuf_tensor[(uint64_t)((n_idx / s_block_stack - 1) % 2 * UB_FLOAT_LINE_SIZE + head_loop_idx * process_row_num)],
-                            ll_ubuf_tensor[(uint64_t)((n_idx / s_block_stack - 1) % 2 * 256 + head_loop_idx * process_row_num)],
-                            pm32_ubuf_tensor,
-                            n_idx, n_loop, qk_n_2, RoundUp<T_BLOCK_SIZE>(qk_round_n_2), cur_sub_m, o_offset, head_idx,
-                            pm_flag_scalar1, head_loop, head_loop_idx, cur_q_seqlen, sub_head_num, cur_head_num, cur_numhead_per_process,
-                            head_res_row_num, head_start_sblock_idx, tail_res_row_num);
-                    }
-                }
+            if (n_idx >= ctx.s_block_stack) {
+                ScheduleSoftmaxStage2TP1(ctx, n_idx);
             }
         }
     }
@@ -3482,134 +3398,20 @@ private:
         uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
         uint32_t offset_tiling, uint32_t embed_split_size_v, uint32_t embed_split_loop_v)
     {
-        uint32_t prev_task = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
-        uint64_t addr_o_scalar = prev_task * q_heads * embedding_size;
-        uint64_t addr_mask_scalar = 0;
-        uint32_t mask_offset = addr_mask_scalar;
+        VectorTP1Context ctx;
+        InitVectorTP1Context(ctx, 0, start_head, 0,
+            cur_q_seqlen, cur_kv_seqlen, cur_head_num, offset_tiling);
 
-        uint32_t pp_n_scalar = block_size; // 64
-        uint32_t sub_n_loop = pp_n_scalar / block_size;
-        uint32_t real_n_loop = (cur_kv_seqlen + block_size - 1) / block_size;
+        o_offset = ctx.o_offset;
 
-        uint32_t n_loop = (cur_kv_seqlen + pp_n_scalar - 1) / pp_n_scalar;
-
-        uint32_t qk_n = pp_n_scalar;
-        uint32_t qk_round_n = RoundUp<BLOCK_SIZE>(qk_n);
-
-        uint32_t qk_n_2 = pp_n_scalar;
-        uint32_t qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-
-        // split head num to two vectors
-        uint32_t sub_head_num = (sub_block_idx == 1) ? (cur_head_num - cur_head_num / 2) : cur_head_num / 2; // 16
-        uint32_t sub_m = sub_head_num * cur_q_seqlen; // 16 * 3 = 48
-
-        uint32_t head_idx = (sub_block_idx == 0) ? start_head : start_head + cur_head_num / 2 * cur_q_seqlen; // not used
-
-        o_offset = addr_o_scalar + start_head * embedding_size + sub_block_idx * cur_head_num / 2 * embedding_size; // for NSD -> SND
-
-        uint32_t sub_m_d128 = (sub_m + 127) / 128;  // up aligned to 128
-        uint32_t sub_m_d64 = (sub_m + 63) / 64;     // up aligned to 128
-        uint32_t round_sub_m = (sub_m + 15) / 16 * 16;
-
-        uint32_t start_kv = 0;
-        uint32_t s_block_stack = 4;
-        uint32_t m_slice = FLOAT_VECTOR_SIZE / s_block_stack;
-        uint32_t m_end = (sub_m + m_slice - 1) / m_slice;
-        for (uint32_t n_idx = 0; n_idx < n_loop + s_block_stack; n_idx += s_block_stack) {
-            if (n_idx < n_loop) {
-                if (n_idx + s_block_stack > n_loop - 1) {
-                    qk_n = (cur_kv_seqlen - n_idx * pp_n_scalar);
-                } else {
-                    qk_n =  pp_n_scalar * s_block_stack;
-                }
-                qk_round_n = RoundUp<16>(qk_n);
-                if (sub_m == 0) {
-                    WaitFlagDev(QK_READY_DECODER);
-                }
-                uint32_t pingpong_flag = 0;
-                for (uint32_t m_ind = 0; m_ind < m_end; m_ind++) {
-                    uint32_t row_offset = m_ind * m_slice;
-                    uint32_t curr_m = m_ind == m_end - 1 ? sub_m - row_offset : m_slice;
-                    uint32_t s_ub_offset = pingpong_flag * 8192;
-                    uint32_t p_gm_offset = (uint64_t)block_idx * TMP_SIZE * 2 +
-                                            (uint64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n + row_offset * qk_round_n + (uint64_t)((n_idx / s_block_stack) % 2) * TMP_SIZE;
-                    uint32_t s_gm_offset = (int64_t)block_idx * TMP_SIZE_DECODER * 4 +
-                                            (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n + row_offset * qk_round_n + (uint64_t)((n_idx / s_block_stack) % 2) * TMP_SIZE_DECODER * 2;
-                    if (m_ind == 0) {
-                        WaitFlagDev(QK_READY_DECODER);
-                    }
-                    if (curr_m == 0) {
-                        continue;
-                    }
-                    OnlineSoftmaxStage1<float, float, IN_DTYPE, IN_DTYPE, MaskType::MASK_TYPE_NONE> (
-                        ls32_ubuf_tensor[s_ub_offset],
-                        mask_ubuf_tensor,
-                        mask_ubuf_tensor.template ReinterpretCast<float>(),
-                        lm32_ubuf_tensor[row_offset],
-                        hm32_ubuf_tensor[row_offset],
-                        gm32_ubuf_tensor[row_offset],
-                        dm32_ubuf_tensor[((n_idx / s_block_stack) % 2) * UB_FLOAT_LINE_SIZE + row_offset],
-                        ls32_ubuf_tensor[s_ub_offset],
-                        ll_ubuf_tensor[row_offset],
-                        gl32_ubuf_tensor[row_offset],
-                        lp_ubuf_tensor[s_ub_offset * 2],
-                        tv32_ubuf_tensor,
-                        s_gm_tensor[s_gm_offset],
-                        p_gm_tensor[p_gm_offset],
-                        n_idx == 0, this->tor,
-                        curr_m, qk_n, qk_round_n, pingpong_flag
-                    );
-                    pingpong_flag = 1 - pingpong_flag;
-                }
-                FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_DECODER);
+        for (uint32_t n_idx = 0; n_idx < ctx.n_loop + ctx.s_block_stack; n_idx += ctx.s_block_stack) {
+            if (n_idx < ctx.n_loop) {
+                ScheduleOnlineSoftmaxStage1(ctx, n_idx);
             }
-            /* ************ softmax2 stage1  ************* */
-            // PIPE_BARRIER(ALL);
-            uint32_t process_row_num = 16;
-            uint32_t numhead_per_process = process_row_num / cur_q_seqlen;
-
-            if (n_idx >= s_block_stack) {
-                if (n_idx == n_loop) {
-                    qk_n_2 = (cur_kv_seqlen - (n_idx - 1) * pp_n_scalar);
-                    qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-                }
-                WaitFlagDev(UPDATE_READY_DECODER);
-                if (sub_m > 0) {
-                    uint32_t head_loop = (sub_m + process_row_num - 1) / process_row_num;
-
-                    uint32_t head_res_row_num = 0;
-                    uint32_t head_start_sblock_idx = 0;
-                    uint32_t tail_res_row_num = 0;
-
-                    for (uint32_t head_loop_idx = 0; head_loop_idx < head_loop; ++head_loop_idx) {
-                        uint32_t head_offset = head_loop_idx * process_row_num * round_v;
-                        uint32_t cur_sub_m = head_loop_idx == (head_loop - 1) ? sub_m - head_loop_idx * process_row_num : process_row_num;
-
-                        // complete head num
-                        head_start_sblock_idx = tail_res_row_num;
-                        head_res_row_num = (cur_q_seqlen - tail_res_row_num) % cur_q_seqlen;
-                        uint32_t cur_numhead_per_process = (cur_sub_m - head_res_row_num) / cur_q_seqlen;
-                        tail_res_row_num = cur_sub_m - cur_numhead_per_process * cur_q_seqlen - head_res_row_num;
-
-                        uint32_t out_o_offset = head_loop_idx * numhead_per_process * round_v; // round_v = 512
-
-                        TailSoftmaxStage2MLAHeadLoopTP1(
-                            o_tmp_gm_tensor[(uint64_t)(block_idx * TMP_SIZE * 2 + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_offset + ((n_idx / s_block_stack - 1) % 2) * TMP_SIZE)],
-                            go_gm_tensor[(uint64_t)(block_idx * TMP_SIZE + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_offset)],
-                            tmp_gm_tensor[(uint64_t)(block_idx * q_heads + start_head + sub_block_idx * cur_head_num * cur_q_seqlen / 2 + head_loop_idx * process_row_num)],
-                            tmp_gm_tensor[(uint64_t)(block_num * q_heads + block_idx * q_heads + start_head + sub_block_idx * cur_head_num * cur_q_seqlen / 2 + head_loop_idx * process_row_num)],
-                            dm32_ubuf_tensor[(uint64_t)((n_idx / s_block_stack - 1) % 2 * UB_FLOAT_LINE_SIZE + head_loop_idx * process_row_num)],
-                            go32_ubuf_tensor, // no need for offset
-                            gl32_ubuf_tensor[(uint64_t)(head_loop_idx * process_row_num)],
-                            gm32_ubuf_tensor[(uint64_t)(head_loop_idx * process_row_num)],
-                            n_idx, n_loop, qk_n_2, RoundUp<T_BLOCK_SIZE>(qk_round_n_2), cur_sub_m, o_offset, head_idx,
-                            head_loop, head_loop_idx, cur_q_seqlen, sub_head_num, cur_head_num, cur_numhead_per_process
-                        );
-                    }
-                }
+            if (n_idx >= ctx.s_block_stack) {
+                ScheduleTailSoftmaxStage2TP1(ctx, n_idx);
             }
         }
-
     }
 
     __aicore__ __attribute__((always_inline)) inline void TailInnerGatherVectorTP1(
