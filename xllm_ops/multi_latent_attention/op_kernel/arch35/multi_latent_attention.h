@@ -18,9 +18,13 @@ limitations under the License.
 
 #include "kernel_operator.h"
 #include "multi_latent_attention_npu.h"
-#include "multi_latent_attention_bs.h"
 #include "../common/common_utils.h"
 #include "../common/common.h"
+// NOTE: multi_latent_attention_bs.h is intentionally included later (after the
+// BLOCK_SIZE_16 / CONST_* constants below), because its migrated sub-function
+// bodies reference BLOCK_SIZE_16, RoundUp (common_utils.h) and SET_FLAG/MTEx
+// (common.h) as non-dependent names, which must be visible at template
+// definition time (two-phase lookup).
 
 #ifdef __CCE_KT_TEST__
 #define __aicore__
@@ -147,8 +151,14 @@ constexpr int64_t CONST_32 = 32;
 constexpr int64_t CONST_64 = 64;
 constexpr int64_t CONST_128 = 128;
 
-// Decoder-specific constants
+// Decoder-specific constants (must be defined BEFORE including bs.h, because the
+// bs.h sub-functions CopyQKResultToGM / ComputeQRope reference TMP_SIZE_DECODER_A5).
 constexpr int32_t TMP_SIZE_DECODER_A5 = 32768;
+
+// Now that BLOCK_SIZE_16 / CONST_* / TMP_SIZE_DECODER_A5 and the common headers
+// (RoundUp, SET_FLAG, MTEx HardEvents) are all visible, pull in the
+// InnerRunCubeMLA sub-functions.
+#include "multi_latent_attention_bs.h"
 
 // ============================================================================
 // UbufAllocA5 — UB 248KB space layout for A5 MLA Decoder (Cube side)
@@ -256,11 +266,16 @@ struct AttentionTypeA5<TilingKeyType::TILING_INT8_DATA> {
 //   - embed_split_size_qk reads from tiling param [25] (TILING_BLOCKSIZE_CALC)
 //     which A5 tiling fills with 256 (up from A3's hardcoded 128)
 // ============================================================================
+// NOTE: template param order MUST match arch32's
+// <IN_DTYPE, IN_ROPE_DTYPE, OUT_DTYPE, IN_KVDTYPE> so that the cpp entry-point
+// instantiations (kept identical to arch32) resolve to the correct semantics.
+// INT8 path: IN_DTYPE=int8, IN_ROPE_DTYPE=float(RoPE NOT quantized),
+//            OUT_DTYPE=float, IN_KVDTYPE=int8.
 template <TilingKeyType tilingKeyType = TilingKeyType::TILING_HALF_DATA,
           typename IN_DTYPE = half,
-          typename IN_KVDTYPE = half,
-          typename OUT_DTYPE = half,
           typename IN_ROPE_DTYPE = half,
+          typename OUT_DTYPE = half,
+          typename IN_KVDTYPE = half,
           InputFormat KInputType = InputFormat::ND_FORMAT,
           bool EnableOptimization = false>
 class MLAttentionDecoderAic {
@@ -276,6 +291,21 @@ class MLAttentionDecoderAic {
     static constexpr int32_t L1_KV_HALF_SIZE = L1_KV_HALF_BUF_SIZE_A5;  // 73728
 
 public:
+    // Expose template tiling key so bs.h helper sub-functions can branch on INT8 path
+    static constexpr TilingKeyType kTilingKeyType = tilingKeyType;
+    static constexpr bool kIsInt8 = (tilingKeyType == TilingKeyType::TILING_INT8_DATA);
+    // Expose the KV input layout so bs.h LoadKVData can pick the ND->NZ vs
+    // NZ->NZ helper path at compile time (mirrors arch32's KInputType branch).
+    static constexpr InputFormat kInputFormat = KInputType;
+
+    // Expose template dtype parameters so bs.h helper sub-functions can name
+    // them (e.g. ReinterpretCast<IN_ROPE_DTYPE>) via CubeT::*_ALIAS.
+    // (mm1OutputType/mm1CopyType are private but reachable by friends directly,
+    //  so no alias is needed for them.)
+    using IN_DTYPE_ALIAS = IN_DTYPE;
+    using IN_KVDTYPE_ALIAS = IN_KVDTYPE;
+    using IN_ROPE_DTYPE_ALIAS = IN_ROPE_DTYPE;
+
     __aicore__ __attribute__((always_inline)) inline MLAttentionDecoderAic() {}
 
     // ========================================================================
@@ -661,6 +691,10 @@ private:
     template <typename CubeT>
     friend __aicore__ void LoadQData(CubeT &, const MLAContext &);
     template <typename CubeT>
+    friend __aicore__ void LoadQMainFromGMToL1(CubeT &, const MLAContext &);
+    template <typename CubeT>
+    friend __aicore__ void LoadQRopeFromGMToL1(CubeT &, const MLAContext &);
+    template <typename CubeT>
     friend __aicore__ uint32_t LoadKVData(CubeT &, MLAContext &, uint32_t);
     template <typename CubeT>
     friend __aicore__ void ComputeQK(CubeT &, MLAContext &, uint32_t, uint32_t);
@@ -695,17 +729,12 @@ private:
                 // Stage1: load this KV block, run QK GEMM1, publish QK result.
                 uint32_t l1_kv_pingpong_flag = LoadKVData(*this, ctx, n_idx);
                 ComputeQK(*this, ctx, n_idx, l1_kv_pingpong_flag);
-                // A3 L1082: notify Vector that QK (S) is ready for softmax.
-                FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_DECODER);
+                // QK_READY_DECODER is now published inside ComputeQK (bs.h).
             }
 
             // Stage2: PV GEMM2 for the previously prepared block (n_idx != 0
-            // guarded inside ComputePV), then notify the update stage.
+            // guarded inside ComputePV, which also publishes UPDATE_READY).
             ComputePV(*this, ctx, n_idx);
-            if (n_idx != 0) {
-                // A3 L1209: notify Vector that PV (O) update is ready.
-                FftsCrossCoreSync<PIPE_FIX, 2>(UPDATE_READY_DECODER);
-            }
         }
     }
 
@@ -734,6 +763,11 @@ private:
     // --- L1 buffer offsets ---
     // BF16/HALF path: Q+RoPE contiguous, KV+RoPE contiguous (3 regions)
     // INT8 path: Q/Q_rope/KV/KV_rope separate (5 regions)
+    // CONSTRAINT: l1q region capacity = (l1kv_buf_addr_offset - l1q_buf_addr_offset)
+    //   = 147456 bytes (~144 rows of half). LoadQData writes up to
+    //   RoundUp<16>(cur_head_num * cur_q_seqlen) * 512 * sizeof(IN_DTYPE) bytes here.
+    //   Host tiling MUST keep head_num * seqlen block so this upper bound stays
+    //   <= 147456; otherwise A5's enlarged tile silently overruns into l1kv region.
     const uint32_t l1q_buf_addr_offset = 0;
     const uint32_t l1q_rope_buf_addr_offset = 65536;
     const uint32_t l1kv_buf_addr_offset = 147456;
@@ -849,18 +883,81 @@ public:
         __gm__ uint8_t *__restrict__ tiling_para_gm,
         __gm__ uint8_t *__restrict__ mask_input_gm)
     {
-        // TODO: A5 Vector SetArgs implementation
+        // A5 Vector SetArgs: bind output/staging GM buffers and load tiling params.
+        // Mapped from arch32 (A3) MLADecoderAiv::SetArgs. GM binding + tiling read are
+        // platform-agnostic; vector-mask/atomic setup uses A5 (dav-3510) intrinsics.
+        sub_block_idx = static_cast<uint64_t>(GetSubBlockidx());
+        SetAtomicnone();
+        SetMasknorm();
+        SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+
+        o_gm = reinterpret_cast<__gm__ OUT_DTYPE *>(o_out_gm);
+        s_gm = reinterpret_cast<__gm__ mm1CopyType *>(s_out_gm);
+        p_gm = reinterpret_cast<__gm__ IN_DTYPE *>(p_out_gm);
+        o_tmp_gm = reinterpret_cast<__gm__ mm2CopyType *>(o_temp_gm);
+        go_gm = reinterpret_cast<__gm__ float *>(globalo_gm);
+        tiling_gm = reinterpret_cast<__gm__ uint8_t *>(tiling_para_gm);
+        gm_block_tables_ = reinterpret_cast<__gm__ int32_t *>(gm_block_table);
+        o_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ OUT_DTYPE *>(o_gm));
+        mask_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ OUT_DTYPE *>(mask_input_gm));
+        s_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm1CopyType *>(s_gm));
+        p_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ IN_DTYPE *>(p_gm));
+        o_tmp_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm2CopyType *>(o_tmp_gm));
+        go_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(go_gm));
+        tmp_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(tmp_gm));
+        if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
+            deq_scale_gm_tensor_q1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(deq_qk_in_gm));
+            deq_scale_gm_tensor_k1.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(deq_pv_in_gm));
+            s_rope_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(s_rope_out_gm));
+        }
+
+        num_batches = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm));
+        q_heads = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_NUMHEADS));
+        embedding_size = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_HEADDIM));
+        block_size = (int32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_BLOCKSIZE));
+        max_num_blocks_per_query = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_MAXBLOCKS));
+        tor = (float)(*((__gm__ float *)tiling_para_gm + TILING_TOR));
+        num_kv_heads = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_KVHEADS));
+        tiling_head_size = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_HEADSIZE));
+        tiling_para_size = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_PARASIZE));
+        totalTaskNum = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + 13));
+        maxKVSeqLen = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_MAX_KV_SEQ_LEN));
+
+        cur_qn_blk_size = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_MTP_HEAD_SPLIT_SIZE));
+        block_size_calc = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_BLOCKSIZE_CALC));
+        mask_type = (uint32_t)(*((__gm__ uint32_t *)tiling_para_gm + TILING_MASK_TYPE_ND));
+
+        go_flag_scalar = 1;
+        gl_flag_scalar = 1;
+
+        __k = embedding_size;
+        round_k = RoundUp<T_BLOCK_SIZE>(__k);
+        __v = embedding_size;
+        round_v = RoundUp<BLOCK_SIZE>(__v);
     }
 
     __aicore__ __attribute__((always_inline)) inline void SetArgs2(
         __gm__ uint8_t *__restrict__ lse_out_gm)
     {
-        // TODO: A5 Vector SetArgs2 (lse for ring mode) implementation
+        // A5 Vector SetArgs2: bind LSE (log-sum-exp) output GM for ring mode.
+        // Mapped from arch32 (A3) MLADecoderAiv::SetArgs2 — platform-agnostic GM binding.
+        lse_gm = reinterpret_cast<__gm__ OUT_DTYPE *>(lse_out_gm);
+        lse_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ OUT_DTYPE *>(lse_gm));
     }
 
     __aicore__ __attribute__((always_inline)) inline void Run()
     {
-        // TODO: A5 Vector Run implementation (Normal / non-TP1 path)
+        // ====================================================================
+        // A5 Vector Run — orchestration layer (mirrors arch32 A3 Run).
+        //
+        // Three-layer split for the A5 port (same as A3 aiv_* files):
+        //   - orchestration (here): 3-line flow — init sync / schedule / wait sync
+        //   - business  (aiv_bs.h ScheduleVectorTasks): batch/head task dispatch
+        //   - platform  (aiv_arch35.h): SET/WAIT_FLAG MTE3/V/MTE2 pipe sync
+        // ====================================================================
+        PlatformInitVectorPipeSync();
+        ScheduleVectorTasks();
+        PlatformWaitVectorPipeSync();
     }
 
     __aicore__ __attribute__((always_inline)) inline void RunTP1()
@@ -868,7 +965,76 @@ public:
         // TODO: A5 Vector RunTP1 implementation (MTP / TP1 path)
     }
 
+    // ------------------------------------------------------------------------
+    // Vector-core business layer (bs.h friend, mirrors the Cube-core policy).
+    // InnerRunVectorChange holds the double-buffered n_loop softmax pipeline for
+    // one task; it is a free function in multi_latent_attention_bs.h and receives
+    // this AIV instance by reference so it can reach the private GM/UB members.
+    // ------------------------------------------------------------------------
+
 private:
+    // [AIV 第三层平台函数 + 第二层业务函数] 迁移至 aiv_arch35.h / aiv_bs.h。
+    // 类内 include 展开为成员函数，可直接访问下方私有 GM/UB/tiling 成员。
+    // 与 A3(arch32) 类内 include aiv_arch32.h / aiv_bs.h 范式一致。
+#include "multi_latent_attention_aiv_arch35.h"
+#include "multi_latent_attention_aiv_bs.h"
+
+    // LSE (log-sum-exp) output GM — bound by SetArgs2 for ring mode.
+    __gm__ OUT_DTYPE *__restrict__ lse_gm{nullptr};
+    AscendC::GlobalTensor<OUT_DTYPE> lse_gm_tensor;
+
+    // ---- GM raw pointers (bound in SetArgs) ----
+    __gm__ mm1CopyType *__restrict__ s_gm{nullptr};
+    __gm__ IN_DTYPE *__restrict__ p_gm{nullptr};
+    __gm__ mm2CopyType *__restrict__ o_tmp_gm{nullptr};
+    __gm__ float *__restrict__ go_gm{nullptr};
+    __gm__ int32_t *__restrict__ gm_block_tables_{nullptr};
+    __gm__ OUT_DTYPE *__restrict__ o_gm{nullptr};
+    __gm__ OUT_DTYPE *__restrict__ mask_gm{nullptr};
+    __gm__ uint8_t *__restrict__ tiling_gm{nullptr};
+
+    // ---- GlobalTensor views (bound in SetArgs) ----
+    AscendC::GlobalTensor<OUT_DTYPE> mask_gm_tensor;
+    AscendC::GlobalTensor<OUT_DTYPE> o_gm_tensor;
+    AscendC::GlobalTensor<mm1CopyType> s_gm_tensor;
+    AscendC::GlobalTensor<float> s_rope_gm_tensor;
+    AscendC::GlobalTensor<IN_DTYPE> p_gm_tensor;
+    AscendC::GlobalTensor<mm2OutputType> o_tmp_gm_tensor;
+    AscendC::GlobalTensor<float> go_gm_tensor;
+    AscendC::GlobalTensor<float> tmp_gm_tensor;
+    AscendC::GlobalTensor<float> deq_scale_gm_tensor_q1;
+    AscendC::GlobalTensor<float> deq_scale_gm_tensor_k1;
+
+    // ---- scalar tiling params (loaded in SetArgs) ----
+    uint32_t go_flag_scalar{1};
+    uint32_t gl_flag_scalar{1};
+    uint32_t num_batches{0};
+    uint32_t q_heads{0};
+    uint32_t num_kv_heads{0};
+    uint32_t embedding_size{0};
+    uint32_t block_size{0};
+    uint32_t __k{0};
+    uint32_t round_k{0};
+    uint32_t __v{0};
+    uint32_t round_v{0};
+    float tor{0};
+    uint64_t sub_block_idx{0};
+    uint32_t tiling_head_size{0};
+    uint32_t tiling_para_size{0};
+    uint32_t block_size_calc{0};
+    uint32_t mask_type{0};
+    uint32_t max_num_blocks_per_query{0};
+    uint32_t totalTaskNum{0};
+    uint32_t maxKVSeqLen{0};
+    uint32_t cur_qn_blk_size{0};
+
+    // Embedding-split loop count for the PV (V) former segment. arch32 L4454
+    // default = 1; passed to InnerRunVectorChange from Run.
+    uint32_t embed_split_loop_v_former{1};
+    // Double-buffer softmax pm flags (ping/pong), toggled per n_idx parity.
+    uint32_t pm_flag_scalar1{0};
+    uint32_t pm_flag_scalar2{0};
+
     UbufAllocA5<BlockFlow> ubufAlloc;
 };
 
