@@ -2799,28 +2799,6 @@ private:
         PIPE_BARRIER(ALL);
     }
 
-    __aicore__ __attribute__((always_inline)) inline void InnerRunVectorChange(
-        uint32_t cur_batch, uint32_t start_head, uint32_t cur_nIndx,
-        uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
-        uint32_t offset_tiling, uint32_t embed_split_size_v, uint32_t embed_split_loop_v)
-    {
-        VectorContext ctx;
-        InitVectorContext(ctx, cur_batch, start_head, cur_nIndx,
-            cur_q_seqlen, cur_kv_seqlen, cur_head_num, offset_tiling);
-
-        o_offset = ctx.o_offset;
-        uint32_t start_kv = 0;
-
-        for (uint32_t n_idx = 0; n_idx < ctx.n_loop + 1; n_idx++) {
-            if (n_idx != ctx.n_loop) {
-                ScheduleSoftmaxStage1(ctx, n_idx, start_kv);
-            }
-            if (n_idx != 0) {
-                ScheduleSoftmaxStage2(ctx, n_idx);
-            }
-        }
-    }
-
     __aicore__ __attribute((always_inline)) inline void SoftmaxGatherTP1(
         AscendC::GlobalTensor<OUT_DTYPE> o_gm_tensor,
         AscendC::GlobalTensor<float> go_gm_tensor,
@@ -3091,48 +3069,6 @@ private:
             );
         }
         AscendC::PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ __attribute__((always_inline)) inline void InnerRunVectorChangeTP1(
-        uint32_t cur_batch, uint32_t start_head, uint32_t cur_nIndx,
-        uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
-        uint32_t offset_tiling, uint32_t embed_split_size_v, uint32_t embed_split_loop_v)
-    {
-        VectorTP1Context ctx;
-        InitVectorTP1Context(ctx, cur_batch, start_head, cur_nIndx,
-            cur_q_seqlen, cur_kv_seqlen, cur_head_num, offset_tiling);
-
-        o_offset = ctx.o_offset;
-
-        for (uint32_t n_idx = 0; n_idx < ctx.n_loop + ctx.s_block_stack; n_idx += ctx.s_block_stack) {
-            if (n_idx < ctx.n_loop) {
-                ScheduleOnlineSoftmaxStage1(ctx, n_idx);
-            }
-            if (n_idx >= ctx.s_block_stack) {
-                ScheduleSoftmaxStage2TP1(ctx, n_idx);
-            }
-        }
-    }
-
-    __aicore__ __attribute__((always_inline)) inline void TailInnerRunVectorChangeTP1(
-        uint32_t start_head,
-        uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
-        uint32_t offset_tiling, uint32_t embed_split_size_v, uint32_t embed_split_loop_v)
-    {
-        VectorTP1Context ctx;
-        InitVectorTP1Context(ctx, 0, start_head, 0,
-            cur_q_seqlen, cur_kv_seqlen, cur_head_num, offset_tiling);
-
-        o_offset = ctx.o_offset;
-
-        for (uint32_t n_idx = 0; n_idx < ctx.n_loop + ctx.s_block_stack; n_idx += ctx.s_block_stack) {
-            if (n_idx < ctx.n_loop) {
-                ScheduleOnlineSoftmaxStage1(ctx, n_idx);
-            }
-            if (n_idx >= ctx.s_block_stack) {
-                ScheduleTailSoftmaxStage2TP1(ctx, n_idx);
-            }
-        }
     }
 
     __aicore__ __attribute__((always_inline)) inline void TailInnerGatherVectorTP1(

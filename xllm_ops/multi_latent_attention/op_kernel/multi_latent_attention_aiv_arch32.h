@@ -54,6 +54,29 @@ __aicore__ __attribute__((always_inline)) inline void PlatformWaitVectorPipeSync
     WAIT_FLAG(V, MTE2, EVENT_ID2);
 }
 
+// 平台函数：MTE2→V 管道同步（数据搬入后 V 侧可见）
+// 用于 SoftmaxStage1 LoadQKData 段：gm_to_ub/DataCopy 完成后，通知 V 侧可读取
+__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSync()
+{
+    SET_FLAG(MTE2, V, EVENT_ID0);
+    WAIT_FLAG(MTE2, V, EVENT_ID0);
+}
+
+// 平台函数：V→MTE3 管道同步（V 计算完成后 MTE3 可搬出）
+// 用于 SoftmaxStage1 QuantizeAndOutput 段：量化/转换完成后，通知 MTE3 可写入 GM
+__aicore__ __attribute__((always_inline)) inline void PlatformVToMte3Sync()
+{
+    SET_FLAG(V, MTE3, EVENT_ID0);
+    WAIT_FLAG(V, MTE3, EVENT_ID0);
+}
+
+// 平台函数：V→MTE2 管道通知（V 完成本轮计算，通知 MTE2 可搬入下轮数据）
+// 用于 SoftmaxStage1 QuantizeAndOutput 段末尾：ping-pong 流水衔接
+__aicore__ __attribute__((always_inline)) inline void PlatformVToMte2Notify()
+{
+    SET_FLAG(V, MTE2, EVENT_ID2);
+}
+
 // 平台函数：Vector TP1 管道同步初始化（RunTP1 方法头部 10 条 SET_FLAG）
 // 与非TP1 相比多出 SET_FLAG(MTE3, MTE2, EVENT_ID1)
 __aicore__ __attribute__((always_inline)) inline void PlatformInitVectorPipeSyncTP1()
@@ -84,4 +107,27 @@ __aicore__ __attribute__((always_inline)) inline void PlatformWaitVectorPipeSync
     WAIT_FLAG(V, MTE2, EVENT_ID4);
     WAIT_FLAG(MTE3, V, EVENT_ID2);
     WAIT_FLAG(V, MTE2, EVENT_ID2);
+}
+
+// 平台函数：MTE2→V 管道同步（数据搬入后 V 侧可见）
+// 用于 SoftmaxStage1 LoadQKData 段：gm_to_ub/DataCopy 完成后，通知 V 侧可读取
+__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSync()
+{
+    SET_FLAG(MTE2, V, EVENT_ID0);
+    WAIT_FLAG(MTE2, V, EVENT_ID0);
+}
+
+// 平台函数：V→MTE3 管道同步（V 计算完成后 MTE3 可搬出）
+// 用于 SoftmaxStage1 QuantizeAndOutput 段：量化/转换完成后，通知 MTE3 可写入 GM
+__aicore__ __attribute__((always_inline)) inline void PlatformVToMte3Sync()
+{
+    SET_FLAG(V, MTE3, EVENT_ID0);
+    WAIT_FLAG(V, MTE3, EVENT_ID0);
+}
+
+// 平台函数：V→MTE2 管道通知（V 完成本轮计算，通知 MTE2 可搬入下轮数据）
+// 用于 SoftmaxStage1 QuantizeAndOutput 段末尾：ping-pong 流水衔接
+__aicore__ __attribute__((always_inline)) inline void PlatformVToMte2Notify()
+{
+    SET_FLAG(V, MTE2, EVENT_ID2);
 }
