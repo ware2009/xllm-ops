@@ -443,3 +443,198 @@ __aicore__ __attribute__((always_inline)) inline void PlatformCopyQRopeResultToG
     }
     SET_FLAG(FIX, M, l1_kv_pingpong_flag);
 }
+
+// 平台函数：初始化管道同步事件（Run 方法头部批量 SET_FLAG）
+__aicore__ __attribute__((always_inline)) inline void PlatformInitPipeSync()
+{
+    SET_FLAG(M, MTE1, EVENT_ID0);
+    SET_FLAG(M, MTE1, EVENT_ID1);
+    SET_FLAG(M, MTE1, EVENT_ID2);
+    SET_FLAG(M, MTE1, EVENT_ID3);
+    SET_FLAG(M, MTE1, EVENT_ID4);
+    SET_FLAG(M, MTE1, EVENT_ID5);
+    SET_FLAG(M, MTE1, EVENT_ID6);
+    SET_FLAG(M, MTE1, EVENT_ID7);
+    SET_FLAG(FIX, M, EVENT_ID0);
+    SET_FLAG(FIX, M, EVENT_ID1);
+    SET_FLAG(MTE1, MTE2, EVENT_ID0);
+    SET_FLAG(MTE1, MTE2, EVENT_ID1);
+    SET_FLAG(MTE1, MTE2, EVENT_ID2);
+    SET_FLAG(MTE1, MTE2, EVENT_ID3);
+    SET_FLAG(MTE1, MTE2, EVENT_ID4);
+    SET_FLAG(MTE1, MTE2, EVENT_ID5);
+    SET_FLAG(MTE1, MTE2, EVENT_ID6);
+    SET_FLAG(MTE1, MTE2, EVENT_ID7);
+    SET_FLAG(FIX, MTE1, EVENT_ID0);
+    SET_FLAG(FIX, MTE1, EVENT_ID1);
+    SET_FLAG(FIX, MTE1, EVENT_ID2);
+    SET_FLAG(FIX, MTE1, EVENT_ID3);
+    SET_FLAG(FIX, MTE1, EVENT_ID4);
+    SET_FLAG(FIX, MTE1, EVENT_ID5);
+    SET_FLAG(MTE2, FIX, EVENT_ID0);
+}
+
+// 平台函数：等待管道同步完成（Run 方法尾部批量 WAIT_FLAG + BARRIER）
+__aicore__ __attribute__((always_inline)) inline void PlatformWaitPipeSync()
+{
+    WAIT_FLAG(M, MTE1, EVENT_ID0);
+    WAIT_FLAG(M, MTE1, EVENT_ID1);
+    WAIT_FLAG(M, MTE1, EVENT_ID2);
+    WAIT_FLAG(M, MTE1, EVENT_ID3);
+    WAIT_FLAG(M, MTE1, EVENT_ID4);
+    WAIT_FLAG(M, MTE1, EVENT_ID5);
+    WAIT_FLAG(M, MTE1, EVENT_ID6);
+    WAIT_FLAG(M, MTE1, EVENT_ID7);
+    WAIT_FLAG(FIX, M, EVENT_ID0);
+    WAIT_FLAG(FIX, M, EVENT_ID1);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID0);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID1);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID2);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID3);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID4);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID5);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID6);
+    WAIT_FLAG(MTE1, MTE2, EVENT_ID7);
+    WAIT_FLAG(FIX, MTE1, EVENT_ID0);
+    WAIT_FLAG(FIX, MTE1, EVENT_ID1);
+    WAIT_FLAG(FIX, MTE1, EVENT_ID2);
+    WAIT_FLAG(FIX, MTE1, EVENT_ID3);
+    WAIT_FLAG(FIX, MTE1, EVENT_ID4);
+    WAIT_FLAG(FIX, MTE1, EVENT_ID5);
+    WAIT_FLAG(MTE2, FIX, EVENT_ID0);
+    PIPE_BARRIER(ALL);
+}
+
+// ==================== TP1 QK 平台函数 ====================
+
+// 平台函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2 分支）
+// TP1 专有：L1 目标偏移 [l1_kv_pingpong_flag * 128 * 256]，dValue=256，使用 block_table_id+embed_split_idx 寻址
+__aicore__ __attribute__((always_inline)) inline void PlatformLoadTP1KVMainToL1(
+    uint32_t embed_split_idx, uint32_t qk_n, uint32_t qk_round_n,
+    uint32_t l1_kv_pingpong_flag, int64_t kv_offset, uint32_t embed_split_idx_128)
+{
+    WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);
+    if constexpr (KInputType == InputFormat::ND_FORMAT) {
+        gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::ND, DataFormat::NZ>(
+            l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 256],
+            k_gm_tensor[kv_offset + embed_split_idx_128],
+            qk_n,
+            qk_round_n,
+            0,
+            256,
+            0,
+            stride_kv);
+    } else {
+        gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
+            l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 256],
+            k_gm_tensor[kv_offset + block_size * 128 * embed_split_idx],
+            qk_round_n,
+            block_size,
+            qk_round_n,
+            256,
+            256, 256);
+    }
+    SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
+    WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
+}
+
+// 平台函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4 分支）
+// TP1 专有：L1 目标偏移 [l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128]，dValue=64
+__aicore__ __attribute__((always_inline)) inline void PlatformLoadTP1KVRopeToL1(
+    uint32_t qk_n, uint32_t qk_round_n,
+    uint32_t l1_kv_pingpong_flag, int64_t kv_offset_rope)
+{
+    WAIT_FLAG(MTE1, MTE2, 2 + l1_kv_pingpong_flag);
+    if constexpr (KInputType == InputFormat::ND_FORMAT) {
+        gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::ND, DataFormat::NZ>(
+            l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128],
+            k_rope_gm_tensor[kv_offset_rope],
+            qk_n,
+            qk_round_n,
+            0,
+            64,
+            0,
+            stride_kv_rope);
+    } else {
+        gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
+            l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128],
+            k_rope_gm_tensor[kv_offset_rope],
+            qk_round_n,
+            block_size,
+            qk_round_n,
+            64,
+            64,
+            64);
+    }
+    SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
+    WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
+}
+
+// 平台函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+// TP1 专有：L1 源偏移 [now_l1_offset + embed_split_idx % 2 * qk_round_n * 128]
+__aicore__ __attribute__((always_inline)) inline void PlatformLoadTP1KVToL0B(
+    uint32_t embed_split_idx, uint32_t round_embed_split_size,
+    uint32_t qk_round_n, int64_t now_l1_offset, uint32_t l1_kv_pingpong_flag)
+{
+    WAIT_FLAG(M, MTE1, embed_split_idx % 2 + 2);
+    l1_to_l0_b<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
+        l0b_buf_tensor[embed_split_idx % 2 * 16384],
+        l1kv_buf_addr_tensor[now_l1_offset + embed_split_idx % 2 * qk_round_n * 128],
+        0,
+        round_embed_split_size * qk_round_n / T_CUBE_MATRIX_SIZE,
+        0,
+        1,
+        0,
+        0);
+    // 释放 KV L1 缓冲区
+    if (embed_split_idx == 1 || embed_split_idx == 3) {
+        SET_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);
+    }
+    if (embed_split_idx == 4) {
+        SET_FLAG(MTE1, MTE2, 2 + l1_kv_pingpong_flag);
+    }
+    SET_FLAG(MTE1, M, embed_split_idx % 2 + 2);
+}
+
+// 平台函数：TP1 QK MMAD 计算（含同步）
+// TP1 与非 TP1 的 cmatrixInitVal 均为 (embed_split_idx == 0)，可复用逻辑
+__aicore__ __attribute__((always_inline)) inline void PlatformComputeTP1QKMMad(
+    uint32_t embed_split_idx, uint32_t embed_split_size,
+    uint32_t m_value, uint32_t qk_n, uint32_t l1_kv_pingpong_flag)
+{
+    WAIT_FLAG(MTE1, M, embed_split_idx % 2);
+    WAIT_FLAG(MTE1, M, embed_split_idx % 2 + 2);
+    if (embed_split_idx == 0) {
+        WAIT_FLAG(FIX, M, l1_kv_pingpong_flag);
+    }
+    mmad<ArchType::ASCEND_V220, IN_DTYPE, IN_DTYPE, mm1OutputType, false>(
+        mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
+        l0a_buf_tensor[embed_split_idx % 2 * 16384],
+        l0b_buf_tensor[embed_split_idx % 2 * 16384],
+        m_value,
+        qk_n,
+        embed_split_size,
+        embed_split_idx == 0);
+    PIPE_BARRIER(M);
+    SET_FLAG(M, MTE1, embed_split_idx % 2);
+    SET_FLAG(M, MTE1, embed_split_idx % 2 + 2);
+}
+
+// 平台函数：TP1 QK 结果从 L0C 拷贝到 GM（embed_split_idx == 4 时）
+// TP1 专有：GM 目标偏移 [block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar]
+//          dstStride = sv_round_n
+__aicore__ __attribute__((always_inline)) inline void PlatformCopyTP1QKResultToGM(
+    uint32_t m_value, uint32_t qk_round_n, uint32_t l1_kv_pingpong_flag,
+    uint64_t gm_dst_offset, uint32_t sv_round_n)
+{
+    SET_FLAG(M, FIX, l1_kv_pingpong_flag);
+    WAIT_FLAG(M, FIX, l1_kv_pingpong_flag);
+    l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, mm1CopyType, mm1OutputType>(
+        s_gm_tensor[gm_dst_offset],
+        mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
+        m_value,
+        qk_round_n,
+        RoundUp<16>(m_value),
+        sv_round_n);
+    SET_FLAG(FIX, M, l1_kv_pingpong_flag);
+}

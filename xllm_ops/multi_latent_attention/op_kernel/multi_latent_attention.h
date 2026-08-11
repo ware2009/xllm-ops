@@ -368,325 +368,16 @@ public:
 
     __aicore__ __attribute__((always_inline)) inline void Run()
     {
-        SET_FLAG(M, MTE1, EVENT_ID0);
-        SET_FLAG(M, MTE1, EVENT_ID1);
-        SET_FLAG(M, MTE1, EVENT_ID2);
-        SET_FLAG(M, MTE1, EVENT_ID3);
-        SET_FLAG(M, MTE1, EVENT_ID4);
-        SET_FLAG(M, MTE1, EVENT_ID5);
-        SET_FLAG(M, MTE1, EVENT_ID6);
-	    SET_FLAG(M, MTE1, EVENT_ID7);
-        SET_FLAG(FIX, M, EVENT_ID0);
-        SET_FLAG(FIX, M, EVENT_ID1);
-        SET_FLAG(MTE1, MTE2, EVENT_ID0);
-        SET_FLAG(MTE1, MTE2, EVENT_ID1);
-        SET_FLAG(MTE1, MTE2, EVENT_ID2);
-        SET_FLAG(MTE1, MTE2, EVENT_ID3);
-        SET_FLAG(MTE1, MTE2, EVENT_ID4);
-        SET_FLAG(MTE1, MTE2, EVENT_ID5);
-        SET_FLAG(MTE1, MTE2, EVENT_ID6);
-        SET_FLAG(MTE1, MTE2, EVENT_ID7);
-        SET_FLAG(FIX, MTE1, EVENT_ID0);
-        SET_FLAG(FIX, MTE1, EVENT_ID1);
-        SET_FLAG(FIX, MTE1, EVENT_ID2);
-        SET_FLAG(FIX, MTE1, EVENT_ID3);
-        SET_FLAG(FIX, MTE1, EVENT_ID4);
-        SET_FLAG(FIX, MTE1, EVENT_ID5);
-        SET_FLAG(MTE2, FIX, EVENT_ID0);
-
-
-        uint64_t cur_batch = 0;
-
-        uint32_t q_block_num_per_batch = (q_heads + cur_qn_blk_size - 1) / cur_qn_blk_size;
-        uint32_t process_num = q_block_num_per_batch * num_batches;
-
-        for (uint32_t process = block_idx; process < process_num; process += (uint32_t)block_num) {  // for task
-            cur_batch = process / q_block_num_per_batch;
-            if (cur_batch >= num_batches) break;
-
-            uint32_t offset_tiling = tiling_head_size + tiling_para_size * cur_batch;
-            uint32_t start_core_idx = (cur_batch * q_block_num_per_batch) % block_num;
-
-            uint32_t q_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-            uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
-            if (kv_seqlen == 0) {
-                continue;
-            }
-            uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
-
-            uint32_t start_head = (process % q_block_num_per_batch) * cur_qn_blk_size;
-            uint32_t start_kv = 0;
-            uint32_t cur_q_seq_len = q_seqlen;
-            uint32_t cur_kv_seqlen = kv_seqlen;
-            uint32_t cur_head_num = cur_qn_blk_size;
-
-            InnerRunCubeMLA(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen,
-                            offset_tiling);
-        }
-        WAIT_FLAG(M, MTE1, EVENT_ID0);
-        WAIT_FLAG(M, MTE1, EVENT_ID1);
-        WAIT_FLAG(M, MTE1, EVENT_ID2);
-        WAIT_FLAG(M, MTE1, EVENT_ID3);
-        WAIT_FLAG(M, MTE1, EVENT_ID4);
-        WAIT_FLAG(M, MTE1, EVENT_ID5);
-        WAIT_FLAG(M, MTE1, EVENT_ID6);
-        WAIT_FLAG(M, MTE1, EVENT_ID7);
-        WAIT_FLAG(FIX, M, EVENT_ID0);
-        WAIT_FLAG(FIX, M, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID0);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID2);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID3);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID4);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID5);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID6);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID7);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID0);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID1);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID2);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID3);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID4);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID5);
-        WAIT_FLAG(MTE2, FIX, EVENT_ID0);
-        PIPE_BARRIER(ALL);
+        PlatformInitPipeSync();
+        ScheduleCubeTasks();
+        PlatformWaitPipeSync();
     }
 
     __aicore__ __attribute__((always_inline)) inline void RunTP1()
     {
-        SET_FLAG(M, MTE1, EVENT_ID0);
-        SET_FLAG(M, MTE1, EVENT_ID1);
-        SET_FLAG(M, MTE1, EVENT_ID2);
-        SET_FLAG(M, MTE1, EVENT_ID3);
-        SET_FLAG(M, MTE1, EVENT_ID4);
-        SET_FLAG(M, MTE1, EVENT_ID5);
-        SET_FLAG(M, MTE1, EVENT_ID6);
-	    SET_FLAG(M, MTE1, EVENT_ID7);
-        SET_FLAG(FIX, M, EVENT_ID0);
-        SET_FLAG(FIX, M, EVENT_ID1);
-        SET_FLAG(MTE1, MTE2, EVENT_ID0);
-        SET_FLAG(MTE1, MTE2, EVENT_ID1);
-        SET_FLAG(MTE1, MTE2, EVENT_ID2);
-        SET_FLAG(MTE1, MTE2, EVENT_ID3);
-        SET_FLAG(MTE1, MTE2, EVENT_ID4);
-        SET_FLAG(MTE1, MTE2, EVENT_ID5);
-        SET_FLAG(MTE1, MTE2, EVENT_ID6);
-        SET_FLAG(MTE1, MTE2, EVENT_ID7);
-        SET_FLAG(FIX, MTE1, EVENT_ID0);
-        SET_FLAG(FIX, MTE1, EVENT_ID1);
-        SET_FLAG(FIX, MTE1, EVENT_ID2);
-        SET_FLAG(FIX, MTE1, EVENT_ID3);
-        SET_FLAG(FIX, MTE1, EVENT_ID4);
-        SET_FLAG(FIX, MTE1, EVENT_ID5);
-        SET_FLAG(MTE2, FIX, EVENT_ID0);
-
-        uint32_t tail = totalTaskNum % block_num;
-        if constexpr (EnableOptimization) {
-
-        } else{
-            tail = 0; // control whether to run tail optimization
-        }
-        uint32_t totalTaskNumRound = totalTaskNum - tail;
-        
-        
-        for (uint32_t process = block_idx; process < totalTaskNumRound; process += (uint32_t)block_num) {  // for task
-            uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
-            uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-
-            uint32_t q_seqlen = 1;
-            uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
-            if (kv_seqlen == 0) {
-                continue;
-            }
-            uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
-
-            uint32_t start_head = 0;
-            uint32_t start_kv = 0;
-            uint32_t cur_q_seq_len = q_seqlen;
-            uint32_t cur_kv_seqlen = kv_seqlen;
-            uint32_t cur_head_num = q_heads;
-
-            InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
-        }
-
-        // suppose all seqs have same length
-        if (tail > 0){
-            uint32_t sample_kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + tiling_head_size + 2));
-            bool enableExtraOptimization = true;
-            if (block_num % 4 == 3) {
-                // cannot optimize this situation due to math problem
-                enableExtraOptimization = false;
-            }
-            if (sample_kv_seqlen <= 2048){
-                // Too Short to benefit from optimization
-                enableExtraOptimization = false;
-            }
-            if (!enableExtraOptimization || tail <= block_num / 2) {
-                // collect all metadata
-                uint32_t cores_per_seq = 1;
-                if (0 < tail && tail <= block_num / 4) {// 6 tasks left, each works with 4 cores
-                    cores_per_seq = 4;
-                    if (tail == 1){
-                        cores_per_seq = block_num;
-                    }
-                    else if (tail == 2){
-                        cores_per_seq = block_num / 2;
-                    }
-                    else if(tail == 3){
-                        cores_per_seq = block_num / 3;
-                    }
-                    else if(tail == 4){
-                        cores_per_seq = block_num / 4;
-                    }
-                }
-                else if(block_num / 4 < tail && tail <= block_num / 3) { // 8 tasks left, each works with 3 cores
-                    cores_per_seq = 3;
-    
-                }
-                else if(block_num / 3 < tail && tail <= block_num / 2) { // 12 tasks left, each works with 2 cores
-                    cores_per_seq = 2;
-                }
-                else {
-                    // no extra optimization for tail > 12
-                    cores_per_seq = 1;
-                }
-
-                if(!enableExtraOptimization){
-                    cores_per_seq = 1;
-                }
-    
-                uint32_t process = totalTaskNumRound + block_idx / cores_per_seq;
-                if (process < totalTaskNum) {
-                    uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
-                    uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-        
-                    uint32_t q_seqlen = 1;
-                    uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
-                    uint32_t kv_seqlen_each = kv_seqlen / cores_per_seq;
-                    uint32_t kv_seqlen_align = (kv_seqlen_each + block_size - 1) / block_size * block_size;
-                    uint32_t actual_work_cores = kv_seqlen / kv_seqlen_align + (kv_seqlen % kv_seqlen_align != 0);
-                    // cores_per_seq = actual_work_cores;
-                    uint32_t kv_seqlen_process = 0;
-                    if (block_idx < block_idx / cores_per_seq * cores_per_seq + actual_work_cores){
-                        kv_seqlen_process = (block_idx % cores_per_seq == actual_work_cores - 1) ? 
-                            (kv_seqlen - kv_seqlen_align * (actual_work_cores - 1)) : kv_seqlen_align;
-                    }
-                        
-                    if (kv_seqlen > 0 && kv_seqlen_process > 0) {
-                        uint32_t start_head = 0;
-                        uint32_t start_kv = (block_idx % cores_per_seq) * kv_seqlen_align;
-                        uint32_t cur_q_seq_len = q_seqlen;
-                        uint32_t cur_kv_seqlen = kv_seqlen_process;
-                        uint32_t cur_head_num = q_heads;
-            
-                        // no need to modify anything in cube kernel, just call the same kernel
-                        InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
-                    }
-                }
-            }
-            else if (tail > 3 * block_num / 4){
-                // no benefit for optimizing this situation
-                uint32_t process = totalTaskNumRound + block_idx;
-                if (process < totalTaskNum) {
-                    uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
-                    uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-
-                    uint32_t q_seqlen = 1;
-                    uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
-                    if (kv_seqlen > 0) {
-                        uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
-    
-                        uint32_t start_head = 0;
-                        uint32_t start_kv = 0;
-                        uint32_t cur_q_seq_len = q_seqlen;
-                        uint32_t cur_kv_seqlen = kv_seqlen;
-                        uint32_t cur_head_num = q_heads;
-    
-                        InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
-                    }
-                }
-            }
-            else {
-                // 18 >= tail >= 12 
-                // first 12 tasks, two cores per task
-                {
-                    uint32_t cores_per_seq = 2;
-                    uint32_t process = totalTaskNumRound + block_idx / cores_per_seq;
-                    uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
-                    uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-        
-                    uint32_t q_seqlen = 1;
-                    uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
-                    uint32_t kv_seqlen_each = kv_seqlen / cores_per_seq;
-                    uint32_t kv_seqlen_align = (kv_seqlen_each + block_size - 1) / block_size * block_size;
-                    uint32_t kv_seqlen_process = (block_idx % cores_per_seq == cores_per_seq - 1) ? 
-                    (kv_seqlen - kv_seqlen_align * (cores_per_seq - 1)) : kv_seqlen_align;
-                    
-                    if (kv_seqlen > 0 && kv_seqlen_process > 0) {
-                        uint32_t start_head = 0;
-                        uint32_t start_kv = (block_idx % cores_per_seq) * kv_seqlen_align;
-                        uint32_t cur_q_seq_len = q_seqlen;
-                        uint32_t cur_kv_seqlen = kv_seqlen_process;
-                        uint32_t cur_head_num = q_heads;
-            
-                        // no need to modify anything in cube kernel, just call the same kernel
-                        InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
-                    }
-                }
-                {
-                    uint32_t cores_per_seq = 4;
-                    uint32_t process = totalTaskNumRound + block_num / 2 + block_idx / cores_per_seq;
-                    if (process < totalTaskNum) {
-                        uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
-                        uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-            
-                        uint32_t q_seqlen = 1;
-                        uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
-                        uint32_t kv_seqlen_each = kv_seqlen / cores_per_seq;
-                        uint32_t kv_seqlen_align = (kv_seqlen_each + block_size - 1) / block_size * block_size;
-                        uint32_t kv_seqlen_process = (block_idx % cores_per_seq == cores_per_seq - 1) ? 
-                        (kv_seqlen - kv_seqlen_align * (cores_per_seq - 1)) : kv_seqlen_align;
-                        
-                        if (kv_seqlen > 0 && kv_seqlen_process > 0) {
-                            uint32_t start_head = 0;
-                            uint32_t start_kv = (block_idx % cores_per_seq) * kv_seqlen_align;
-                            uint32_t cur_q_seq_len = q_seqlen;
-                            uint32_t cur_kv_seqlen = kv_seqlen_process;
-                            uint32_t cur_head_num = q_heads;
-                
-                            // no need to modify anything in cube kernel, just call the same kernel
-                            InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
-                        }
-                    }
-                }
-            }
-        }
-
-        WAIT_FLAG(M, MTE1, EVENT_ID0);
-        WAIT_FLAG(M, MTE1, EVENT_ID1);
-        WAIT_FLAG(M, MTE1, EVENT_ID2);
-        WAIT_FLAG(M, MTE1, EVENT_ID3);
-        WAIT_FLAG(M, MTE1, EVENT_ID4);
-        WAIT_FLAG(M, MTE1, EVENT_ID5);
-        WAIT_FLAG(M, MTE1, EVENT_ID6);
-        WAIT_FLAG(M, MTE1, EVENT_ID7);
-        WAIT_FLAG(FIX, M, EVENT_ID0);
-        WAIT_FLAG(FIX, M, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID0);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID2);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID3);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID4);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID5);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID6);
-        WAIT_FLAG(MTE1, MTE2, EVENT_ID7);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID0);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID1);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID2);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID3);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID4);
-        WAIT_FLAG(FIX, MTE1, EVENT_ID5);
-        WAIT_FLAG(MTE2, FIX, EVENT_ID0);
-        PIPE_BARRIER(ALL);
+        PlatformInitPipeSync();
+        ScheduleCubeTasksTP1();
+        PlatformWaitPipeSync();
     }
 
 private:
@@ -902,10 +593,136 @@ private:
         uint64_t l1kv_offset;
     };
 
+    // ==================== InnerRunCubeMLATP1 三层架构拆分 ====================
+    // === 第一层：TP1Context 结构体 ===
+    struct TP1Context {
+        // input params
+        uint32_t cur_batch;
+        uint32_t start_head;
+        uint32_t cur_head_num;
+        uint32_t start_kv;
+        uint32_t cur_q_seqlen;
+        uint32_t cur_kv_seqlen;
+        uint32_t offset_tiling;
+
+        // Q address
+        uint64_t q_offset;
+        uint64_t q_rope_offset;
+
+        // loop & size
+        uint32_t pp_n_scalar;
+        uint32_t sub_n_loop;
+        uint32_t n_loop;
+
+        // QK dims
+        uint32_t qk_n;
+        uint32_t qk_round_n;
+        uint32_t qk_n_2;
+        uint32_t qk_round_n_2;
+
+        // row info
+        uint32_t row_num;
+        // m is class member
+
+        // TP1 专有字段
+        uint32_t sv_n;            // PV阶段有效列数（动态变化）
+        uint32_t s_block_stack;   // 流水线深度=4
+    };
+
+    // === 第一层：InitTP1Context 编排层 ===
+    __aicore__ __attribute__((always_inline)) inline void InitTP1Context(
+        TP1Context &ctx, uint32_t cur_batch, uint32_t start_head, uint32_t cur_head_num,
+        uint32_t start_kv, uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t offset_tiling)
+    {
+        ctx.cur_batch = cur_batch;
+        ctx.start_head = start_head;
+        ctx.cur_head_num = cur_head_num;
+        ctx.start_kv = start_kv;
+        ctx.cur_q_seqlen = cur_q_seqlen;
+        ctx.cur_kv_seqlen = cur_kv_seqlen;
+        ctx.offset_tiling = offset_tiling;
+
+        uint32_t prev_task = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
+        uint64_t addr_q_scalar = (uint64_t)prev_task * q_heads;
+        ctx.q_offset = addr_q_scalar * 512 + start_head * 512;
+        ctx.q_rope_offset = addr_q_scalar * 64 + start_head * 64;
+
+        ctx.pp_n_scalar = block_size;
+        ctx.sub_n_loop = ctx.pp_n_scalar / block_size;
+        ctx.n_loop = (cur_kv_seqlen + ctx.pp_n_scalar - 1) / ctx.pp_n_scalar;
+
+        ctx.qk_n = ctx.pp_n_scalar;
+        ctx.qk_round_n = RoundUp<BLOCK_SIZE>(ctx.qk_n);
+        ctx.qk_n_2 = ctx.pp_n_scalar;
+        ctx.qk_round_n_2 = RoundUp<BLOCK_SIZE>(ctx.qk_n_2);
+
+        ctx.row_num = cur_head_num * cur_q_seqlen;
+        ctx.sv_n = ctx.n_loop == 1 ? cur_kv_seqlen : ctx.pp_n_scalar;
+        m = RoundUp<16>(ctx.row_num);
+
+        ctx.s_block_stack = 4;
+    }
+
+    // === 第一层：LoadTP1QData 编排层 ===
+    __aicore__ __attribute__((always_inline)) inline void LoadTP1QData(TP1Context &ctx)
+    {
+        LoadQMainFromGMToL1(l1q_buf_addr_tensor, q_gm_tensor, ctx.q_offset, ctx.cur_q_seqlen, ctx.cur_head_num);
+        LoadQRopeFromGMToL1(l1q_buf_addr_tensor, l1q_rope_buf_addr_tensor, q_rope_gm_tensor, ctx.q_rope_offset, ctx.cur_q_seqlen, ctx.cur_head_num);
+        PlatformSetQLoadComplete();
+    }
+
+
     // [PV 第三层平台函数 + 第二层业务函数] 已迁移至 arch32.h / bs.h
-    // === 以下 include 第三层和第二层子文件（放在 QKParams/PVParams 之后，确保类型可见）===
+    // === 以下 include 第三层和第二层子文件（放在 QKParams/PVParams/TP1Context 之后，确保类型可见）===
     #include "multi_latent_attention_arch32.h"
     #include "multi_latent_attention_bs.h"
+
+    // === 第一层：ComputeTP1QK 编排层（CUBE1 stage1）===
+    // 外层 split_idx 循环 + 内层 embed_split_idx 循环（5次: 0-4）
+    // idx 0,2: Q→L0A + KV Main GM→L1
+    // idx 1,3: Q→L0A + KV L1→L0B + mmad
+    // idx 4:   Q→L0A + KV Rope GM→L1 + L1→L0B + mmad + S→GM
+    // 循环后: FftsCrossCoreSync
+    __aicore__ __attribute__((always_inline)) inline void ComputeTP1QK(
+        TP1Context &ctx, uint32_t n_idx)
+    {
+        for (uint32_t split_idx = 0; split_idx < ctx.s_block_stack && n_idx + split_idx < ctx.n_loop; split_idx++) {
+            TP1QKParams params;
+            InitTP1QKParams(ctx, split_idx, n_idx, params);
+
+            for (uint32_t embed_split_idx = 0; embed_split_idx < 5; ++embed_split_idx) {
+                if (embed_split_idx == 4) {
+                    params.embed_split_size = 64;
+                    params.round_embed_split_size = 64;
+                }
+
+                // Q L1→L0A
+                LoadTP1QDataToL0A(params, embed_split_idx);
+
+                // KV Main GM→L1 (idx 0,2)
+                if (embed_split_idx == 0 || embed_split_idx == 2) {
+                    LoadTP1KVMainFromGM(params, embed_split_idx);
+                }
+
+                // KV Rope GM→L1 (idx 4)
+                if (embed_split_idx == 4) {
+                    LoadTP1KVRopeFromGM(params, embed_split_idx);
+                }
+
+                // KV L1→L0B (all idx)
+                LoadTP1KVDataToL0B(params, embed_split_idx);
+
+                // QK mmad
+                ComputeTP1QKMMad(params, embed_split_idx);
+
+                // S→GM (idx 4)
+                if (embed_split_idx == 4) {
+                    CopyTP1QKResultToGM(params, embed_split_idx, n_idx);
+                }
+            }
+        }
+        FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_DECODER);
+    }
 
     // === 第一层：ComputePV 编排层 ===
     __aicore__ __attribute__((always_inline)) inline void ComputePV(
@@ -967,204 +784,27 @@ private:
     __aicore__ __attribute__((always_inline)) inline void InnerRunCubeMLATP1(uint32_t cur_batch, uint32_t start_head, uint32_t cur_head_num,
         uint32_t start_kv, uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t offset_tiling)
     {
-        uint32_t prev_task = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
-        uint64_t addr_q_scalar = (uint64_t)prev_task * q_heads;
-        uint64_t q_offset = addr_q_scalar * 512 + start_head * 512;
-        uint64_t q_rope_offset = addr_q_scalar * 64 + start_head * 64;
+        TP1Context ctx;
+        InitTP1Context(ctx, cur_batch, start_head, cur_head_num,
+                       start_kv, cur_q_seqlen, cur_kv_seqlen, offset_tiling);
+        LoadTP1QData(ctx);
 
-        uint32_t pp_n_scalar = block_size;
-        uint32_t sub_n_loop = pp_n_scalar / block_size;
-
-        uint32_t n_loop = (cur_kv_seqlen + pp_n_scalar - 1) / pp_n_scalar;
-
-        uint32_t qk_n = pp_n_scalar;
-        uint32_t qk_round_n = RoundUp<BLOCK_SIZE>(qk_n);
-        uint32_t qk_n_2 = pp_n_scalar;
-        uint32_t qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
-
-        uint32_t row_num  = cur_head_num * cur_q_seqlen;
-
-        uint32_t sv_n = n_loop == 1 ? cur_kv_seqlen : pp_n_scalar;
-        m = RoundUp<16>(row_num);
-
-        // copy Q
-        LoadQMainFromGMToL1(l1q_buf_addr_tensor, q_gm_tensor, q_offset, cur_q_seqlen, cur_head_num);
-        LoadQRopeFromGMToL1(l1q_buf_addr_tensor, l1q_rope_buf_addr_tensor, q_rope_gm_tensor, q_rope_offset, cur_q_seqlen, cur_head_num);
-
-        SET_FLAG(MTE2, MTE1, EVENT_ID0);
-        WAIT_FLAG(MTE2, MTE1, EVENT_ID0);
-        uint32_t s_block_stack = 4;
+        uint32_t pp_n_scalar = ctx.pp_n_scalar;
+        uint32_t n_loop = ctx.n_loop;
+        uint32_t s_block_stack = ctx.s_block_stack;
         for (uint32_t n_idx = 0; n_idx < n_loop + s_block_stack; n_idx+=s_block_stack) {
             if (n_idx < n_loop) {
-                uint32_t sv_n_triu = n_loop * pp_n_scalar;
-                if (n_idx + s_block_stack > n_loop - 1) {
-                    sv_n = cur_kv_seqlen - n_idx * pp_n_scalar; // delete
-                } else {
-                    sv_n = pp_n_scalar * s_block_stack;
-                }
-                uint32_t sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
-                for (uint32_t split_idx = 0; split_idx < s_block_stack && n_idx + split_idx < n_loop; split_idx++) {
-                    uint32_t now_idx = n_idx + split_idx;
-                    uint32_t l1_kv_pingpong_flag = now_idx % 2;
-                    if (now_idx == (n_loop - 1)) {
-                        qk_n = (cur_kv_seqlen - now_idx * pp_n_scalar);
-                        qk_round_n = RoundUp<BLOCK_SIZE>(qk_n);
-                    } else  {
-                        qk_n = pp_n_scalar;
-                        qk_round_n = RoundUp<BLOCK_SIZE>(qk_n);
-                    }
-                    bool last_split = split_idx == s_block_stack - 1 || now_idx == n_loop - 1;
-                    uint32_t embed_split_size = 128;
-                    uint32_t round_embed_split_size = RoundUp<T_BLOCK_SIZE>(embed_split_size);
-
-                    /* ************ CUBE1 stage1  ************* */
-
-                    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
-                                    cur_batch * max_num_blocks_per_query + start_kv / block_size + now_idx));
-                    int64_t kv_offset = (int64_t)block_table_id * block_size * stride_kv;
-                    int64_t kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
-
-
-                    uint32_t q_load_coeff = 1;
-                    q_load_coeff = m;
-                    int64_t now_l1_offset = 0;
-                    for (uint32_t embed_split_idx = 0; embed_split_idx < 5; ++embed_split_idx) {
-                        if (embed_split_idx == 4) {
-                            embed_split_size = 64;
-                            round_embed_split_size = 64;
-                        }
-                        WAIT_FLAG(M, MTE1, embed_split_idx % 2);
-
-                        for (uint64_t loa_load_idx = 0; loa_load_idx < q_load_coeff / BLOCK_SIZE; ++loa_load_idx) {
-                            l1_to_l0_a<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                                l0a_buf_tensor[embed_split_idx % 2 * 16384 + loa_load_idx * round_embed_split_size * BLOCK_SIZE],
-                                l1q_buf_addr_tensor[embed_split_idx * m * 128 + loa_load_idx * T_CUBE_MATRIX_SIZE],
-                                0,
-                                round_embed_split_size / T_BLOCK_SIZE,                                 // repeat
-                                0,
-                                q_load_coeff / BLOCK_SIZE,                            // srcStride
-                                0,
-                                0                                                     // dstStride
-                            );
-                        }
-
-                        SET_FLAG(MTE1, M, embed_split_idx % 2);
-                        if (embed_split_idx == 0 || embed_split_idx == 2) {
-                            WAIT_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);  // 等待V全部搬入L0B
-                            now_l1_offset = l1_kv_pingpong_flag * 128 * 256;
-                            if constexpr(KInputType == InputFormat::ND_FORMAT) {
-                                gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::ND, DataFormat::NZ>(
-                                    l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 256],
-                                    k_gm_tensor[kv_offset + embed_split_idx * 128],
-                                    qk_n,         // nValue
-                                    qk_round_n,             // dstNzC0Stride
-                                    0,                     // dstNzMatrixStride, unused
-                                    256,            // dValue
-                                    0,                     // dstNzMatrixStride, unused
-                                    stride_kv            // srcDValue
-                                );
-                            } else {
-                                gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
-                                    l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 256],
-                                    k_gm_tensor[kv_offset + block_size * 128 * embed_split_idx],
-                                    qk_round_n,
-                                    block_size,
-                                    qk_round_n,
-                                    256,
-                                    256, 256);
-                            }
-                            SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-                            WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-                        } else if (embed_split_idx == 4) {
-                            WAIT_FLAG(MTE1, MTE2, 2 + l1_kv_pingpong_flag);
-                            now_l1_offset = l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
-                            if constexpr(KInputType == InputFormat::ND_FORMAT) {
-                                gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::ND, DataFormat::NZ>(
-                                    l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128],
-                                    k_rope_gm_tensor[kv_offset_rope],
-                                    qk_n,         // nValue
-                                    qk_round_n,             // dstNzC0Stride
-                                    0,                     // dstNzMatrixStride, unused
-                                    64,            // dValue
-                                    0,                     // dstNzMatrixStride, unused
-                                    stride_kv_rope            // srcDValue
-                                );
-                            } else {
-                                gm_to_l1<ArchType::ASCEND_V220, IN_KVDTYPE, DataFormat::NZ, DataFormat::NZ>(
-                                    l1kv_buf_addr_tensor[l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128],
-                                    k_rope_gm_tensor[kv_offset_rope],
-                                    qk_round_n,
-                                    block_size,
-                                    qk_round_n,
-                                    64,
-                                    64,
-                                    64);
-                            }
-                            SET_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-                            WAIT_FLAG(MTE2, MTE1, l1_kv_pingpong_flag);
-                        }
-                        WAIT_FLAG(M, MTE1, embed_split_idx % 2 + 2);
-                        l1_to_l0_b<ArchType::ASCEND_V220, IN_DTYPE, false, DataFormat::VECTOR, DataFormat::VECTOR>(
-                            l0b_buf_tensor[embed_split_idx % 2 * 16384],
-                            l1kv_buf_addr_tensor[now_l1_offset + embed_split_idx % 2 * qk_round_n * 128],
-                            0,
-                            round_embed_split_size * qk_round_n / T_CUBE_MATRIX_SIZE,  // repeat
-                            0,
-                            1,                                        // srcStride
-                            0,
-                            0                                        // dstStride
-                        );
-                        if (embed_split_idx == 1 || embed_split_idx == 3) {
-                            SET_FLAG(MTE1, MTE2, l1_kv_pingpong_flag);
-                        }
-                        if (embed_split_idx == 4) {
-                            SET_FLAG(MTE1, MTE2, 2 + l1_kv_pingpong_flag);
-                        }
-                        SET_FLAG(MTE1, M, embed_split_idx % 2 + 2);
-                        WAIT_FLAG(MTE1, M, embed_split_idx % 2);
-                        WAIT_FLAG(MTE1, M, embed_split_idx % 2 + 2);
-                        if (embed_split_idx == 0) {
-                            WAIT_FLAG(FIX, M, l1_kv_pingpong_flag);
-                        }
-                        mmad<ArchType::ASCEND_V220, IN_DTYPE, IN_DTYPE, mm1OutputType, false>(
-                            mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                            l0a_buf_tensor[embed_split_idx % 2 * 16384],
-                            l0b_buf_tensor[embed_split_idx % 2 * 16384],
-                            m,     // m
-                            qk_n,  // n
-                            embed_split_size,   // k
-                            embed_split_idx == 0     // cmatrixInitVal
-                        );
-                        PIPE_BARRIER(M);
-                        SET_FLAG(M, MTE1, embed_split_idx % 2);
-                        SET_FLAG(M, MTE1, embed_split_idx % 2 + 2);
-
-                        // copy S to gm
-                        if (embed_split_idx == 4) {
-                            SET_FLAG(M, FIX, l1_kv_pingpong_flag);
-                            WAIT_FLAG(M, FIX, l1_kv_pingpong_flag);
-
-                            l0c_to_gm<ArchType::ASCEND_V220, DataFormat::ND, mm1CopyType, mm1OutputType>(
-                                s_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER * 4 + (uint64_t)((n_idx / s_block_stack) % 2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar],
-                                mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-                                m,           // MSize
-                                qk_round_n,  // NSize
-                                RoundUp<16>(m), // srcStride
-                                sv_round_n  // dstStride_dst_D
-                            );
-                            SET_FLAG(FIX, M, l1_kv_pingpong_flag);
-                        }
-                    }
-                }
-                FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_DECODER);
+                ComputeTP1QK(ctx, n_idx);
             }
             /* ************ CUBE2 stage1  ************* */
             if (n_idx >= s_block_stack) {
                 if (n_idx + s_block_stack > n_loop + s_block_stack - 1) {
-                    sv_n = cur_kv_seqlen - (n_idx - s_block_stack) * pp_n_scalar; // delete
+                    ctx.sv_n = cur_kv_seqlen - (n_idx - s_block_stack) * pp_n_scalar; // delete
                 } else {
-                    sv_n = pp_n_scalar * s_block_stack;
+                    ctx.sv_n = pp_n_scalar * s_block_stack;
                 }
+                uint32_t sv_n = ctx.sv_n;
+                uint32_t row_num = ctx.row_num;
                 uint32_t sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
                 uint32_t embed_split_size = 128;
                 embed_split_loop_v = 4;
@@ -1175,11 +815,13 @@ private:
                     for (uint32_t split_idx = 0; split_idx < s_block_stack && n_idx + split_idx < n_loop + s_block_stack; split_idx++) {
                         uint32_t now_idx = n_idx + split_idx;
                         if (now_idx == (n_loop + s_block_stack - 1)) {
-                            qk_n_2 = (cur_kv_seqlen - (now_idx - s_block_stack) * pp_n_scalar);
+                            ctx.qk_n_2 = (cur_kv_seqlen - (now_idx - s_block_stack) * pp_n_scalar);
                         } else {
-                            qk_n_2 = pp_n_scalar;
+                            ctx.qk_n_2 = pp_n_scalar;
                         }
-                        qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
+                        ctx.qk_round_n_2 = RoundUp<BLOCK_SIZE>(ctx.qk_n_2);
+                        uint32_t qk_n_2 = ctx.qk_n_2;
+                        uint32_t qk_round_n_2 = ctx.qk_round_n_2;
                         uint32_t l1_kv_pingpong_flag = now_idx % 2;
                         uint32_t l0_p_pingpong_flag = now_idx % 2;
                         uint32_t l0b_pingpong_flag = now_idx % 2;
@@ -1485,55 +1127,9 @@ public:
 
     __aicore__ __attribute__((always_inline)) inline void Run()
     {
-        SET_FLAG(MTE3, V, EVENT_ID0);
-        SET_FLAG(MTE3, MTE2, EVENT_ID0);
-        SET_FLAG(MTE3, MTE2, EVENT_ID2);
-        SET_FLAG(MTE3, MTE2, EVENT_ID3);
-        SET_FLAG(MTE3, MTE2, EVENT_ID4);
-        SET_FLAG(V, MTE2, EVENT_ID4);
-        SET_FLAG(V, MTE2, EVENT_ID0);
-        SET_FLAG(MTE3, V, EVENT_ID2);
-        SET_FLAG(V, MTE2, EVENT_ID2);
-
-
-        uint64_t cur_batch = 0;
-
-        uint32_t q_block_num_per_batch = (q_heads + cur_qn_blk_size - 1) / cur_qn_blk_size;
-        uint32_t process_num = q_block_num_per_batch * num_batches;
-
-        for (uint32_t process = block_idx; process < process_num; process += (uint32_t)block_num) {  // for task
-            cur_batch = process / q_block_num_per_batch;
-            if (cur_batch >= num_batches) break;
-
-            uint32_t offset_tiling = tiling_head_size + tiling_para_size * cur_batch;
-            uint32_t start_core_idx = (cur_batch * q_block_num_per_batch) % block_num;
-
-            uint32_t q_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
-            uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
-            if (kv_seqlen == 0) {
-                continue;
-            }
-            uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
-
-            uint32_t start_head = (process % q_block_num_per_batch) * cur_qn_blk_size;
-            uint32_t start_kv = 0;
-            uint32_t cur_q_seq_len = q_seqlen;
-            uint32_t cur_kv_seqlen = kv_seqlen;
-            uint32_t cur_head_num = cur_qn_blk_size;
-            uint32_t cur_nIndx = 0;
-            InnerRunVectorChange(cur_batch, start_head, cur_nIndx, cur_q_seq_len, cur_kv_seqlen, cur_head_num,
-                offset_tiling, 512, embed_split_loop_v_former);
-        }
-
-        WAIT_FLAG(MTE3, V, EVENT_ID0);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID0);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID2);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID3);
-        WAIT_FLAG(MTE3, MTE2, EVENT_ID4);
-        WAIT_FLAG(V, MTE2, EVENT_ID0);
-        WAIT_FLAG(V, MTE2, EVENT_ID4);
-        WAIT_FLAG(MTE3, V, EVENT_ID2);
-        WAIT_FLAG(V, MTE2, EVENT_ID2);
+        PlatformInitVectorPipeSync();
+        ScheduleVectorTasks();
+        PlatformWaitVectorPipeSync();
     }
 
     __aicore__ __attribute__((always_inline)) inline void RunTP1()
@@ -1807,6 +1403,10 @@ public:
         WAIT_FLAG(V, MTE2, EVENT_ID2);
     }
 private:
+
+    // [AIV 第三层平台函数 + 第二层业务函数] 已迁移至 aiv_arch32.h / aiv_bs.h
+    #include "multi_latent_attention_aiv_arch32.h"
+    #include "multi_latent_attention_aiv_bs.h"
 
 
    __aicore__ __attribute__((always_inline)) inline void ReduceMaxRepeatM(

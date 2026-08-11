@@ -82,6 +82,131 @@ __aicore__ __attribute__((always_inline)) inline void LoadQMainFromGMToL1(
     }
 }
 
+// ==================== TP1 QK 业务函数 ====================
+
+// TP1 QK 参数结构体
+struct TP1QKParams {
+    uint32_t qk_n;
+    uint32_t qk_round_n;
+    uint32_t l1_kv_pingpong_flag;
+    uint32_t embed_split_size;
+    uint32_t round_embed_split_size;
+    int64_t now_l1_offset;
+    int64_t kv_offset;
+    int64_t kv_offset_rope;
+    uint32_t sv_round_n;
+    uint32_t gm_split_idx;  // split_idx 用于 GM 偏移计算
+    uint32_t pp_n_scalar;   // block_size，用于 GM 偏移计算
+};
+
+// 业务函数：初始化 TP1 QK 参数
+// 对应原始 CUBE1 stage1 中 split_idx 循环体内的参数计算
+__aicore__ __attribute__((always_inline)) inline void InitTP1QKParams(
+    TP1Context &ctx, uint32_t split_idx, uint32_t n_idx, TP1QKParams &params)
+{
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t now_idx = n_idx + split_idx;
+
+    params.l1_kv_pingpong_flag = now_idx % 2;
+
+    // 动态计算 qk_n / qk_round_n
+    if (now_idx == (n_loop - 1)) {
+        params.qk_n = (ctx.cur_kv_seqlen - now_idx * pp_n_scalar);
+    } else {
+        params.qk_n = pp_n_scalar;
+    }
+    params.qk_round_n = RoundUp<BLOCK_SIZE>(params.qk_n);
+
+    // embed_split_size 默认 128，idx==4 时为 64（在编排层设置）
+    params.embed_split_size = 128;
+    params.round_embed_split_size = RoundUp<T_BLOCK_SIZE>(params.embed_split_size);
+
+    // now_l1_offset 默认 0，在 LoadTP1KVMain/KVRope 中更新
+    params.now_l1_offset = 0;
+
+    // block_table_id / kv_offset / kv_offset_rope 地址计算
+    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
+                    ctx.cur_batch * max_num_blocks_per_query + ctx.start_kv / block_size + now_idx));
+    params.kv_offset = (int64_t)block_table_id * block_size * stride_kv;
+    params.kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
+
+    // sv_round_n 计算（用于 S→GM 的 dstStride）
+    uint32_t sv_n_triu = n_loop * pp_n_scalar;
+    uint32_t sv_n;
+    if (n_idx + ctx.s_block_stack > n_loop - 1) {
+        sv_n = ctx.cur_kv_seqlen - n_idx * pp_n_scalar;
+    } else {
+        sv_n = pp_n_scalar * ctx.s_block_stack;
+    }
+    params.sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+
+    params.gm_split_idx = split_idx;
+    params.pp_n_scalar = pp_n_scalar;
+}
+
+// 业务函数：TP1 Q 数据从 L1 加载到 L0A
+// 复用非 TP1 的 PlatformWaitQLoadComplete / PlatformLoadQToL0A / PlatformSetQLoadComplete
+// TP1 中 q_load_coeff = m，与非 TP1 一致
+__aicore__ __attribute__((always_inline)) inline void LoadTP1QDataToL0A(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformWaitQLoadComplete(embed_split_idx);
+    PlatformLoadQToL0A(embed_split_idx, params.round_embed_split_size, m, false);
+    PlatformSetQLoadComplete(embed_split_idx);
+}
+
+// 业务函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVMainFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 256;
+    PlatformLoadTP1KVMainToL1(embed_split_idx, params.qk_n, params.qk_round_n,
+                              params.l1_kv_pingpong_flag, params.kv_offset,
+                              embed_split_idx * 128);
+}
+
+// 业务函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVRopeFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
+    PlatformLoadTP1KVRopeToL1(params.qk_n, params.qk_round_n,
+                               params.l1_kv_pingpong_flag, params.kv_offset_rope);
+}
+
+// 业务函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVDataToL0B(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformLoadTP1KVToL0B(embed_split_idx, params.round_embed_split_size,
+                           params.qk_round_n, params.now_l1_offset,
+                           params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK MMAD 计算
+__aicore__ __attribute__((always_inline)) inline void ComputeTP1QKMMad(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformComputeTP1QKMMad(embed_split_idx, params.embed_split_size,
+                             m, params.qk_n, params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK 结果拷贝到 GM（idx 4 时）
+// GM 偏移: block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar
+__aicore__ __attribute__((always_inline)) inline void CopyTP1QKResultToGM(
+    const TP1QKParams &params, uint32_t embed_split_idx, uint32_t n_idx)
+{
+    uint64_t gm_dst_offset = (uint64_t)block_idx * TMP_SIZE_DECODER * 4 +
+                             (uint64_t)((n_idx / 4) % 2) * TMP_SIZE_DECODER * 2 +
+                             params.gm_split_idx * params.pp_n_scalar;
+    PlatformCopyTP1QKResultToGM(m, params.qk_round_n,
+                                 params.l1_kv_pingpong_flag,
+                                 gm_dst_offset, params.sv_round_n);
+}
+
 // 业务函数：将 Q Rope 数据从 GM 搬运到 L1（ND→NZ 格式转换）
 // INT8 场景：用 gm_to_l1 搬到独立的 l1q_rope_buf_addr_tensor
 // 非INT8 场景：用 DataCopy 搬到 l1q_buf_addr_tensor 的 Q 主体之后
@@ -122,6 +247,131 @@ __aicore__ __attribute__((always_inline)) inline void LoadQRopeFromGMToL1(
     }
 }
 
+// ==================== TP1 QK 业务函数 ====================
+
+// TP1 QK 参数结构体
+struct TP1QKParams {
+    uint32_t qk_n;
+    uint32_t qk_round_n;
+    uint32_t l1_kv_pingpong_flag;
+    uint32_t embed_split_size;
+    uint32_t round_embed_split_size;
+    int64_t now_l1_offset;
+    int64_t kv_offset;
+    int64_t kv_offset_rope;
+    uint32_t sv_round_n;
+    uint32_t gm_split_idx;  // split_idx 用于 GM 偏移计算
+    uint32_t pp_n_scalar;   // block_size，用于 GM 偏移计算
+};
+
+// 业务函数：初始化 TP1 QK 参数
+// 对应原始 CUBE1 stage1 中 split_idx 循环体内的参数计算
+__aicore__ __attribute__((always_inline)) inline void InitTP1QKParams(
+    TP1Context &ctx, uint32_t split_idx, uint32_t n_idx, TP1QKParams &params)
+{
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t now_idx = n_idx + split_idx;
+
+    params.l1_kv_pingpong_flag = now_idx % 2;
+
+    // 动态计算 qk_n / qk_round_n
+    if (now_idx == (n_loop - 1)) {
+        params.qk_n = (ctx.cur_kv_seqlen - now_idx * pp_n_scalar);
+    } else {
+        params.qk_n = pp_n_scalar;
+    }
+    params.qk_round_n = RoundUp<BLOCK_SIZE>(params.qk_n);
+
+    // embed_split_size 默认 128，idx==4 时为 64（在编排层设置）
+    params.embed_split_size = 128;
+    params.round_embed_split_size = RoundUp<T_BLOCK_SIZE>(params.embed_split_size);
+
+    // now_l1_offset 默认 0，在 LoadTP1KVMain/KVRope 中更新
+    params.now_l1_offset = 0;
+
+    // block_table_id / kv_offset / kv_offset_rope 地址计算
+    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
+                    ctx.cur_batch * max_num_blocks_per_query + ctx.start_kv / block_size + now_idx));
+    params.kv_offset = (int64_t)block_table_id * block_size * stride_kv;
+    params.kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
+
+    // sv_round_n 计算（用于 S→GM 的 dstStride）
+    uint32_t sv_n_triu = n_loop * pp_n_scalar;
+    uint32_t sv_n;
+    if (n_idx + ctx.s_block_stack > n_loop - 1) {
+        sv_n = ctx.cur_kv_seqlen - n_idx * pp_n_scalar;
+    } else {
+        sv_n = pp_n_scalar * ctx.s_block_stack;
+    }
+    params.sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+
+    params.gm_split_idx = split_idx;
+    params.pp_n_scalar = pp_n_scalar;
+}
+
+// 业务函数：TP1 Q 数据从 L1 加载到 L0A
+// 复用非 TP1 的 PlatformWaitQLoadComplete / PlatformLoadQToL0A / PlatformSetQLoadComplete
+// TP1 中 q_load_coeff = m，与非 TP1 一致
+__aicore__ __attribute__((always_inline)) inline void LoadTP1QDataToL0A(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformWaitQLoadComplete(embed_split_idx);
+    PlatformLoadQToL0A(embed_split_idx, params.round_embed_split_size, m, false);
+    PlatformSetQLoadComplete(embed_split_idx);
+}
+
+// 业务函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVMainFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 256;
+    PlatformLoadTP1KVMainToL1(embed_split_idx, params.qk_n, params.qk_round_n,
+                              params.l1_kv_pingpong_flag, params.kv_offset,
+                              embed_split_idx * 128);
+}
+
+// 业务函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVRopeFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
+    PlatformLoadTP1KVRopeToL1(params.qk_n, params.qk_round_n,
+                               params.l1_kv_pingpong_flag, params.kv_offset_rope);
+}
+
+// 业务函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVDataToL0B(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformLoadTP1KVToL0B(embed_split_idx, params.round_embed_split_size,
+                           params.qk_round_n, params.now_l1_offset,
+                           params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK MMAD 计算
+__aicore__ __attribute__((always_inline)) inline void ComputeTP1QKMMad(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformComputeTP1QKMMad(embed_split_idx, params.embed_split_size,
+                             m, params.qk_n, params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK 结果拷贝到 GM（idx 4 时）
+// GM 偏移: block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar
+__aicore__ __attribute__((always_inline)) inline void CopyTP1QKResultToGM(
+    const TP1QKParams &params, uint32_t embed_split_idx, uint32_t n_idx)
+{
+    uint64_t gm_dst_offset = (uint64_t)block_idx * TMP_SIZE_DECODER * 4 +
+                             (uint64_t)((n_idx / 4) % 2) * TMP_SIZE_DECODER * 2 +
+                             params.gm_split_idx * params.pp_n_scalar;
+    PlatformCopyTP1QKResultToGM(m, params.qk_round_n,
+                                 params.l1_kv_pingpong_flag,
+                                 gm_dst_offset, params.sv_round_n);
+}
+
 // 业务函数：将 KV 主体数据从 GM 搬运到 L1
 // ND_FORMAT 场景：ND→NZ 格式转换（gm_to_l1<ND, NZ>）
 // INT8 / 非INT8 NZ 场景：NZ→NZ 格式搬运（gm_to_l1<NZ, NZ>）
@@ -158,6 +408,131 @@ __aicore__ __attribute__((always_inline)) inline void LoadKVMainFromGMToL1(
             0                       // srcDValue (NZ→NZ always 0)
         );
     }
+}
+
+// ==================== TP1 QK 业务函数 ====================
+
+// TP1 QK 参数结构体
+struct TP1QKParams {
+    uint32_t qk_n;
+    uint32_t qk_round_n;
+    uint32_t l1_kv_pingpong_flag;
+    uint32_t embed_split_size;
+    uint32_t round_embed_split_size;
+    int64_t now_l1_offset;
+    int64_t kv_offset;
+    int64_t kv_offset_rope;
+    uint32_t sv_round_n;
+    uint32_t gm_split_idx;  // split_idx 用于 GM 偏移计算
+    uint32_t pp_n_scalar;   // block_size，用于 GM 偏移计算
+};
+
+// 业务函数：初始化 TP1 QK 参数
+// 对应原始 CUBE1 stage1 中 split_idx 循环体内的参数计算
+__aicore__ __attribute__((always_inline)) inline void InitTP1QKParams(
+    TP1Context &ctx, uint32_t split_idx, uint32_t n_idx, TP1QKParams &params)
+{
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t now_idx = n_idx + split_idx;
+
+    params.l1_kv_pingpong_flag = now_idx % 2;
+
+    // 动态计算 qk_n / qk_round_n
+    if (now_idx == (n_loop - 1)) {
+        params.qk_n = (ctx.cur_kv_seqlen - now_idx * pp_n_scalar);
+    } else {
+        params.qk_n = pp_n_scalar;
+    }
+    params.qk_round_n = RoundUp<BLOCK_SIZE>(params.qk_n);
+
+    // embed_split_size 默认 128，idx==4 时为 64（在编排层设置）
+    params.embed_split_size = 128;
+    params.round_embed_split_size = RoundUp<T_BLOCK_SIZE>(params.embed_split_size);
+
+    // now_l1_offset 默认 0，在 LoadTP1KVMain/KVRope 中更新
+    params.now_l1_offset = 0;
+
+    // block_table_id / kv_offset / kv_offset_rope 地址计算
+    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
+                    ctx.cur_batch * max_num_blocks_per_query + ctx.start_kv / block_size + now_idx));
+    params.kv_offset = (int64_t)block_table_id * block_size * stride_kv;
+    params.kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
+
+    // sv_round_n 计算（用于 S→GM 的 dstStride）
+    uint32_t sv_n_triu = n_loop * pp_n_scalar;
+    uint32_t sv_n;
+    if (n_idx + ctx.s_block_stack > n_loop - 1) {
+        sv_n = ctx.cur_kv_seqlen - n_idx * pp_n_scalar;
+    } else {
+        sv_n = pp_n_scalar * ctx.s_block_stack;
+    }
+    params.sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+
+    params.gm_split_idx = split_idx;
+    params.pp_n_scalar = pp_n_scalar;
+}
+
+// 业务函数：TP1 Q 数据从 L1 加载到 L0A
+// 复用非 TP1 的 PlatformWaitQLoadComplete / PlatformLoadQToL0A / PlatformSetQLoadComplete
+// TP1 中 q_load_coeff = m，与非 TP1 一致
+__aicore__ __attribute__((always_inline)) inline void LoadTP1QDataToL0A(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformWaitQLoadComplete(embed_split_idx);
+    PlatformLoadQToL0A(embed_split_idx, params.round_embed_split_size, m, false);
+    PlatformSetQLoadComplete(embed_split_idx);
+}
+
+// 业务函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVMainFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 256;
+    PlatformLoadTP1KVMainToL1(embed_split_idx, params.qk_n, params.qk_round_n,
+                              params.l1_kv_pingpong_flag, params.kv_offset,
+                              embed_split_idx * 128);
+}
+
+// 业务函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVRopeFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
+    PlatformLoadTP1KVRopeToL1(params.qk_n, params.qk_round_n,
+                               params.l1_kv_pingpong_flag, params.kv_offset_rope);
+}
+
+// 业务函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVDataToL0B(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformLoadTP1KVToL0B(embed_split_idx, params.round_embed_split_size,
+                           params.qk_round_n, params.now_l1_offset,
+                           params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK MMAD 计算
+__aicore__ __attribute__((always_inline)) inline void ComputeTP1QKMMad(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformComputeTP1QKMMad(embed_split_idx, params.embed_split_size,
+                             m, params.qk_n, params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK 结果拷贝到 GM（idx 4 时）
+// GM 偏移: block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar
+__aicore__ __attribute__((always_inline)) inline void CopyTP1QKResultToGM(
+    const TP1QKParams &params, uint32_t embed_split_idx, uint32_t n_idx)
+{
+    uint64_t gm_dst_offset = (uint64_t)block_idx * TMP_SIZE_DECODER * 4 +
+                             (uint64_t)((n_idx / 4) % 2) * TMP_SIZE_DECODER * 2 +
+                             params.gm_split_idx * params.pp_n_scalar;
+    PlatformCopyTP1QKResultToGM(m, params.qk_round_n,
+                                 params.l1_kv_pingpong_flag,
+                                 gm_dst_offset, params.sv_round_n);
 }
 
 // 业务函数：将 KV Rope 数据从 GM 搬运到 L1
@@ -345,4 +720,598 @@ __aicore__ __attribute__((always_inline)) inline void ComputeQRope(
             params.l1_kv_pingpong_flag, n_idx,
             m, params.qk_round_n);
     }
+}
+
+// ==================== TP1 QK 业务函数 ====================
+
+// TP1 QK 参数结构体
+struct TP1QKParams {
+    uint32_t qk_n;
+    uint32_t qk_round_n;
+    uint32_t l1_kv_pingpong_flag;
+    uint32_t embed_split_size;
+    uint32_t round_embed_split_size;
+    int64_t now_l1_offset;
+    int64_t kv_offset;
+    int64_t kv_offset_rope;
+    uint32_t sv_round_n;
+    uint32_t gm_split_idx;  // split_idx 用于 GM 偏移计算
+    uint32_t pp_n_scalar;   // block_size，用于 GM 偏移计算
+};
+
+// 业务函数：初始化 TP1 QK 参数
+// 对应原始 CUBE1 stage1 中 split_idx 循环体内的参数计算
+__aicore__ __attribute__((always_inline)) inline void InitTP1QKParams(
+    TP1Context &ctx, uint32_t split_idx, uint32_t n_idx, TP1QKParams &params)
+{
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t now_idx = n_idx + split_idx;
+
+    params.l1_kv_pingpong_flag = now_idx % 2;
+
+    // 动态计算 qk_n / qk_round_n
+    if (now_idx == (n_loop - 1)) {
+        params.qk_n = (ctx.cur_kv_seqlen - now_idx * pp_n_scalar);
+    } else {
+        params.qk_n = pp_n_scalar;
+    }
+    params.qk_round_n = RoundUp<BLOCK_SIZE>(params.qk_n);
+
+    // embed_split_size 默认 128，idx==4 时为 64（在编排层设置）
+    params.embed_split_size = 128;
+    params.round_embed_split_size = RoundUp<T_BLOCK_SIZE>(params.embed_split_size);
+
+    // now_l1_offset 默认 0，在 LoadTP1KVMain/KVRope 中更新
+    params.now_l1_offset = 0;
+
+    // block_table_id / kv_offset / kv_offset_rope 地址计算
+    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
+                    ctx.cur_batch * max_num_blocks_per_query + ctx.start_kv / block_size + now_idx));
+    params.kv_offset = (int64_t)block_table_id * block_size * stride_kv;
+    params.kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
+
+    // sv_round_n 计算（用于 S→GM 的 dstStride）
+    uint32_t sv_n_triu = n_loop * pp_n_scalar;
+    uint32_t sv_n;
+    if (n_idx + ctx.s_block_stack > n_loop - 1) {
+        sv_n = ctx.cur_kv_seqlen - n_idx * pp_n_scalar;
+    } else {
+        sv_n = pp_n_scalar * ctx.s_block_stack;
+    }
+    params.sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+
+    params.gm_split_idx = split_idx;
+    params.pp_n_scalar = pp_n_scalar;
+}
+
+// 业务函数：TP1 Q 数据从 L1 加载到 L0A
+// 复用非 TP1 的 PlatformWaitQLoadComplete / PlatformLoadQToL0A / PlatformSetQLoadComplete
+// TP1 中 q_load_coeff = m，与非 TP1 一致
+__aicore__ __attribute__((always_inline)) inline void LoadTP1QDataToL0A(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformWaitQLoadComplete(embed_split_idx);
+    PlatformLoadQToL0A(embed_split_idx, params.round_embed_split_size, m, false);
+    PlatformSetQLoadComplete(embed_split_idx);
+}
+
+// 业务函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVMainFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 256;
+    PlatformLoadTP1KVMainToL1(embed_split_idx, params.qk_n, params.qk_round_n,
+                              params.l1_kv_pingpong_flag, params.kv_offset,
+                              embed_split_idx * 128);
+}
+
+// 业务函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVRopeFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
+    PlatformLoadTP1KVRopeToL1(params.qk_n, params.qk_round_n,
+                               params.l1_kv_pingpong_flag, params.kv_offset_rope);
+}
+
+// 业务函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVDataToL0B(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformLoadTP1KVToL0B(embed_split_idx, params.round_embed_split_size,
+                           params.qk_round_n, params.now_l1_offset,
+                           params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK MMAD 计算
+__aicore__ __attribute__((always_inline)) inline void ComputeTP1QKMMad(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformComputeTP1QKMMad(embed_split_idx, params.embed_split_size,
+                             m, params.qk_n, params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK 结果拷贝到 GM（idx 4 时）
+// GM 偏移: block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar
+__aicore__ __attribute__((always_inline)) inline void CopyTP1QKResultToGM(
+    const TP1QKParams &params, uint32_t embed_split_idx, uint32_t n_idx)
+{
+    uint64_t gm_dst_offset = (uint64_t)block_idx * TMP_SIZE_DECODER * 4 +
+                             (uint64_t)((n_idx / 4) % 2) * TMP_SIZE_DECODER * 2 +
+                             params.gm_split_idx * params.pp_n_scalar;
+    PlatformCopyTP1QKResultToGM(m, params.qk_round_n,
+                                 params.l1_kv_pingpong_flag,
+                                 gm_dst_offset, params.sv_round_n);
+}
+
+// 业务函数：调度 Cube MLA 任务（Run 方法的 for 循环部分）
+// 遍历所有 batch，解析 tiling 参数，调用 InnerRunCubeMLA
+__aicore__ __attribute__((always_inline)) inline void ScheduleCubeTasks()
+{
+    uint32_t q_block_num_per_batch = (q_heads + cur_qn_blk_size - 1) / cur_qn_blk_size;
+    uint32_t process_num = q_block_num_per_batch * num_batches;
+
+    for (uint32_t process = block_idx; process < process_num; process += (uint32_t)block_num) {
+        uint32_t cur_batch = process / q_block_num_per_batch;
+        if (cur_batch >= num_batches) break;
+
+        uint32_t offset_tiling = tiling_head_size + tiling_para_size * cur_batch;
+        uint32_t start_core_idx = (cur_batch * q_block_num_per_batch) % block_num;
+
+        uint32_t q_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
+        uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 1 + offset_tiling));
+        if (kv_seqlen == 0) {
+            continue;
+        }
+        uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
+
+        uint32_t start_head = (process % q_block_num_per_batch) * cur_qn_blk_size;
+        uint32_t start_kv = 0;
+        uint32_t cur_q_seq_len = q_seqlen;
+        uint32_t cur_kv_seqlen = kv_seqlen;
+        uint32_t cur_head_num = cur_qn_blk_size;
+
+        InnerRunCubeMLA(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen,
+                        offset_tiling);
+    }
+}
+
+// ==================== TP1 QK 业务函数 ====================
+
+// TP1 QK 参数结构体
+struct TP1QKParams {
+    uint32_t qk_n;
+    uint32_t qk_round_n;
+    uint32_t l1_kv_pingpong_flag;
+    uint32_t embed_split_size;
+    uint32_t round_embed_split_size;
+    int64_t now_l1_offset;
+    int64_t kv_offset;
+    int64_t kv_offset_rope;
+    uint32_t sv_round_n;
+    uint32_t gm_split_idx;  // split_idx 用于 GM 偏移计算
+    uint32_t pp_n_scalar;   // block_size，用于 GM 偏移计算
+};
+
+// 业务函数：初始化 TP1 QK 参数
+// 对应原始 CUBE1 stage1 中 split_idx 循环体内的参数计算
+__aicore__ __attribute__((always_inline)) inline void InitTP1QKParams(
+    TP1Context &ctx, uint32_t split_idx, uint32_t n_idx, TP1QKParams &params)
+{
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t now_idx = n_idx + split_idx;
+
+    params.l1_kv_pingpong_flag = now_idx % 2;
+
+    // 动态计算 qk_n / qk_round_n
+    if (now_idx == (n_loop - 1)) {
+        params.qk_n = (ctx.cur_kv_seqlen - now_idx * pp_n_scalar);
+    } else {
+        params.qk_n = pp_n_scalar;
+    }
+    params.qk_round_n = RoundUp<BLOCK_SIZE>(params.qk_n);
+
+    // embed_split_size 默认 128，idx==4 时为 64（在编排层设置）
+    params.embed_split_size = 128;
+    params.round_embed_split_size = RoundUp<T_BLOCK_SIZE>(params.embed_split_size);
+
+    // now_l1_offset 默认 0，在 LoadTP1KVMain/KVRope 中更新
+    params.now_l1_offset = 0;
+
+    // block_table_id / kv_offset / kv_offset_rope 地址计算
+    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
+                    ctx.cur_batch * max_num_blocks_per_query + ctx.start_kv / block_size + now_idx));
+    params.kv_offset = (int64_t)block_table_id * block_size * stride_kv;
+    params.kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
+
+    // sv_round_n 计算（用于 S→GM 的 dstStride）
+    uint32_t sv_n_triu = n_loop * pp_n_scalar;
+    uint32_t sv_n;
+    if (n_idx + ctx.s_block_stack > n_loop - 1) {
+        sv_n = ctx.cur_kv_seqlen - n_idx * pp_n_scalar;
+    } else {
+        sv_n = pp_n_scalar * ctx.s_block_stack;
+    }
+    params.sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+
+    params.gm_split_idx = split_idx;
+    params.pp_n_scalar = pp_n_scalar;
+}
+
+// 业务函数：TP1 Q 数据从 L1 加载到 L0A
+// 复用非 TP1 的 PlatformWaitQLoadComplete / PlatformLoadQToL0A / PlatformSetQLoadComplete
+// TP1 中 q_load_coeff = m，与非 TP1 一致
+__aicore__ __attribute__((always_inline)) inline void LoadTP1QDataToL0A(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformWaitQLoadComplete(embed_split_idx);
+    PlatformLoadQToL0A(embed_split_idx, params.round_embed_split_size, m, false);
+    PlatformSetQLoadComplete(embed_split_idx);
+}
+
+// 业务函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVMainFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 256;
+    PlatformLoadTP1KVMainToL1(embed_split_idx, params.qk_n, params.qk_round_n,
+                              params.l1_kv_pingpong_flag, params.kv_offset,
+                              embed_split_idx * 128);
+}
+
+// 业务函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVRopeFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
+    PlatformLoadTP1KVRopeToL1(params.qk_n, params.qk_round_n,
+                               params.l1_kv_pingpong_flag, params.kv_offset_rope);
+}
+
+// 业务函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVDataToL0B(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformLoadTP1KVToL0B(embed_split_idx, params.round_embed_split_size,
+                           params.qk_round_n, params.now_l1_offset,
+                           params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK MMAD 计算
+__aicore__ __attribute__((always_inline)) inline void ComputeTP1QKMMad(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformComputeTP1QKMMad(embed_split_idx, params.embed_split_size,
+                             m, params.qk_n, params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK 结果拷贝到 GM（idx 4 时）
+// GM 偏移: block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar
+__aicore__ __attribute__((always_inline)) inline void CopyTP1QKResultToGM(
+    const TP1QKParams &params, uint32_t embed_split_idx, uint32_t n_idx)
+{
+    uint64_t gm_dst_offset = (uint64_t)block_idx * TMP_SIZE_DECODER * 4 +
+                             (uint64_t)((n_idx / 4) % 2) * TMP_SIZE_DECODER * 2 +
+                             params.gm_split_idx * params.pp_n_scalar;
+    PlatformCopyTP1QKResultToGM(m, params.qk_round_n,
+                                 params.l1_kv_pingpong_flag,
+                                 gm_dst_offset, params.sv_round_n);
+}
+
+// 业务函数：调度 Cube MLA TP1 任务（RunTP1 方法的中段业务逻辑）
+// 包含主循环调度 + tail 优化三分支（cores_per_seq 动态调整）
+__aicore__ __attribute__((always_inline)) inline void ScheduleCubeTasksTP1()
+{
+    uint32_t tail = totalTaskNum % block_num;
+    if constexpr (EnableOptimization) {
+
+    } else{
+        tail = 0; // control whether to run tail optimization
+    }
+    uint32_t totalTaskNumRound = totalTaskNum - tail;
+
+
+    for (uint32_t process = block_idx; process < totalTaskNumRound; process += (uint32_t)block_num) {  // for task
+        uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
+        uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
+
+        uint32_t q_seqlen = 1;
+        uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
+        if (kv_seqlen == 0) {
+            continue;
+        }
+        uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
+
+        uint32_t start_head = 0;
+        uint32_t start_kv = 0;
+        uint32_t cur_q_seq_len = q_seqlen;
+        uint32_t cur_kv_seqlen = kv_seqlen;
+        uint32_t cur_head_num = q_heads;
+
+        InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
+    }
+
+    // suppose all seqs have same length
+    if (tail > 0){
+        uint32_t sample_kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + tiling_head_size + 2));
+        bool enableExtraOptimization = true;
+        if (block_num % 4 == 3) {
+            // cannot optimize this situation due to math problem
+            enableExtraOptimization = false;
+        }
+        if (sample_kv_seqlen <= 2048){
+            // Too Short to benefit from optimization
+            enableExtraOptimization = false;
+        }
+        if (!enableExtraOptimization || tail <= block_num / 2) {
+            // collect all metadata
+            uint32_t cores_per_seq = 1;
+            if (0 < tail && tail <= block_num / 4) {// 6 tasks left, each works with 4 cores
+                cores_per_seq = 4;
+                if (tail == 1){
+                    cores_per_seq = block_num;
+                }
+                else if (tail == 2){
+                    cores_per_seq = block_num / 2;
+                }
+                else if(tail == 3){
+                    cores_per_seq = block_num / 3;
+                }
+                else if(tail == 4){
+                    cores_per_seq = block_num / 4;
+                }
+            }
+            else if(block_num / 4 < tail && tail <= block_num / 3) { // 8 tasks left, each works with 3 cores
+                cores_per_seq = 3;
+
+            }
+            else if(block_num / 3 < tail && tail <= block_num / 2) { // 12 tasks left, each works with 2 cores
+                cores_per_seq = 2;
+            }
+            else {
+                // no extra optimization for tail > 12
+                cores_per_seq = 1;
+            }
+
+            if(!enableExtraOptimization){
+                cores_per_seq = 1;
+            }
+
+            uint32_t process = totalTaskNumRound + block_idx / cores_per_seq;
+            if (process < totalTaskNum) {
+                uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
+                uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
+
+                uint32_t q_seqlen = 1;
+                uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
+                uint32_t kv_seqlen_each = kv_seqlen / cores_per_seq;
+                uint32_t kv_seqlen_align = (kv_seqlen_each + block_size - 1) / block_size * block_size;
+                uint32_t actual_work_cores = kv_seqlen / kv_seqlen_align + (kv_seqlen % kv_seqlen_align != 0);
+                // cores_per_seq = actual_work_cores;
+                uint32_t kv_seqlen_process = 0;
+                if (block_idx < block_idx / cores_per_seq * cores_per_seq + actual_work_cores){
+                    kv_seqlen_process = (block_idx % cores_per_seq == actual_work_cores - 1) ?
+                        (kv_seqlen - kv_seqlen_align * (actual_work_cores - 1)) : kv_seqlen_align;
+                }
+
+                if (kv_seqlen > 0 && kv_seqlen_process > 0) {
+                    uint32_t start_head = 0;
+                    uint32_t start_kv = (block_idx % cores_per_seq) * kv_seqlen_align;
+                    uint32_t cur_q_seq_len = q_seqlen;
+                    uint32_t cur_kv_seqlen = kv_seqlen_process;
+                    uint32_t cur_head_num = q_heads;
+
+                    // no need to modify anything in cube kernel, just call the same kernel
+                    InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
+                }
+            }
+        }
+        else if (tail > 3 * block_num / 4){
+            // no benefit for optimizing this situation
+            uint32_t process = totalTaskNumRound + block_idx;
+            if (process < totalTaskNum) {
+                uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
+                uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
+
+                uint32_t q_seqlen = 1;
+                uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
+                if (kv_seqlen > 0) {
+                    uint32_t kv_seqlen_align = (kv_seqlen + block_size - 1) / block_size * block_size;
+
+                    uint32_t start_head = 0;
+                    uint32_t start_kv = 0;
+                    uint32_t cur_q_seq_len = q_seqlen;
+                    uint32_t cur_kv_seqlen = kv_seqlen;
+                    uint32_t cur_head_num = q_heads;
+
+                    InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
+                }
+            }
+        }
+        else {
+            // 18 >= tail >= 12
+            // first 12 tasks, two cores per task
+            {
+                uint32_t cores_per_seq = 2;
+                uint32_t process = totalTaskNumRound + block_idx / cores_per_seq;
+                uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
+                uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
+
+                uint32_t q_seqlen = 1;
+                uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
+                uint32_t kv_seqlen_each = kv_seqlen / cores_per_seq;
+                uint32_t kv_seqlen_align = (kv_seqlen_each + block_size - 1) / block_size * block_size;
+                uint32_t kv_seqlen_process = (block_idx % cores_per_seq == cores_per_seq - 1) ?
+                (kv_seqlen - kv_seqlen_align * (cores_per_seq - 1)) : kv_seqlen_align;
+
+                if (kv_seqlen > 0 && kv_seqlen_process > 0) {
+                    uint32_t start_head = 0;
+                    uint32_t start_kv = (block_idx % cores_per_seq) * kv_seqlen_align;
+                    uint32_t cur_q_seq_len = q_seqlen;
+                    uint32_t cur_kv_seqlen = kv_seqlen_process;
+                    uint32_t cur_head_num = q_heads;
+
+                    // no need to modify anything in cube kernel, just call the same kernel
+                    InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
+                }
+            }
+            {
+                uint32_t cores_per_seq = 4;
+                uint32_t process = totalTaskNumRound + block_num / 2 + block_idx / cores_per_seq;
+                if (process < totalTaskNum) {
+                    uint32_t offset_tiling = tiling_head_size + tiling_para_size * process;
+                    uint32_t cur_batch = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + offset_tiling));
+
+                    uint32_t q_seqlen = 1;
+                    uint32_t kv_seqlen = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 2 + offset_tiling));
+                    uint32_t kv_seqlen_each = kv_seqlen / cores_per_seq;
+                    uint32_t kv_seqlen_align = (kv_seqlen_each + block_size - 1) / block_size * block_size;
+                    uint32_t kv_seqlen_process = (block_idx % cores_per_seq == cores_per_seq - 1) ?
+                    (kv_seqlen - kv_seqlen_align * (cores_per_seq - 1)) : kv_seqlen_align;
+
+                    if (kv_seqlen > 0 && kv_seqlen_process > 0) {
+                        uint32_t start_head = 0;
+                        uint32_t start_kv = (block_idx % cores_per_seq) * kv_seqlen_align;
+                        uint32_t cur_q_seq_len = q_seqlen;
+                        uint32_t cur_kv_seqlen = kv_seqlen_process;
+                        uint32_t cur_head_num = q_heads;
+
+                        // no need to modify anything in cube kernel, just call the same kernel
+                        InnerRunCubeMLATP1(cur_batch, start_head, cur_head_num, start_kv, cur_q_seq_len, cur_kv_seqlen, offset_tiling);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== TP1 QK 业务函数 ====================
+
+// TP1 QK 参数结构体
+struct TP1QKParams {
+    uint32_t qk_n;
+    uint32_t qk_round_n;
+    uint32_t l1_kv_pingpong_flag;
+    uint32_t embed_split_size;
+    uint32_t round_embed_split_size;
+    int64_t now_l1_offset;
+    int64_t kv_offset;
+    int64_t kv_offset_rope;
+    uint32_t sv_round_n;
+    uint32_t gm_split_idx;  // split_idx 用于 GM 偏移计算
+    uint32_t pp_n_scalar;   // block_size，用于 GM 偏移计算
+};
+
+// 业务函数：初始化 TP1 QK 参数
+// 对应原始 CUBE1 stage1 中 split_idx 循环体内的参数计算
+__aicore__ __attribute__((always_inline)) inline void InitTP1QKParams(
+    TP1Context &ctx, uint32_t split_idx, uint32_t n_idx, TP1QKParams &params)
+{
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t now_idx = n_idx + split_idx;
+
+    params.l1_kv_pingpong_flag = now_idx % 2;
+
+    // 动态计算 qk_n / qk_round_n
+    if (now_idx == (n_loop - 1)) {
+        params.qk_n = (ctx.cur_kv_seqlen - now_idx * pp_n_scalar);
+    } else {
+        params.qk_n = pp_n_scalar;
+    }
+    params.qk_round_n = RoundUp<BLOCK_SIZE>(params.qk_n);
+
+    // embed_split_size 默认 128，idx==4 时为 64（在编排层设置）
+    params.embed_split_size = 128;
+    params.round_embed_split_size = RoundUp<T_BLOCK_SIZE>(params.embed_split_size);
+
+    // now_l1_offset 默认 0，在 LoadTP1KVMain/KVRope 中更新
+    params.now_l1_offset = 0;
+
+    // block_table_id / kv_offset / kv_offset_rope 地址计算
+    uint32_t block_table_id = (uint32_t)(*(block_tables_gm +
+                    ctx.cur_batch * max_num_blocks_per_query + ctx.start_kv / block_size + now_idx));
+    params.kv_offset = (int64_t)block_table_id * block_size * stride_kv;
+    params.kv_offset_rope = (int64_t)block_table_id * block_size * stride_kv_rope;
+
+    // sv_round_n 计算（用于 S→GM 的 dstStride）
+    uint32_t sv_n_triu = n_loop * pp_n_scalar;
+    uint32_t sv_n;
+    if (n_idx + ctx.s_block_stack > n_loop - 1) {
+        sv_n = ctx.cur_kv_seqlen - n_idx * pp_n_scalar;
+    } else {
+        sv_n = pp_n_scalar * ctx.s_block_stack;
+    }
+    params.sv_round_n = (sv_n + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+
+    params.gm_split_idx = split_idx;
+    params.pp_n_scalar = pp_n_scalar;
+}
+
+// 业务函数：TP1 Q 数据从 L1 加载到 L0A
+// 复用非 TP1 的 PlatformWaitQLoadComplete / PlatformLoadQToL0A / PlatformSetQLoadComplete
+// TP1 中 q_load_coeff = m，与非 TP1 一致
+__aicore__ __attribute__((always_inline)) inline void LoadTP1QDataToL0A(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformWaitQLoadComplete(embed_split_idx);
+    PlatformLoadQToL0A(embed_split_idx, params.round_embed_split_size, m, false);
+    PlatformSetQLoadComplete(embed_split_idx);
+}
+
+// 业务函数：TP1 KV Main 数据从 GM 搬运到 L1（idx 0,2）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVMainFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 256;
+    PlatformLoadTP1KVMainToL1(embed_split_idx, params.qk_n, params.qk_round_n,
+                              params.l1_kv_pingpong_flag, params.kv_offset,
+                              embed_split_idx * 128);
+}
+
+// 业务函数：TP1 KV Rope 数据从 GM 搬运到 L1（idx 4）
+// 更新 now_l1_offset 供后续 L1→L0B 使用
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVRopeFromGM(
+    TP1QKParams &params, uint32_t embed_split_idx)
+{
+    params.now_l1_offset = params.l1_kv_pingpong_flag * 128 * 64 + 2 * 256 * 128;
+    PlatformLoadTP1KVRopeToL1(params.qk_n, params.qk_round_n,
+                               params.l1_kv_pingpong_flag, params.kv_offset_rope);
+}
+
+// 业务函数：TP1 KV 数据从 L1 加载到 L0B（所有 embed_split_idx）
+__aicore__ __attribute__((always_inline)) inline void LoadTP1KVDataToL0B(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformLoadTP1KVToL0B(embed_split_idx, params.round_embed_split_size,
+                           params.qk_round_n, params.now_l1_offset,
+                           params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK MMAD 计算
+__aicore__ __attribute__((always_inline)) inline void ComputeTP1QKMMad(
+    const TP1QKParams &params, uint32_t embed_split_idx)
+{
+    PlatformComputeTP1QKMMad(embed_split_idx, params.embed_split_size,
+                             m, params.qk_n, params.l1_kv_pingpong_flag);
+}
+
+// 业务函数：TP1 QK 结果拷贝到 GM（idx 4 时）
+// GM 偏移: block_idx * TMP_SIZE_DECODER * 4 + ((n_idx/s_block_stack)%2) * TMP_SIZE_DECODER * 2 + split_idx * pp_n_scalar
+__aicore__ __attribute__((always_inline)) inline void CopyTP1QKResultToGM(
+    const TP1QKParams &params, uint32_t embed_split_idx, uint32_t n_idx)
+{
+    uint64_t gm_dst_offset = (uint64_t)block_idx * TMP_SIZE_DECODER * 4 +
+                             (uint64_t)((n_idx / 4) % 2) * TMP_SIZE_DECODER * 2 +
+                             params.gm_split_idx * params.pp_n_scalar;
+    PlatformCopyTP1QKResultToGM(m, params.qk_round_n,
+                                 params.l1_kv_pingpong_flag,
+                                 gm_dst_offset, params.sv_round_n);
 }
