@@ -934,6 +934,37 @@ public:
         round_k = RoundUp<T_BLOCK_SIZE>(__k);
         __v = embedding_size;
         round_v = RoundUp<BLOCK_SIZE>(__v);
+
+        // ---- A5 UB buffer carve-out ----
+        // Allocate one contiguous UB region (MAX_UB_SIZE_A5) and slice per-tensor
+        // views from it via ReinterpretCast at the offsets defined in UbufAllocA5.
+        // Replaces A3's AsdopsBuffer::GetBuffer<ASCEND_UB,T>(offset) (main L3137).
+        vpipe.InitBuffer(ubTBuf, MAX_UB_SIZE_A5);
+        auto ubBase = ubTBuf.Get<uint8_t>();
+        ls32_ubuf_tensor        = ubBase[ubufAlloc.ls32_ubuf_offset].ReinterpretCast<float>();
+        ls32_quant_ubuf_tensor  = ubBase[ubufAlloc.ls32_quant_ubuf_offset].ReinterpretCast<float>();
+        ls16_ubuf_tensor        = ubBase[ubufAlloc.ls32_ubuf_offset].ReinterpretCast<half>();
+        lp_ubuf_tensor          = ubBase[ubufAlloc.lp_ubuf_offset].ReinterpretCast<IN_DTYPE>();
+        lp32_ubuf_tensor        = ubBase[ubufAlloc.lp32_ubuf_offset].ReinterpretCast<float>();
+        mask_ubuf_tensor        = ubBase[ubufAlloc.mask_ubuf_offset].ReinterpretCast<OUT_DTYPE>();
+        lo_ubuf_tensor          = ubBase[ubufAlloc.lo_ubuf_offset].ReinterpretCast<float>();
+        mask32_ubuf_tensor      = ubBase[ubufAlloc.mask32_ubuf_offset].ReinterpretCast<float>();
+        lm32_ubuf_tensor        = ubBase[ubufAlloc.lm32_ubuf_offset].ReinterpretCast<float>();
+        hm32_ubuf_tensor        = ubBase[ubufAlloc.hm32_ubuf_offset].ReinterpretCast<float>();
+        pm32_ubuf_tensor        = ubBase[ubufAlloc.pm32_ubuf_offset].ReinterpretCast<float>();
+        pm32_ubuf_stage2_tensor = ubBase[ubufAlloc.pm32_ubuf_stage2_offset].ReinterpretCast<float>();
+        gm32_ubuf_tensor        = ubBase[ubufAlloc.gm32_ubuf_offset].ReinterpretCast<float>();
+        dm32_ubuf_tensor        = ubBase[ubufAlloc.dm32_ubuf_offset].ReinterpretCast<float>();
+        dm32_stage2_ubuf_tensor = ubBase[ubufAlloc.dm32_ubuf_stage2_offset].ReinterpretCast<float>();
+        descale_q1_ubuf_tensor  = ubBase[ubufAlloc.descale1_offset].ReinterpretCast<float>();
+        descale_k1_ubuf_tensor  = ubBase[ubufAlloc.descale2_offset].ReinterpretCast<float>();
+        ll_ubuf_tensor          = ubBase[ubufAlloc.ll_ubuf_offset].ReinterpretCast<float>();
+        ll_stage2_ubuf_tensor   = ubBase[ubufAlloc.ll_ubuf_stage2_offset].ReinterpretCast<float>();
+        gl_ubuf_tensor          = ubBase[ubufAlloc.gl_ubuf_offset].ReinterpretCast<OUT_DTYPE>();
+        gl32_ubuf_tensor        = ubBase[ubufAlloc.gl32_ubuf_offset].ReinterpretCast<float>();
+        tv32_ubuf_tensor        = ubBase[ubufAlloc.tv32_ubuf_offset].ReinterpretCast<float>();
+        go_ubuf_tensor          = ubBase[ubufAlloc.go_ubuf_offset].ReinterpretCast<OUT_DTYPE>();
+        go32_ubuf_tensor        = ubBase[ubufAlloc.go32_ubuf_offset].ReinterpretCast<float>();
     }
 
     __aicore__ __attribute__((always_inline)) inline void SetArgs2(
@@ -977,6 +1008,105 @@ private:
     // 类内 include 展开为成员函数，可直接访问下方私有 GM/UB/tiling 成员。
     // 与 A3(arch32) 类内 include aiv_arch32.h / aiv_bs.h 范式一致。
 #include "multi_latent_attention_aiv_arch35.h"
+
+    // ------------------------------------------------------------------------
+    // VectorContext: per-task scalar snapshot consumed by InnerRunVectorChange
+    // and the Schedule* softmax stages. Mirrors A3(arch32) VectorContext; all
+    // fields are pure scalars derived in InitVectorContext (no platform deps).
+    // ------------------------------------------------------------------------
+    struct VectorContext {
+        // input params
+        uint32_t cur_batch;
+        uint32_t start_head;
+        uint32_t cur_nIndx;
+        uint32_t cur_q_seqlen;
+        uint32_t cur_kv_seqlen;
+        uint32_t cur_head_num;
+        uint32_t offset_tiling;
+
+        // addresses
+        uint64_t addr_o_scalar;
+        uint64_t addr_mask_scalar;
+        uint32_t mask_offset;
+
+        // loop & size
+        uint32_t pp_n_scalar;
+        uint32_t sub_n_loop;
+        uint32_t real_n_loop;
+        uint32_t n_loop;
+
+        // QK dims
+        uint32_t qk_n;
+        uint32_t qk_round_n;
+        uint32_t qk_n_2;
+        uint32_t qk_round_n_2;
+
+        // head split
+        uint32_t sub_head_num;
+        uint32_t sub_m;
+        uint32_t head_idx;
+        uint64_t o_offset;
+
+        // tail info
+        uint32_t tail_len;
+        bool prev_tail_mask;
+    };
+
+    // Pure-scalar context initializer (A3 InitVectorContext equivalent).
+    // Relies only on A5 existing scalar members: tiling_gm / block_size /
+    // embedding_size / sub_block_idx / RoundUp / BLOCK_SIZE.
+    __aicore__ __attribute__((always_inline)) inline void InitVectorContext(
+        VectorContext &ctx, uint32_t cur_batch, uint32_t start_head, uint32_t cur_nIndx,
+        uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t cur_head_num,
+        uint32_t offset_tiling)
+    {
+        ctx.cur_batch = cur_batch;
+        ctx.start_head = start_head;
+        ctx.cur_nIndx = cur_nIndx;
+        ctx.cur_q_seqlen = cur_q_seqlen;
+        ctx.cur_kv_seqlen = cur_kv_seqlen;
+        ctx.cur_head_num = cur_head_num;
+        ctx.offset_tiling = offset_tiling;
+
+        // addr
+        uint32_t addr_o_high32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 4 + offset_tiling));
+        uint32_t addr_o_loww32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 5 + offset_tiling));
+        ctx.addr_o_scalar = (uint64_t)(((uint64_t)addr_o_high32) << 32 | addr_o_loww32);
+
+        uint32_t addr_mask_high32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 6 + offset_tiling));
+        uint32_t addr_mask_loww32 = (uint32_t)(*((__gm__ uint32_t *)tiling_gm + 7 + offset_tiling));
+        ctx.addr_mask_scalar = (uint64_t)(((uint64_t)addr_mask_high32) << 32 | addr_mask_loww32);
+        ctx.mask_offset = ctx.addr_mask_scalar;
+
+        // loop & size
+        ctx.pp_n_scalar = block_size;
+        ctx.sub_n_loop = ctx.pp_n_scalar / block_size;
+        ctx.real_n_loop = (cur_kv_seqlen + block_size - 1) / block_size;
+        ctx.n_loop = (cur_kv_seqlen + ctx.pp_n_scalar - 1) / ctx.pp_n_scalar;
+
+        // QK dims
+        ctx.qk_n = ctx.pp_n_scalar;
+        ctx.qk_round_n = RoundUp<BLOCK_SIZE>(ctx.qk_n);
+        ctx.qk_n_2 = ctx.pp_n_scalar;
+        ctx.qk_round_n_2 = RoundUp<BLOCK_SIZE>(ctx.qk_n_2);
+
+        // head split
+        ctx.sub_head_num = (sub_block_idx == 1) ? (cur_head_num - cur_head_num / 2) : cur_head_num / 2;
+        ctx.sub_m = ctx.sub_head_num * cur_q_seqlen;
+        ctx.head_idx = (sub_block_idx == 0) ? start_head : start_head + cur_head_num / 2 * cur_q_seqlen;
+        ctx.o_offset = ctx.addr_o_scalar + start_head * embedding_size + sub_block_idx * cur_head_num / 2 * embedding_size;
+
+        // tail info
+        ctx.tail_len = cur_kv_seqlen - (ctx.n_loop - 1) * ctx.pp_n_scalar;
+        ctx.prev_tail_mask = (ctx.n_loop > 1 && ctx.tail_len < cur_q_seqlen - 1);
+    }
+
+    // Output GM byte offset for the current task (set by InnerRunVectorChange
+    // from ctx.o_offset, consumed by ScheduleSoftmaxStage2).
+    uint64_t o_offset{0};
+
+    // AIV business layer (第二层) — included after VectorContext/InitVectorContext
+    // are declared so InnerRunVectorChange / Schedule* can reference them.
 #include "multi_latent_attention_aiv_bs.h"
 
     // LSE (log-sum-exp) output GM — bound by SetArgs2 for ring mode.
@@ -1036,6 +1166,43 @@ private:
     uint32_t pm_flag_scalar2{0};
 
     UbufAllocA5<BlockFlow> ubufAlloc;
+
+    // ---- A5 UB buffer infrastructure ----
+    // A5 (dav-3510) abandons A3's AsdopsBuffer::GetBuffer<ASCEND_UB> pattern.
+    // Instead we use the standard AscendC TPipe + TBuf<VECCALC> pattern (mirrors
+    // the AIC-side L1/L0 TBuf setup): pipe.InitBuffer(ubTBuf, MAX_UB_SIZE_A5)
+    // then carve individual LocalTensors from the base buffer at the offsets
+    // provided by UbufAllocA5. AIV is an independent class, so it owns its own
+    // TPipe (the AIC-side pipe is not visible here).
+    AscendC::TPipe vpipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ubTBuf;
+
+    // UB LocalTensor views (carved in SetArgs from ubufAlloc offsets).
+    // Types mirror A3 GetBuffer<ASCEND_UB,T> declarations (main file L3137-3164).
+    AscendC::LocalTensor<float> ls32_ubuf_tensor;
+    AscendC::LocalTensor<float> ls32_quant_ubuf_tensor;
+    AscendC::LocalTensor<half> ls16_ubuf_tensor;
+    AscendC::LocalTensor<IN_DTYPE> lp_ubuf_tensor;
+    AscendC::LocalTensor<float> lp32_ubuf_tensor;
+    AscendC::LocalTensor<OUT_DTYPE> mask_ubuf_tensor;
+    AscendC::LocalTensor<float> lo_ubuf_tensor;
+    AscendC::LocalTensor<float> mask32_ubuf_tensor;
+    AscendC::LocalTensor<float> lm32_ubuf_tensor;
+    AscendC::LocalTensor<float> hm32_ubuf_tensor;
+    AscendC::LocalTensor<float> pm32_ubuf_tensor;
+    AscendC::LocalTensor<float> pm32_ubuf_stage2_tensor;
+    AscendC::LocalTensor<float> gm32_ubuf_tensor;
+    AscendC::LocalTensor<float> dm32_ubuf_tensor;
+    AscendC::LocalTensor<float> dm32_stage2_ubuf_tensor;
+    AscendC::LocalTensor<float> descale_q1_ubuf_tensor;
+    AscendC::LocalTensor<float> descale_k1_ubuf_tensor;
+    AscendC::LocalTensor<float> ll_ubuf_tensor;
+    AscendC::LocalTensor<float> ll_stage2_ubuf_tensor;
+    AscendC::LocalTensor<OUT_DTYPE> gl_ubuf_tensor;
+    AscendC::LocalTensor<float> gl32_ubuf_tensor;
+    AscendC::LocalTensor<float> tv32_ubuf_tensor;
+    AscendC::LocalTensor<OUT_DTYPE> go_ubuf_tensor;
+    AscendC::LocalTensor<float> go32_ubuf_tensor;
 };
 
 } // namespace MlaArch35
