@@ -1745,7 +1745,10 @@ private:
         PIPE_BARRIER(V);
     }
 
-    __aicore__ __attribute__((always_inline)) inline void TensorDivRepeatM(
+    // TensorDivRepeatM / TensorMulRepeatM / DeQuantPerHeadImpl / QuantPerTokenImpl
+    // 已迁移至 multi_latent_attention_aiv_bs.h（业务逻辑层）
+
+    // SoftmaxStage1 已迁移至 multi_latent_attention_aiv_bs.h（业务逻辑层）
         const AscendC::LocalTensor<float>& dst,
         const AscendC::LocalTensor<float>& src,
         const AscendC::LocalTensor<float>& src1,

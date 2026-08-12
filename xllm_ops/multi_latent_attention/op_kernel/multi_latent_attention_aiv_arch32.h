@@ -54,27 +54,34 @@ __aicore__ __attribute__((always_inline)) inline void PlatformWaitVectorPipeSync
     WAIT_FLAG(V, MTE2, EVENT_ID2);
 }
 
-// 平台函数：MTE2→V 管道同步（数据搬入后 V 侧可见）
-// 用于 SoftmaxStage1 LoadQKData 段：gm_to_ub/DataCopy 完成后，通知 V 侧可读取
-__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSync()
+// 平台函数：MTE2→V EVENT_ID0 同步（SET+WAIT）
+// 用于 DeQuantPerHeadImpl：src 搬入后通知 V 管道可读
+__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSyncEvent0()
 {
     SET_FLAG(MTE2, V, EVENT_ID0);
     WAIT_FLAG(MTE2, V, EVENT_ID0);
 }
 
-// 平台函数：V→MTE3 管道同步（V 计算完成后 MTE3 可搬出）
-// 用于 SoftmaxStage1 QuantizeAndOutput 段：量化/转换完成后，通知 MTE3 可写入 GM
-__aicore__ __attribute__((always_inline)) inline void PlatformVToMte3Sync()
+// 平台函数：MTE2→V EVENT_ID2 同步（SET+WAIT）
+// 用于 DeQuantPerHeadImpl：deScale 搬入后通知 V 管道可做 online 乘法
+__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSyncEvent2()
 {
-    SET_FLAG(V, MTE3, EVENT_ID0);
-    WAIT_FLAG(V, MTE3, EVENT_ID0);
+    SET_FLAG(MTE2, V, EVENT_ID2);
+    WAIT_FLAG(MTE2, V, EVENT_ID2);
 }
 
-// 平台函数：V→MTE2 管道通知（V 完成本轮计算，通知 MTE2 可搬入下轮数据）
-// 用于 SoftmaxStage1 QuantizeAndOutput 段末尾：ping-pong 流水衔接
-__aicore__ __attribute__((always_inline)) inline void PlatformVToMte2Notify()
+// 平台函数：V→MTE2 管道等待（等待上一轮 V→MTE2 通知）
+// 用于 SoftmaxStage1 LoadQKData 段开头：等待上一轮 QuantizeAndOutput 发出的 MTE2 可搬入通知
+__aicore__ __attribute__((always_inline)) inline void PlatformVToMte2Wait()
 {
-    SET_FLAG(V, MTE2, EVENT_ID2);
+    WAIT_FLAG(V, MTE2, EVENT_ID2);
+}
+
+// 平台函数：V 管道同步屏障
+// 用于 SoftmaxStage1 LoadQKData 段 INT8 路径：Add 之后确保数据可见
+__aicore__ __attribute__((always_inline)) inline void PlatformVPipeBarrier()
+{
+    PIPE_BARRIER(V);
 }
 
 // 平台函数：Vector TP1 管道同步初始化（RunTP1 方法头部 10 条 SET_FLAG）
@@ -109,25 +116,18 @@ __aicore__ __attribute__((always_inline)) inline void PlatformWaitVectorPipeSync
     WAIT_FLAG(V, MTE2, EVENT_ID2);
 }
 
-// 平台函数：MTE2→V 管道同步（数据搬入后 V 侧可见）
-// 用于 SoftmaxStage1 LoadQKData 段：gm_to_ub/DataCopy 完成后，通知 V 侧可读取
-__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSync()
+// 平台函数：MTE2→V EVENT_ID0 同步（SET+WAIT）
+// 用于 DeQuantPerHeadImpl：src 搬入后通知 V 管道可读
+__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSyncEvent0()
 {
     SET_FLAG(MTE2, V, EVENT_ID0);
     WAIT_FLAG(MTE2, V, EVENT_ID0);
 }
 
-// 平台函数：V→MTE3 管道同步（V 计算完成后 MTE3 可搬出）
-// 用于 SoftmaxStage1 QuantizeAndOutput 段：量化/转换完成后，通知 MTE3 可写入 GM
-__aicore__ __attribute__((always_inline)) inline void PlatformVToMte3Sync()
+// 平台函数：MTE2→V EVENT_ID2 同步（SET+WAIT）
+// 用于 DeQuantPerHeadImpl：deScale 搬入后通知 V 管道可做 online 乘法
+__aicore__ __attribute__((always_inline)) inline void PlatformMte2ToVSyncEvent2()
 {
-    SET_FLAG(V, MTE3, EVENT_ID0);
-    WAIT_FLAG(V, MTE3, EVENT_ID0);
-}
-
-// 平台函数：V→MTE2 管道通知（V 完成本轮计算，通知 MTE2 可搬入下轮数据）
-// 用于 SoftmaxStage1 QuantizeAndOutput 段末尾：ping-pong 流水衔接
-__aicore__ __attribute__((always_inline)) inline void PlatformVToMte2Notify()
-{
-    SET_FLAG(V, MTE2, EVENT_ID2);
+    SET_FLAG(MTE2, V, EVENT_ID2);
+    WAIT_FLAG(MTE2, V, EVENT_ID2);
 }
