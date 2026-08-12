@@ -217,6 +217,11 @@ struct UbufAllocA5<BlockStack::ONE_FLOW> {
 
     // Temp / V staging: can use MTE3 (UB -> L1) to feed GEMM2 without GM hop
     const uint32_t tv32_ubuf_offset = 10 * UB_UINT8_BLOCK_SIZE_MLA_A5;
+    // Ring-mode LSE scratch. UB is already packed to ~10*BLK (< MAX_UB_SIZE_A5),
+    // so LSE reuses the Stage1-only regions (ls32@0, ls16/mask32@4*BLK) which are
+    // dead by the Stage2 IS_RING tail — same time-sliced aliasing A3 relies on.
+    const uint32_t lse32_ubuf_offset = 0 * UB_UINT8_BLOCK_SIZE_MLA_A5;
+    const uint32_t lse_conv_ubuf_offset = 4 * UB_UINT8_BLOCK_SIZE_MLA_A5;
 };
 
 namespace XllmOps {
@@ -277,7 +282,11 @@ template <TilingKeyType tilingKeyType = TilingKeyType::TILING_HALF_DATA,
           typename OUT_DTYPE = half,
           typename IN_KVDTYPE = half,
           InputFormat KInputType = InputFormat::ND_FORMAT,
-          bool EnableOptimization = false>
+          bool EnableOptimization = false,
+          // A5 shared-UB layout selector — MUST match the paired MLADecoderAiv's
+          // BlockFlow so S/P/lo/go offsets (UbufAllocA5<BlockFlow>) are identical
+          // on both cores. Normal/Ring paths use ONE_FLOW; TP1 paths use FOUR_FLOW.
+          BlockStack BlockFlow = BlockStack::ONE_FLOW>
 class MLAttentionDecoderAic {
     // Type aliases for GEMM intermediates
     using mm1OutputType = typename AttentionTypeA5<tilingKeyType>::mm1OutputType;
@@ -365,17 +374,21 @@ public:
         pipe.InitBuffer(l0cTBuf, L0C_UINT8_BUF_SIZE_A5);   // L0C = 256KB
 
         // --- A5 shared-UB carve (Cube side) ---
-        // Allocate one contiguous UB region and view S/P/O at the SAME offsets
-        // used by MLADecoderAiv (UbufAllocA5<ONE_FLOW>), so the CUBE and its two
-        // Vector cores read/write the same physical UB (no GM round-trip):
-        //   s_ubuf @ ls32_ubuf_offset (0)      : QK score written L0C->UB (FixPipe)
-        //   p_ubuf @ lp_ubuf_offset  (2*BLK)   : softmax P source for UB->L1 (MTE3)
-        //   go_ubuf @ go_ubuf_offset (8*BLK)   : PV output written L0C->UB (FixPipe)
+        // Allocate one contiguous UB region and view S/P/lo/O at the SAME offsets
+        // used by the paired MLADecoderAiv (UbufAllocA5<BlockFlow>), so the CUBE and
+        // its two Vector cores read/write the same physical UB (no GM round-trip).
+        // Offsets follow the selected BlockFlow specialization (ONE_FLOW/FOUR_FLOW):
+        //   s_ubuf  @ ls32_ubuf_offset : QK score written L0C->UB (FixPipe)
+        //   p_ubuf  @ lp_ubuf_offset   : softmax P source for UB->L1 (MTE3)
+        //   lo_ubuf @ lo_ubuf_offset   : PV mmad result written L0C->UB (FixPipe)
+        //   go_ubuf @ go_ubuf_offset   : final O staged for copy-out
         pipe.InitBuffer(ubTBuf, MAX_UB_SIZE_A5);
         auto ubBase = ubTBuf.Get<uint8_t>();
         s_ubuf_tensor  = ubBase[ubufAlloc.ls32_ubuf_offset].template ReinterpretCast<float>();
         p_ubuf_tensor  = ubBase[ubufAlloc.lp_ubuf_offset].template ReinterpretCast<IN_DTYPE>();
         go_ubuf_tensor = ubBase[ubufAlloc.go_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
+        // PV mmad result (lo) shares the same physical UB as AIV lo_ubuf (4*BLK).
+        lo_ubuf_tensor = ubBase[ubufAlloc.lo_ubuf_offset].template ReinterpretCast<float>();
 
         // Get base tensors (required before sub-buffer offset assignment)
         auto l1BaseTensor = l1TBuf.Get<uint8_t>();
@@ -798,17 +811,23 @@ private:
     // A5 abandons A3's S/P GM round-trip: QK score (S) is written L0C->UB via
     // FixPipe, and softmax result (P) is consumed UB->L1 via MTE3. The UB region
     // here MUST share the SAME physical buffer & offset layout as MLADecoderAiv
-    // (same AI Core, 1 CUBE + 2 Vector), so we reuse UbufAllocA5<ONE_FLOW> — the
-    // FP16 main path — whose ls32/lp/go offsets are identical to the AIV side.
-    // Offsets: s_ubuf=ls32(0), p_ubuf=lp(2*BLK), go_ubuf=go(8*BLK).
+    // (same AI Core, 1 CUBE + 2 Vector), so we select UbufAllocA5<BlockFlow> — the
+    // SAME specialization the paired AIV uses — whose ls32/lp/lo/go offsets are
+    // therefore guaranteed identical on both cores. ONE_FLOW: p_ubuf=lp(2*BLK);
+    // FOUR_FLOW: p_ubuf=lp(0) time-shared with S (dead after QK, safe under the
+    // QK_READY->SOFTMAX_READY->UPDATE_READY cross-core sync ordering).
     AscendC::TBuf<AscendC::TPosition::VECCALC> ubTBuf;
-    UbufAllocA5<BlockStack::ONE_FLOW> ubufAlloc;
+    UbufAllocA5<BlockFlow> ubufAlloc;
     // QK score (S) staged L0C->UB (FixPipe target, float, == AIV ls32_ubuf).
     AscendC::LocalTensor<float> s_ubuf_tensor;
     // Softmax result (P) source for UB->L1 MTE3 (== AIV lp_ubuf).
     AscendC::LocalTensor<IN_DTYPE> p_ubuf_tensor;
     // PV output (O) staged L0C->UB (FixPipe target, == AIV go_ubuf).
     AscendC::LocalTensor<OUT_DTYPE> go_ubuf_tensor;
+    // A5 shared-UB: PV mmad result (lo) staged L0C->UB (FixPipe target, float,
+    // == AIV lo_ubuf @ 4*BLK). Replaces the A3 o_tmp_gm round-trip: the paired
+    // AIV Stage2 reads this same physical UB region (no GM).
+    AscendC::LocalTensor<float> lo_ubuf_tensor;
 
     // L1 sub-tensors (assigned in SetArgs after pipe.InitBuffer)
     AscendC::LocalTensor<IN_DTYPE> l1q_buf_addr_tensor;
@@ -987,6 +1006,8 @@ public:
         tv32_ubuf_tensor        = ubBase[ubufAlloc.tv32_ubuf_offset].template ReinterpretCast<float>();
         go_ubuf_tensor          = ubBase[ubufAlloc.go_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
         go32_ubuf_tensor        = ubBase[ubufAlloc.go32_ubuf_offset].template ReinterpretCast<float>();
+        lse32_ubuf_tensor       = ubBase[ubufAlloc.lse32_ubuf_offset].template ReinterpretCast<float>();
+        lse_conv_ubuf_tensor    = ubBase[ubufAlloc.lse_conv_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
     }
 
     __aicore__ __attribute__((always_inline)) inline void SetArgs2(
@@ -1222,6 +1243,11 @@ private:
     AscendC::LocalTensor<float> tv32_ubuf_tensor;
     AscendC::LocalTensor<OUT_DTYPE> go_ubuf_tensor;
     AscendC::LocalTensor<float> go32_ubuf_tensor;
+    // Ring-mode LSE (log-sum-exp) scratch: lse32 accumulates ln(gl)+gm in fp32,
+    // lse_conv converts it to OUT_DTYPE before copy-out to lse_gm. Only used on
+    // the IS_RING path (Stage2 tail).
+    AscendC::LocalTensor<float> lse32_ubuf_tensor;
+    AscendC::LocalTensor<OUT_DTYPE> lse_conv_ubuf_tensor;
 };
 
 } // namespace MlaArch35
@@ -1257,6 +1283,11 @@ struct UbufAllocA5<BlockStack::FOUR_FLOW> {
     const uint32_t go_ubuf_offset = 8 * UB_UINT8_BLOCK_SIZE_MLA_A5;
     const uint32_t go32_ubuf_offset = 8 * UB_UINT8_BLOCK_SIZE_MLA_A5;
     const uint32_t tv32_ubuf_offset = 10 * UB_UINT8_BLOCK_SIZE_MLA_A5;
+    // Ring-mode LSE scratch. UB is already packed to ~10*BLK (< MAX_UB_SIZE_A5),
+    // so LSE reuses the Stage1-only regions (ls32@0, ls16/mask32@4*BLK) which are
+    // dead by the Stage2 IS_RING tail — same time-sliced aliasing A3 relies on.
+    const uint32_t lse32_ubuf_offset = 0 * UB_UINT8_BLOCK_SIZE_MLA_A5;
+    const uint32_t lse_conv_ubuf_offset = 4 * UB_UINT8_BLOCK_SIZE_MLA_A5;
 };
 
 

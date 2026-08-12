@@ -102,7 +102,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if(TILING_KEY_IS(4)){ // fp16 ND TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT, true> pa_aic_fp16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT, true, BlockStack::FOUR_FLOW> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -112,7 +112,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(5)) { // bf16 ND TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::ND_FORMAT, true> pa_aic_bf16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::ND_FORMAT, true, BlockStack::FOUR_FLOW> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -122,7 +122,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(20)) { // fp16 NZ TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT, true> pa_aic_fp16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT, true, BlockStack::FOUR_FLOW> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -132,7 +132,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(21)) { // bf16 NZ TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::NZ_FORMAT, true> pa_aic_bf16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::NZ_FORMAT, true, BlockStack::FOUR_FLOW> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_bf16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -186,7 +186,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(36)) { // fp16 ND Ring TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT> pa_aic_fp16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::ND_FORMAT, false, BlockStack::FOUR_FLOW> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -197,7 +197,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(37)) { // bf16 ND Ring TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::ND_FORMAT> pa_aic_fp16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::ND_FORMAT, false, BlockStack::FOUR_FLOW> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -208,7 +208,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(52)) { // fp16 NZ Ring TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_HALF_DATA, half, half, half, half, InputFormat::NZ_FORMAT, false, BlockStack::FOUR_FLOW> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
         } else if ASCEND_IS_AIV {
@@ -219,7 +219,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         }
     } else if (TILING_KEY_IS(53)) { // bf16 NZ Ring TP1
         if ASCEND_IS_AIC {
-            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::NZ_FORMAT> pa_aic_fp16 {};
+            MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::NZ_FORMAT, false, BlockStack::FOUR_FLOW> pa_aic_fp16 {};
             pa_aic_fp16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
             pa_aic_fp16.RunTP1();
         } else if ASCEND_IS_AIV {

@@ -110,15 +110,31 @@ def _mla_decode_golden(q_nope, q_rope, k_nope, k_rope, v_nope,
     return out
 
 
+# -----------------------------------------------------------------------------
+# A5 (ascend950 / DAV_3510) support status
+# -----------------------------------------------------------------------------
+# The A5 arch35 kernel currently ships ONLY the Run() path as complete
+# functionality (Normal / Ring / INT8). The MTP TP1 path (RunTP1) is NOT yet
+# implemented (InnerRunCubeMLATP1 / AIV RunTP1 are TODO stubs).
+#
+# Host tiling triggers the TP1 path when:
+#     mtpTp1Flag = (q_head == 128) && (dtype in {fp16, bf16})   # M_LIMIT = 128
+# which maps to A5 TilingKey 4/5 (RunTP1, unimplemented).
+#
+# => All cases with q_head == 128 are [NOT SUPPORTED - A5 RunTP1 not
+#    implemented] and are commented out below until RunTP1 lands.
+#    Cases with q_head in {32, 64} map to TilingKey 0 (Run(), supported).
+# -----------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "dtype, batch, q_head, kv_head, kv_seqlen, block_size",
     [
         (torch.float16, 200, 32, 1, 64, 128),
-        (torch.float16, 1, 128, 1, 1024, 128),
-        (torch.float16, 6, 128, 1, 2048, 128),
-        (torch.float16, 12, 128, 1, 2048, 128),
-        (torch.float16, 24, 128, 1, 4096, 128),
-        (torch.float16, 25, 128, 1, 4096, 128),
+        # [NOT SUPPORTED - A5 RunTP1 not implemented] q_head==128 -> TP1 (TilingKey 4/5)
+        # (torch.float16, 1, 128, 1, 1024, 128),
+        # (torch.float16, 6, 128, 1, 2048, 128),
+        # (torch.float16, 12, 128, 1, 2048, 128),
+        # (torch.float16, 24, 128, 1, 4096, 128),
+        # (torch.float16, 25, 128, 1, 4096, 128),
         (torch.float16, 1, 32, 1, 1024, 128),
         (torch.float16, 6, 32, 1, 2048, 128),
         (torch.float16, 12, 32, 1, 2048, 128),

@@ -863,6 +863,41 @@ __aicore__ __attribute__((always_inline)) inline void CopyPVResultToGM(
 }
 
 // ----------------------------------------------------------------------------
+// CopyPVResultToUB - A5 shared-UB variant that replaces CopyPVResultToGM. Instead
+// of the A3 mm2 L0C->o_tmp_gm(O) round-trip, it FixPipes the PV result straight
+// into the UB region the AIC shares with its two paired AIV cores
+// (lo_ubuf_tensor == AIV lo_ubuf, offset 4*BLK). Same L0C->UB Fixpipe path as
+// CopyQKResultToUB. The UB region is per-AI-Core private, so there is NO block_idx
+// stride; only the n_idx double-buffer half stays. A5 PV L0C is float (FP16 main
+// path) -> Fixpipe NoQuant into the shared float UB. INT8 (int32 L0C) is a TODO.
+// ----------------------------------------------------------------------------
+template <typename LoUbufT, typename L0cT>
+__aicore__ __attribute__((always_inline)) inline void CopyPVResultToUB(
+    const AscendC::LocalTensor<LoUbufT> &lo_ubuf_tensor,
+    const AscendC::LocalTensor<L0cT> &mm2_l0c_buf_tensor,
+    uint32_t l0c_pingpong_flag, uint32_t embed_split_idx,
+    uint32_t n_idx, uint32_t m, uint32_t round_embed_split_size, uint32_t round_v)
+{
+    PlatformWaitPVL0cForFix(l0c_pingpong_flag);
+    // A5 FixPipe supports L0C(float)->UB(float) (FP16 main path). INT8 L0C is
+    // int32 and A5 has NO Fixpipe<int,float> combo; only the FP16 path FixPipes
+    // into the shared UB here; INT8 is a TODO stub.
+    if constexpr (AscendC::IsSameType<L0cT, float>::value) {
+        CopyQKResultToUBRaw(
+            lo_ubuf_tensor[(uint64_t)embed_split_idx * round_embed_split_size +
+                           (uint64_t)((n_idx - 1) % 2) * TMP_SIZE_DECODER_A5],
+            mm2_l0c_buf_tensor[l0c_pingpong_flag * 16384],
+            m,                                     // MSize
+            round_v,                               // NSize
+            RoundUp<16>(m),                        // srcStride
+            RoundUp<16>(round_embed_split_size));  // dstStride
+    }
+    // TODO(INT8): route the int32 mm2 L0C PV result into the shared UB once the
+    // INT8 decode path is enabled.
+    PlatformSetPVFixComplete(l0c_pingpong_flag);
+}
+
+// ----------------------------------------------------------------------------
 // ComputePV 鈥?arch32 L1084-1208  (CUBE2 stage1). Pure orchestration (mirrors
 // ComputeQK): refresh qk_n_2 on the tail block, run the embed_split_loop_v (=4)
 // loop over the sub-functions (V transpose -> P load on split 0 -> PV mmad ->
@@ -925,8 +960,10 @@ __aicore__ __attribute__((always_inline)) inline void ComputePV(
                       l0b_pingpong_flag, l0c_pingpong_flag, l0_p_pingpong_flag,
                       m, embed_split_size, qk_n_2, is_last_split);
 
-        CopyPVResultToGM(aic.o_tmp_gm_tensor, aic.mm2_l0c_buf_tensor,
-                         l0c_pingpong_flag, (uint32_t)block_idx, esi, n_idx,
+        // A5 shared-UB: FixPipe the PV result straight into the UB shared with
+        // the paired AIV cores (lo_ubuf) instead of the A3 o_tmp_gm round-trip.
+        CopyPVResultToUB(aic.lo_ubuf_tensor, aic.mm2_l0c_buf_tensor,
+                         l0c_pingpong_flag, esi, n_idx,
                          m, round_embed_split_size, round_v);
     }
 

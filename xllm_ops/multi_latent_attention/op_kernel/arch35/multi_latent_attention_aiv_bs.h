@@ -333,15 +333,248 @@ __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
     PlatformSoftmaxStage1PostSync();
 }
 
-// 业务函数：softmax 阶段二（PV + rescale + O 写回）——本批空桩。
-// 与 A3(arch32) aiv_bs.h ScheduleSoftmaxStage2(VectorContext&,n_idx) 签名一致。
-// 本体依赖 SoftmaxStage2MLAHeadLoop 本体、round_v、o_offset、WaitFlagDev 等，
-// 留待后续分批移植。
+// ==================== SoftmaxStage2 计算体（A5 标准 AscendC 重写）====================
+// 参考 A3(arch32) aiv_bs.h SoftmaxStage2MLAHeadLoop(L637-996)，但：
+//  ① A5 共享 UB 数据流：PV 结果(A3 存 o_tmp_gm)已由 AIC FixPipe(L0C→UB)写入共享
+//     lo_ubuf(offset 4*BLK)，AIV 从同物理地址直读，故删除 n_idx!=0 分支的
+//     gm_to_ub(lo←o_tmp_gm)、n_idx==0 分支的 gm_to_ub(go32←o_tmp_gm) 改为从 lo 读；
+//  ② 向量原语全换标准 AscendC API（Exp/Mul/Add/Div/Brcb/Ln/Cast/DataCopy/DataCopyPad）；
+//  ③ go_gm 跨 head_loop 累加中转维持 GM(A3 原样)；
+//  ④ INT8(TILING_INT8_DATA) DeQuant 路径先留 TODO；PIPE_BARRIER(V) 保留。
+// 本批仅实现 FP16 主路径。
+__aicore__ __attribute__((always_inline)) inline void SoftmaxStage2MLAHeadLoop(
+    AscendC::GlobalTensor<float> go_gm_tensor,
+    AscendC::GlobalTensor<OUT_DTYPE> o_gm_tensor,
+    AscendC::LocalTensor<float> dm32_ubuf_tensor_off,
+    AscendC::LocalTensor<float> ll_ubuf_tensor_off,
+    AscendC::LocalTensor<float> pm32_ubuf_tensor_off,
+    uint32_t n_idx, uint32_t n_loop, uint32_t qk_n, uint32_t qk_round_n,
+    uint32_t sub_m, uint64_t o_offset, uint32_t head_idx, uint32_t pm_flag_scalar,
+    uint32_t head_loop, uint32_t head_loop_idx, uint32_t q_seq_len,
+    uint32_t sub_head_num, uint32_t cur_head_num, uint32_t numhead_per_process,
+    uint32_t head_res_row_num, uint32_t head_start_sblock_idx, uint32_t tail_res_row_num)
+{
+    (void)qk_n; (void)qk_round_n; (void)head_idx; (void)pm_flag_scalar;
+    (void)sub_head_num; (void)cur_head_num; (void)pm32_ubuf_tensor_off;
+
+    uint32_t sub_m_d64 = (sub_m + 63) / 64;         // 64 对齐 repeat
+    uint32_t round_sub_m = (sub_m + 15) / 16 * 16;
+
+    WAIT_FLAG(V, MTE2, EVENT_ID0);
+    // *** A5 共享 UB：PV 结果 lo 已在 lo_ubuf(AIC FixPipe 写入)，无需 gm_to_ub(lo←o_tmp_gm)。
+    // TODO(INT8): n_idx!=0 时反量化 DeQuantPerHeadImpl(lo)。
+    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+    WAIT_FLAG(MTE3, MTE2, EVENT_ID4);
+    if (n_idx != 0) {
+        if (head_loop_idx == 0) {
+            // *** dm = exp(dm)
+            AscendC::Exp(dm32_ubuf_tensor_off, dm32_ubuf_tensor_off, sub_m);
+            PIPE_BARRIER(V);
+            // *** gl = dm * gl
+            AscendC::Mul(gl32_ubuf_tensor, dm32_ubuf_tensor_off, gl32_ubuf_tensor, sub_m);
+            PIPE_BARRIER(V);
+            // *** gl = gl + ll
+            AscendC::Add(gl32_ubuf_tensor, gl32_ubuf_tensor, ll_ubuf_tensor_off, sub_m);
+            PIPE_BARRIER(V);
+        }
+        // *** dm_block = expand_to_block(dm)：每行 dm 广播到一个 block
+        AscendC::Brcb(
+            tv32_ubuf_tensor.template ReinterpretCast<uint32_t>(),
+            dm32_ubuf_tensor_off.template ReinterpretCast<uint32_t>(),
+            round_sub_m / FLOAT_BLOCK_SIZE,
+            AscendC::BrcbRepeatParams(1, 8));
+        PIPE_BARRIER(V);
+        if (head_loop > 1) {
+            // *** go32 ← go_gm（跨 head_loop 累加中转，维持 GM）
+            AscendC::DataCopy(go32_ubuf_tensor, go_gm_tensor, sub_m * round_v);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        }
+    // *** go = go * dm_block（每行乘该行 dm，src1 广播 src1BlkStride=0）
+        for (uint32_t vmul_idx = 0; vmul_idx < __v / FLOAT_VECTOR_SIZE; ++vmul_idx) {
+            AscendC::Mul<float, false>(
+                go32_ubuf_tensor[vmul_idx * FLOAT_VECTOR_SIZE],
+                go32_ubuf_tensor[vmul_idx * FLOAT_VECTOR_SIZE],
+                tv32_ubuf_tensor,
+                (uint64_t)0, sub_m,
+                AscendC::BinaryRepeatParams(1, 1, 0,
+                    round_v / FLOAT_BLOCK_SIZE, round_v / FLOAT_BLOCK_SIZE, 1));
+        }
+        if (__v % FLOAT_VECTOR_SIZE > 0) {
+            AscendC::SetVectorMask<float>(0, __v % FLOAT_VECTOR_SIZE);
+            AscendC::Mul<float, false>(
+                go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                tv32_ubuf_tensor,
+                (uint64_t)0, sub_m,
+                AscendC::BinaryRepeatParams(1, 1, 0,
+                    round_v / FLOAT_BLOCK_SIZE, round_v / FLOAT_BLOCK_SIZE, 1));
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        }
+        PIPE_BARRIER(V);
+        // *** go = lo + go（lo 来自共享 UB）
+        AscendC::Add(go32_ubuf_tensor, go32_ubuf_tensor, lo_ubuf_tensor, sub_m * round_v);
+        PIPE_BARRIER(V);
+    } else {
+        // *** gl = ll
+        if (head_loop_idx == 0) {
+            AscendC::DataCopy(gl32_ubuf_tensor, ll_ubuf_tensor_off, 64);
+            PIPE_BARRIER(V);
+        }
+        // *** A5 共享 UB：go32 ← lo(PV 结果已在共享 UB)，替代 gm_to_ub(go32←o_tmp_gm)。
+        // TODO(INT8): n_idx==0 时反量化 DeQuantPerHeadImpl(go32←lo)。
+        AscendC::DataCopy(go32_ubuf_tensor, lo_ubuf_tensor, sub_m * round_v);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
+
+    if (n_idx == n_loop - 1) {
+        // *** gl_block = expand_to_block(gl)
+        AscendC::Brcb(
+            tv32_ubuf_tensor.template ReinterpretCast<uint32_t>(),
+            gl32_ubuf_tensor.template ReinterpretCast<uint32_t>()[head_loop_idx * 16],
+            round_sub_m / FLOAT_BLOCK_SIZE,
+            AscendC::BrcbRepeatParams(1, 8));
+        PIPE_BARRIER(V);
+        // *** go = go / gl_block
+        for (uint32_t vdiv_idx = 0; vdiv_idx < __v / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
+            AscendC::Div<float, false>(
+                go32_ubuf_tensor[vdiv_idx * FLOAT_VECTOR_SIZE],
+                go32_ubuf_tensor[vdiv_idx * FLOAT_VECTOR_SIZE],
+          tv32_ubuf_tensor,
+                (uint64_t)0, sub_m,
+                AscendC::BinaryRepeatParams(1, 1, 0,
+                    round_v / FLOAT_BLOCK_SIZE, round_v / FLOAT_BLOCK_SIZE, 1));
+        }
+        if (__v % FLOAT_VECTOR_SIZE > 0) {
+            AscendC::SetVectorMask<float>(0, __v % FLOAT_VECTOR_SIZE);
+            AscendC::Div<float, false>(
+                go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                tv32_ubuf_tensor,
+                (uint64_t)0, sub_m,
+                AscendC::BinaryRepeatParams(1, 1, 0,
+                    round_v / FLOAT_BLOCK_SIZE, round_v / FLOAT_BLOCK_SIZE, 1));
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        }
+        PIPE_BARRIER(V);
+        // *** go = cast_fp32_to_out(go)
+        AscendC::Cast(go_ubuf_tensor, go32_ubuf_tensor,
+            AscendC::RoundMode::CAST_RINT, sub_m * round_v);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+
+        // *** 三段 DataCopyPad 输出到 o_gm（head 边角 + 整 head + 尾行）
+        uint32_t inner_o_gm_offset = 0;
+        uint32_t inner_go_ubuf_offset = 0;
+        if (head_res_row_num != 0) {
+            AscendC::DataCopyPad(
+                o_gm_tensor[inner_o_gm_offset + q_heads * __v * head_start_sblock_idx],
+                go_ubuf_tensor[inner_go_ubuf_offset],
+                AscendC::DataCopyExtParams(
+                    head_res_row_num, __v * 2, 0, __v * (q_heads - 1) * 2, 0));
+            inner_o_gm_offset += __v;
+            inner_go_ubuf_offset += head_res_row_num * __v;
+        }
+        for (uint32_t i = 0; i < numhead_per_process; i++) {
+            AscendC::DataCopyPad(
+                o_gm_tensor[inner_o_gm_offset],
+                go_ubuf_tensor[inner_go_ubuf_offset],
+                AscendC::DataCopyExtParams(
+                    q_seq_len, __v * 2, 0, __v * (q_heads - 1) * 2, 0));
+            inner_o_gm_offset += __v;
+            inner_go_ubuf_offset += q_seq_len * __v;
+        }
+        if (tail_res_row_num != 0) {
+            AscendC::DataCopyPad(
+                o_gm_tensor[inner_o_gm_offset],
+                go_ubuf_tensor[inner_go_ubuf_offset],
+                AscendC::DataCopyExtParams(
+                    tail_res_row_num, __v * 2, 0, __v * (q_heads - 1) * 2, 0));
+        }
+        // *** IS_RING：LSE 输出 = ln(gl) + gm
+        if constexpr (IsRing) {
+            AscendC::Ln(lse32_ubuf_tensor, gl32_ubuf_tensor, sub_m);
+            PIPE_BARRIER(V);
+            AscendC::Add(lse32_ubuf_tensor, lse32_ubuf_tensor, gm32_ubuf_tensor, sub_m);
+            PIPE_BARRIER(V);
+            AscendC::Cast(lse_conv_ubuf_tensor, lse32_ubuf_tensor,
+                AscendC::RoundMode::CAST_RINT, sub_m);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1);
+            AscendC::DataCopyExtParams lseCopyParams(
+                1, sizeof(OUT_DTYPE) * sub_m * head_loop, 0, 0, 0);
+            AscendC::DataCopyPad(
+                lse_gm_tensor[(int64_t)(o_offset / __k)],
+                lse_conv_ubuf_tensor, lseCopyParams);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
+        }
+    } else if (head_loop > 1) {
+        // *** go_gm ← go32（跨 head_loop 累加中转，维持 GM）
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+        AscendC::DataCopy(go_gm_tensor, go32_ubuf_tensor, sub_m * round_v);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
+}
+
+// 业务函数：softmax 阶段二调度（PV + rescale + O 写回）。
+// 与 A3(arch32) aiv_bs.h ScheduleSoftmaxStage2(VectorContext&,n_idx) 一致；
+// A5 共享 UB：不再传 o_tmp_gm(PV 结果已在共享 lo_ubuf)，go_gm 维持 GM。
 __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage2(
     VectorContext &ctx, uint32_t n_idx)
 {
-    (void)ctx; (void)n_idx;
-    // TODO(next-batch): 移植 arch32 ScheduleSoftmaxStage2 业务体。
+    uint32_t cur_q_seqlen = ctx.cur_q_seqlen;
+    uint32_t cur_kv_seqlen = ctx.cur_kv_seqlen;
+    uint32_t cur_head_num = ctx.cur_head_num;
+    uint32_t pp_n_scalar = ctx.pp_n_scalar;
+    uint32_t n_loop = ctx.n_loop;
+    uint32_t sub_m = ctx.sub_m;
+    uint32_t sub_head_num = ctx.sub_head_num;
+    uint32_t head_idx = ctx.head_idx;
+    uint32_t qk_n_2 = ctx.qk_n_2;
+    uint32_t qk_round_n_2 = ctx.qk_round_n_2;
+
+    uint32_t process_row_num = 16;
+    uint32_t numhead_per_process = process_row_num / cur_q_seqlen;
+
+    if (n_idx == n_loop) {
+        qk_n_2 = (cur_kv_seqlen - (n_idx - 1) * pp_n_scalar);
+    qk_round_n_2 = RoundUp<BLOCK_SIZE>(qk_n_2);
+    }
+    // *** 等待 AIC 侧 PV 结果写入共享 lo_ubuf（FixPipe 完成，UPDATE_READY_DECODER）
+    WaitFlagDev(UPDATE_READY_DECODER);
+    if (sub_m > 0) {
+        uint32_t head_loop = (sub_m + process_row_num - 1) / process_row_num;
+        uint32_t head_res_row_num = 0;
+        uint32_t head_start_sblock_idx = 0;
+        uint32_t tail_res_row_num = 0;
+
+        for (uint32_t head_loop_idx = 0; head_loop_idx < head_loop; ++head_loop_idx) {
+            uint32_t cur_sub_m = head_loop_idx == (head_loop - 1)
+                ? sub_m - head_loop_idx * process_row_num : process_row_num;
+
+            head_start_sblock_idx = tail_res_row_num;
+            head_res_row_num = (cur_q_seqlen - tail_res_row_num) % cur_q_seqlen;
+            uint32_t cur_numhead_per_process = (cur_sub_m - head_res_row_num) / cur_q_seqlen;
+            tail_res_row_num = cur_sub_m - cur_numhead_per_process * cur_q_seqlen - head_res_row_num;
+
+            uint32_t out_o_offset = head_loop_idx * numhead_per_process * round_v;
+
+            SoftmaxStage2MLAHeadLoop(
+                go_gm_tensor[(uint64_t)(block_idx * TMP_SIZE + sub_block_idx * cur_head_num * cur_q_seqlen / 2 * round_v + head_loop_idx * process_row_num * round_v)],
+                o_gm_tensor[(uint64_t)(o_offset + out_o_offset)],
+                dm32_ubuf_tensor[(uint64_t)((n_idx - 1) % 2 * 128 + head_loop_idx * process_row_num)],
+                ll_ubuf_tensor[(uint64_t)((n_idx - 1) % 2 * 256 + head_loop_idx * process_row_num)],
+                pm32_ubuf_tensor[(uint64_t)((n_idx - 1) % 2 * 128 + head_loop_idx * process_row_num)],
+                n_idx - 1, n_loop, qk_n_2, RoundUp<T_BLOCK_SIZE>(qk_round_n_2), cur_sub_m, o_offset,
+                head_idx + head_loop_idx * process_row_num,
+                pm_flag_scalar1, head_loop, head_loop_idx, cur_q_seqlen, sub_head_num, cur_head_num,
+                cur_numhead_per_process, head_res_row_num, head_start_sblock_idx, tail_res_row_num);
+        }
+    }
 }
 
 // 业务函数：单个 Vector 任务的计算体（非 TP1 路径）。
