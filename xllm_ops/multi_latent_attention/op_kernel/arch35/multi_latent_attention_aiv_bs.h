@@ -120,18 +120,21 @@ __aicore__ __attribute__((always_inline)) inline void UpdateSoftmaxState(
 {
     uint32_t round_sub_m = (sub_m + 15) / 16 * 16;
 
-    // *** lm = rowmax(ls)：对每行 qk_n 个元素求最大值，存 lm32[m]
-    for (uint32_t m = 0; m < sub_m; ++m) {
-        AscendC::WholeReduceMax<float>(
-            lm32_ubuf_tensor[m],
-            ls32_ubuf_tensor[m * qk_round_n],
-            qk_n,           // mask（本行有效元素数）
-            1,              // repeatTimes
-            1,              // dstRepStride
-            1,              // srcBlkStride
-            8,              // srcRepStride
-            AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-    }
+    // *** lm = rowmax(ls)：批量归约，repeat=sub_m 一次完成（对齐 A3 ReduceMaxRepeatM）
+    // A3: __set_mask(qk_n) + cmax_v<...,ORDER_ONLY_VALUE>(dst,src,repeat=sub_m,1,1,qk_round_n/FLOAT_BLOCK_SIZE)
+    // A5: SetVectorMask<float> 设本行有效元素数 → WholeReduceMax<float,false> mask=0 依赖预设掩码。
+    // 注: 本批只支持 qk_n<=FLOAT_VECTOR_SIZE(64) 主路径；qk_n>64 需分块（A3 else 分支）留 TODO。
+    AscendC::SetVectorMask<float>(0, qk_n);
+    AscendC::WholeReduceMax<float, false>(
+        lm32_ubuf_tensor,
+        ls32_ubuf_tensor,
+        (int32_t)0,                     // mask=0：使用上面 SetVectorMask 预设掩码
+        sub_m,                          // repeatTimes
+        1,                              // dstRepStride
+        1,                              // srcBlkStride
+        qk_round_n / FLOAT_BLOCK_SIZE,  // srcRepStride
+        AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);   // 恢复全掩码
     PIPE_BARRIER(V);
 
     if (n_idx != 0) {
@@ -157,16 +160,36 @@ __aicore__ __attribute__((always_inline)) inline void UpdateSoftmaxState(
 __aicore__ __attribute__((always_inline)) inline void SubAndExp(
     uint32_t sub_m, uint32_t qk_n, uint32_t qk_round_n)
 {
-    // *** ls[m,:] = ls[m,:] - hm[m]（逐行减去该行最大值，标量广播）
-    for (uint32_t m = 0; m < sub_m; ++m) {
-        float row_max = hm32_ubuf_tensor.GetValue(m);
-        AscendC::Adds(
-            ls32_ubuf_tensor[m * qk_round_n],
-            ls32_ubuf_tensor[m * qk_round_n],
-            -row_max,
-            qk_n);
-    }
+    uint32_t round_sub_m = (sub_m + 15) / 16 * 16;
+
+    // *** ls[m,:] = ls[m,:] - hm[m]（每行减该行最大值）
+    // A3 TensorSubValueRepeatM: brcb_v 把每行 max(hm)[sub_m] 广播到 tv32（每行填满一个 block），
+    // 再用 sub_v(src1BlockStride=0,src1RepStride=1) 批量 repeat=sub_m。A5 用标准 Brcb + Sub。
+    // 本批仅支持 qk_n<=FLOAT_VECTOR_SIZE(64) 主路径；qk_n>64 需分块留 TODO。
+    AscendC::Brcb(
+        tv32_ubuf_tensor.template ReinterpretCast<uint32_t>(),
+        hm32_ubuf_tensor.template ReinterpretCast<uint32_t>(),
+        round_sub_m / FLOAT_BLOCK_SIZE,                      // repeat
+        AscendC::BrcbRepeatParams(1, 8));                    // dstBlockStride=1, dstRepeatStride=8
     PIPE_BARRIER(V);
+
+    AscendC::SetVectorMask<float>(0, qk_n);
+    AscendC::Sub<float, false>(
+        ls32_ubuf_tensor,
+        ls32_ubuf_tensor,
+        tv32_ubuf_tensor,
+        (uint64_t)0,                                         // mask=0：使用预设掩码
+        sub_m,                                               // repeatTimes
+        AscendC::BinaryRepeatParams(
+            1,                                               // dstBlkStride
+            1,                                               // src0BlkStride
+            0,                                               // src1BlkStride（广播：每行减自己的 max）
+            qk_round_n / FLOAT_BLOCK_SIZE,                   // dstRepStride
+            qk_round_n / FLOAT_BLOCK_SIZE,                   // src0RepStride
+            1));                                             // src1RepStride
+    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);  // 恢复全掩码
+    PIPE_BARRIER(V);
+
     // *** ls = exp(ls)
     AscendC::Exp(ls32_ubuf_tensor, ls32_ubuf_tensor, sub_m * qk_round_n);
     PIPE_BARRIER(V);
@@ -201,17 +224,19 @@ __aicore__ __attribute__((always_inline)) inline void QuantizeAndOutput(
         lp_ubuf_tensor,
         sub_m * qk_round_n * T_BLOCK_OFFSET / T_BLOCK_SIZE);
 
-    // *** ll = rowsum(ls)：对每行 qk_n 个元素求和，存 ll32[m]
-    for (uint32_t m = 0; m < sub_m; ++m) {
-        AscendC::WholeReduceSum<float>(
-            ll_ubuf_tensor[m],
-            ls32_ubuf_tensor[m * qk_round_n],
-            qk_n,           // mask
-            1,              // repeatTimes
-            1,              // dstRepStride
-            1,              // srcBlkStride
-            8);             // srcRepStride
-    }
+    // *** ll = rowsum(ls)：批量归约，repeat=sub_m 一次完成（对齐 A3 ReduceSumRepeatM）
+    // A5: SetVectorMask<float> 设本行有效元素数 → WholeReduceSum<float,false> mask=0 依赖预设掩码。
+    // 注: 本批只支持 qk_n<=FLOAT_VECTOR_SIZE(64) 主路径；qk_n>64 需分块留 TODO。
+    AscendC::SetVectorMask<float>(0, qk_n);
+    AscendC::WholeReduceSum<float, false>(
+        ll_ubuf_tensor,
+        ls32_ubuf_tensor,
+        (int32_t)0,                     // mask=0：使用预设掩码
+        sub_m,                          // repeatTimes
+        1,                              // dstRepStride
+        1,                              // srcBlkStride
+        qk_round_n / FLOAT_BLOCK_SIZE); // srcRepStride
+    AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);   // 恢复全掩码
 
     // *** V→MTE2 通知：本轮完成，MTE2 可搬入下轮
     PlatformVToMte2Notify();
