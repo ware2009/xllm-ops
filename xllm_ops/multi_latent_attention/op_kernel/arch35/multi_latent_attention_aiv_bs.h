@@ -18,25 +18,21 @@
 
 // 业务子函数1：QK 数据加载 + mask 加载（FP16 非INT8 路径）
 // 非INT8: DataCopy(s_gm→ls32) + mask(DataCopyPad/DataCopy 按 mask_type 3/4) + Cast(mask→mask32)
+// A5 共享 UB：S(QK score) 已由 AIC 侧 FixPipe(L0C→UB) 写入 ls32_ubuf（同物理地址），
+// 故不再从 GM 搬入 S；仅加载真实输入 mask + Cast(mask→mask32)。
 __aicore__ __attribute__((always_inline)) inline void LoadQKData(
-    AscendC::GlobalTensor<mm1CopyType> s_gm_tensor,
     AscendC::GlobalTensor<float> s_rope_gm_tensor,
     AscendC::GlobalTensor<OUT_DTYPE> mask_gm_tensor,
     uint32_t n_idx, uint32_t qk_n, uint32_t qk_round_n, uint32_t sub_m,
     const uint32_t head_idx, uint32_t cur_q_seqlen, bool need_mask)
 {
+    // *** 等待 AIC 侧 QK score 写入 UB（FixPipe 完成）后 V 侧方可读 ls32_ubuf
     WAIT_FLAG(V, MTE2, EVENT_ID2);
     if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
         // TODO(INT8): 反量化 DeQuantPerHeadImpl + s_rope Add 融合，本批先不支持。
         (void)s_rope_gm_tensor; (void)head_idx;
     } else {
-        // *** ls32 ← s_gm（QK 结果，FP16/BF16 搬入 UB，按 float 视图对齐）
-        // A3: gm_to_ub<...,mm1CopyType>(ls32.ReinterpretCast<mm1CopyType>(), s_gm,
-        //     lenBurst = sub_m*qk_round_n/FLOAT_BLOCK_SIZE)。A5 用 DataCopy 等价。
-        AscendC::DataCopy(
-            ls32_ubuf_tensor.template ReinterpretCast<mm1CopyType>(),
-            s_gm_tensor,
-            sub_m * qk_round_n);
+        // *** S 已在 ls32_ubuf（AIC FixPipe L0C→UB 写入），无需 DataCopy(ls32←s_gm)。
 
         // *** mask 加载（mask_type==3 用 DataCopyPad；need_mask&&mask_type==4 用 DataCopy）
         if (mask_type == 3) {
@@ -197,9 +193,9 @@ __aicore__ __attribute__((always_inline)) inline void SubAndExp(
 }
 
 // 业务子函数5：量化/转换输出（FP16 非INT8 路径）
-// 非INT8: Cast(lp←ls32 FP32→OUT_DTYPE) + DataCopy(p_gm←lp) + ReduceSum(ll=rowsum(ls))
+// A5 共享 UB：P 写入 lp_ubuf（AIC 侧从同物理地址读取供 UB→L1 MTE3），不再写回 GM。
+// 非INT8: Cast(lp←ls32 FP32→OUT_DTYPE) + ReduceSum(ll=rowsum(ls))
 __aicore__ __attribute__((always_inline)) inline void QuantizeAndOutput(
-    AscendC::GlobalTensor<IN_DTYPE> p_gm_tensor,
     uint32_t sub_m, uint32_t qk_n, uint32_t qk_round_n)
 {
     if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
@@ -215,14 +211,10 @@ __aicore__ __attribute__((always_inline)) inline void QuantizeAndOutput(
         PIPE_BARRIER(V);
     }
 
-    // *** V→MTE3 同步：Cast 完成后 MTE3 可搬出
+    // *** V→MTE3 同步：Cast 完成后 P 已就绪于 lp_ubuf（AIC 侧 MTE3 从同地址搬出）
     PlatformVToMte3Sync();
 
-    // *** p_gm ← lp（概率写回 GM）
-    AscendC::DataCopy(
-        p_gm_tensor,
-        lp_ubuf_tensor,
-        sub_m * qk_round_n * T_BLOCK_OFFSET / T_BLOCK_SIZE);
+    // *** A5 共享 UB：P 留在 lp_ubuf，AIC 侧 ComputePV 直接读取，无需 DataCopy(p_gm←lp)。
 
     // *** ll = rowsum(ls)：批量归约，repeat=sub_m 一次完成（对齐 A3 ReduceSumRepeatM）
     // A5: SetVectorMask<float> 设本行有效元素数 → WholeReduceSum<float,false> mask=0 依赖预设掩码。
@@ -244,11 +236,9 @@ __aicore__ __attribute__((always_inline)) inline void QuantizeAndOutput(
 }
 
 // 业务函数：非TP1 Phase 1 — SoftmaxStage1 计算本体（串联 5 段）
-// 签名与 ScheduleSoftmaxStage1 的调用一致（4 GM tensor + 14 标量）。
-// UB tensor 直接引用类成员，故不像 A3 那样传 dm32/ll/pm32 形参。
+// A5 共享 UB：S 已在 ls32_ubuf、P 写 lp_ubuf，故签名不再含 s_gm/p_gm；
+// 仅保留真实输入 s_rope_gm/mask_gm。UB tensor 直接引用类成员。
 __aicore__ __attribute__((always_inline)) inline void SoftmaxStage1(
-    AscendC::GlobalTensor<IN_DTYPE> p_gm_tensor_off,
-    AscendC::GlobalTensor<mm1CopyType> s_gm_tensor_off,
     AscendC::GlobalTensor<float> s_rope_gm_tensor_off,
     AscendC::GlobalTensor<OUT_DTYPE> mask_gm_tensor_off,
     uint32_t n_idx, uint32_t qk_n, uint32_t qk_round_n, uint32_t sub_m,
@@ -259,8 +249,8 @@ __aicore__ __attribute__((always_inline)) inline void SoftmaxStage1(
     (void)sub_n_loop; (void)cur_batch; (void)start_kv;
     (void)real_n_loop; (void)pm_flag_scalar; (void)cur_kv_seqlen;
 
-    // 段1：QK 数据加载（非INT8:FP16+mask+Cast；INT8 留 TODO）
-    LoadQKData(s_gm_tensor_off, s_rope_gm_tensor_off, mask_gm_tensor_off,
+    // 段1：QK 数据加载（S 已在 UB；仅加载 mask/s_rope）
+    LoadQKData(s_rope_gm_tensor_off, mask_gm_tensor_off,
                n_idx, qk_n, qk_round_n, sub_m, head_idx, cur_q_seqlen, need_mask);
     // 段2：QK 缩放 + 非INT8 mask Add
     ScaleAndMask(qk_n, qk_round_n, sub_m, cur_q_seqlen, need_mask);
@@ -268,8 +258,8 @@ __aicore__ __attribute__((always_inline)) inline void SoftmaxStage1(
     UpdateSoftmaxState(n_idx, sub_m, qk_n, qk_round_n);
     // 段4：减法 + 指数（ls = exp(ls - hm)）
     SubAndExp(sub_m, qk_n, qk_round_n);
-    // 段5：转换输出 + p_gm 写回 + rowsum
-    QuantizeAndOutput(p_gm_tensor_off, sub_m, qk_n, qk_round_n);
+    // 段5：转换输出（P 写 lp_ubuf，留 UB）+ rowsum
+    QuantizeAndOutput(sub_m, qk_n, qk_round_n);
 }
 
 // 业务函数：非TP1 Phase 1 — Softmax Stage1 调度
@@ -322,12 +312,6 @@ __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
         // input QK shape (sub_m, qk_round_n)
         if (n_idx % 2 == 0) {
             SoftmaxStage1(
-                p_gm_tensor[(uint64_t)block_idx * TMP_SIZE * T_BLOCK_OFFSET +
-                    (uint64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n * T_BLOCK_OFFSET +
-                    (uint64_t)(n_idx % 2) * TMP_SIZE * T_BLOCK_OFFSET / 2],
-                s_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER_A5 +
-                    (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n +
-                    (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER_A5 / 2],
                 s_rope_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER_A5 +
                     (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n +
                     (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER_A5 / 2],
@@ -336,12 +320,6 @@ __aicore__ __attribute__((always_inline)) inline void ScheduleSoftmaxStage1(
                 real_n_loop, head_idx, pm_flag_scalar1, cur_q_seqlen, cur_kv_seqlen, need_mask);
         } else {
             SoftmaxStage1(
-                p_gm_tensor[(uint64_t)block_idx * TMP_SIZE * T_BLOCK_OFFSET +
-                    (uint64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n * T_BLOCK_OFFSET +
-                    TMP_SIZE * T_BLOCK_OFFSET / 2],
-                s_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER_A5 +
-                    (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n +
-                    TMP_SIZE_DECODER_A5 / 2],
                 s_rope_gm_tensor[(int64_t)block_idx * TMP_SIZE_DECODER_A5 +
                     (int64_t)sub_block_idx * cur_head_num * cur_q_seqlen / 2 * qk_round_n +
                     TMP_SIZE_DECODER_A5 / 2],

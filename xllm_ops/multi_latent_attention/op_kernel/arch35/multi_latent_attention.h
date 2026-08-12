@@ -343,8 +343,8 @@ public:
         k_gm = reinterpret_cast<__gm__ IN_KVDTYPE *>(k_in_gm);
         k_rope_gm = reinterpret_cast<__gm__ IN_ROPE_DTYPE *>(k_rope_in_gm);
         block_tables_gm = reinterpret_cast<__gm__ int32_t *>(block_tables_in_gm);
-        s_gm = reinterpret_cast<__gm__ mm1CopyType *>(s_out_gm);
-        p_gm = reinterpret_cast<__gm__ IN_DTYPE *>(p_out_gm);
+        // A5 shared-UB: S/P no longer round-trip through GM (see CopyQKResultToUB /
+        // LoadPDataToL0A). s_out_gm/p_out_gm inputs kept for host ABI compat but unbound.
         o_tmp_gm = reinterpret_cast<__gm__ mm2CopyType *>(o_temp_gm);
         tiling_gm = reinterpret_cast<__gm__ uint8_t *>(tiling_para_gm);
 
@@ -353,8 +353,6 @@ public:
         q_rope_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ IN_ROPE_DTYPE *>(q_rope_gm));
         k_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ IN_KVDTYPE *>(k_gm));
         k_rope_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ IN_ROPE_DTYPE *>(k_rope_gm));
-        s_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm1CopyType *>(s_out_gm));
-        p_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ IN_DTYPE *>(p_out_gm));
         o_tmp_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm2CopyType *>(o_temp_gm));
         block_tables_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(block_tables_in_gm));
 
@@ -365,6 +363,19 @@ public:
         pipe.InitBuffer(l0aTBuf, L0AB_UINT8_BUF_SIZE_A5);  // L0A = 32KB
         pipe.InitBuffer(l0bTBuf, L0AB_UINT8_BUF_SIZE_A5);  // L0B = 32KB
         pipe.InitBuffer(l0cTBuf, L0C_UINT8_BUF_SIZE_A5);   // L0C = 256KB
+
+        // --- A5 shared-UB carve (Cube side) ---
+        // Allocate one contiguous UB region and view S/P/O at the SAME offsets
+        // used by MLADecoderAiv (UbufAllocA5<ONE_FLOW>), so the CUBE and its two
+        // Vector cores read/write the same physical UB (no GM round-trip):
+        //   s_ubuf @ ls32_ubuf_offset (0)      : QK score written L0C->UB (FixPipe)
+        //   p_ubuf @ lp_ubuf_offset  (2*BLK)   : softmax P source for UB->L1 (MTE3)
+        //   go_ubuf @ go_ubuf_offset (8*BLK)   : PV output written L0C->UB (FixPipe)
+        pipe.InitBuffer(ubTBuf, MAX_UB_SIZE_A5);
+        auto ubBase = ubTBuf.Get<uint8_t>();
+        s_ubuf_tensor  = ubBase[ubufAlloc.ls32_ubuf_offset].template ReinterpretCast<float>();
+        p_ubuf_tensor  = ubBase[ubufAlloc.lp_ubuf_offset].template ReinterpretCast<IN_DTYPE>();
+        go_ubuf_tensor = ubBase[ubufAlloc.go_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
 
         // Get base tensors (required before sub-buffer offset assignment)
         auto l1BaseTensor = l1TBuf.Get<uint8_t>();
@@ -743,8 +754,7 @@ private:
     __gm__ IN_ROPE_DTYPE *__restrict__ q_rope_gm{nullptr};
     __gm__ IN_KVDTYPE *__restrict__ k_gm{nullptr};
     __gm__ IN_ROPE_DTYPE *__restrict__ k_rope_gm{nullptr};
-    __gm__ mm1CopyType *__restrict__ s_gm{nullptr};
-    __gm__ IN_DTYPE *__restrict__ p_gm{nullptr};
+    // A5 shared-UB: S/P GM pointers removed (S via FixPipe->UB, P via UB->L1 MTE3).
     __gm__ mm2CopyType *__restrict__ o_tmp_gm{nullptr};
     __gm__ int32_t *__restrict__ block_tables_gm{nullptr};
     __gm__ uint8_t *__restrict__ tiling_gm{nullptr};
@@ -754,8 +764,6 @@ private:
     AscendC::GlobalTensor<IN_ROPE_DTYPE> q_rope_gm_tensor;
     AscendC::GlobalTensor<IN_KVDTYPE> k_gm_tensor;
     AscendC::GlobalTensor<IN_ROPE_DTYPE> k_rope_gm_tensor;
-    AscendC::GlobalTensor<mm1CopyType> s_gm_tensor;
-    AscendC::GlobalTensor<IN_DTYPE> p_gm_tensor;
     AscendC::GlobalTensor<mm2CopyType> o_tmp_gm_tensor;
     AscendC::GlobalTensor<int32_t> block_tables_gm_tensor;
     AscendC::GlobalTensor<float> s_rope_gm_tensor;  // INT8 path: QK RoPE score output
@@ -785,6 +793,22 @@ private:
     AscendC::TBuf<AscendC::TPosition::A2> l0aTBuf;   // L0A
     AscendC::TBuf<AscendC::TPosition::B2> l0bTBuf;    // L0B
     AscendC::TBuf<AscendC::TPosition::CO1> l0cTBuf;  // L0C (shared by mm1/mm2)
+
+    // --- A5 shared-UB infrastructure (Cube side) ---
+    // A5 abandons A3's S/P GM round-trip: QK score (S) is written L0C->UB via
+    // FixPipe, and softmax result (P) is consumed UB->L1 via MTE3. The UB region
+    // here MUST share the SAME physical buffer & offset layout as MLADecoderAiv
+    // (same AI Core, 1 CUBE + 2 Vector), so we reuse UbufAllocA5<ONE_FLOW> — the
+    // FP16 main path — whose ls32/lp/go offsets are identical to the AIV side.
+    // Offsets: s_ubuf=ls32(0), p_ubuf=lp(2*BLK), go_ubuf=go(8*BLK).
+    AscendC::TBuf<AscendC::TPosition::VECCALC> ubTBuf;
+    UbufAllocA5<BlockStack::ONE_FLOW> ubufAlloc;
+    // QK score (S) staged L0C->UB (FixPipe target, float, == AIV ls32_ubuf).
+    AscendC::LocalTensor<float> s_ubuf_tensor;
+    // Softmax result (P) source for UB->L1 MTE3 (== AIV lp_ubuf).
+    AscendC::LocalTensor<IN_DTYPE> p_ubuf_tensor;
+    // PV output (O) staged L0C->UB (FixPipe target, == AIV go_ubuf).
+    AscendC::LocalTensor<OUT_DTYPE> go_ubuf_tensor;
 
     // L1 sub-tensors (assigned in SetArgs after pipe.InitBuffer)
     AscendC::LocalTensor<IN_DTYPE> l1q_buf_addr_tensor;
@@ -892,16 +916,14 @@ public:
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
 
         o_gm = reinterpret_cast<__gm__ OUT_DTYPE *>(o_out_gm);
-        s_gm = reinterpret_cast<__gm__ mm1CopyType *>(s_out_gm);
-        p_gm = reinterpret_cast<__gm__ IN_DTYPE *>(p_out_gm);
+        // A5 shared-UB: S read from ls32_ubuf, P written to lp_ubuf; s_out_gm/p_out_gm
+        // inputs kept for host ABI compat but unbound (softmax stays in shared UB).
         o_tmp_gm = reinterpret_cast<__gm__ mm2CopyType *>(o_temp_gm);
         go_gm = reinterpret_cast<__gm__ float *>(globalo_gm);
         tiling_gm = reinterpret_cast<__gm__ uint8_t *>(tiling_para_gm);
         gm_block_tables_ = reinterpret_cast<__gm__ int32_t *>(gm_block_table);
         o_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ OUT_DTYPE *>(o_gm));
         mask_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ OUT_DTYPE *>(mask_input_gm));
-        s_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm1CopyType *>(s_gm));
-        p_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ IN_DTYPE *>(p_gm));
         o_tmp_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ mm2CopyType *>(o_tmp_gm));
         go_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(go_gm));
         tmp_gm_tensor.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(tmp_gm));
@@ -941,30 +963,30 @@ public:
         // Replaces A3's AsdopsBuffer::GetBuffer<ASCEND_UB,T>(offset) (main L3137).
         vpipe.InitBuffer(ubTBuf, MAX_UB_SIZE_A5);
         auto ubBase = ubTBuf.Get<uint8_t>();
-        ls32_ubuf_tensor        = ubBase[ubufAlloc.ls32_ubuf_offset].ReinterpretCast<float>();
-        ls32_quant_ubuf_tensor  = ubBase[ubufAlloc.ls32_quant_ubuf_offset].ReinterpretCast<float>();
-        ls16_ubuf_tensor        = ubBase[ubufAlloc.ls32_ubuf_offset].ReinterpretCast<half>();
-        lp_ubuf_tensor          = ubBase[ubufAlloc.lp_ubuf_offset].ReinterpretCast<IN_DTYPE>();
-        lp32_ubuf_tensor        = ubBase[ubufAlloc.lp32_ubuf_offset].ReinterpretCast<float>();
-        mask_ubuf_tensor        = ubBase[ubufAlloc.mask_ubuf_offset].ReinterpretCast<OUT_DTYPE>();
-        lo_ubuf_tensor          = ubBase[ubufAlloc.lo_ubuf_offset].ReinterpretCast<float>();
-        mask32_ubuf_tensor      = ubBase[ubufAlloc.mask32_ubuf_offset].ReinterpretCast<float>();
-        lm32_ubuf_tensor        = ubBase[ubufAlloc.lm32_ubuf_offset].ReinterpretCast<float>();
-        hm32_ubuf_tensor        = ubBase[ubufAlloc.hm32_ubuf_offset].ReinterpretCast<float>();
-        pm32_ubuf_tensor        = ubBase[ubufAlloc.pm32_ubuf_offset].ReinterpretCast<float>();
-        pm32_ubuf_stage2_tensor = ubBase[ubufAlloc.pm32_ubuf_stage2_offset].ReinterpretCast<float>();
-        gm32_ubuf_tensor        = ubBase[ubufAlloc.gm32_ubuf_offset].ReinterpretCast<float>();
-        dm32_ubuf_tensor        = ubBase[ubufAlloc.dm32_ubuf_offset].ReinterpretCast<float>();
-        dm32_stage2_ubuf_tensor = ubBase[ubufAlloc.dm32_ubuf_stage2_offset].ReinterpretCast<float>();
-        descale_q1_ubuf_tensor  = ubBase[ubufAlloc.descale1_offset].ReinterpretCast<float>();
-        descale_k1_ubuf_tensor  = ubBase[ubufAlloc.descale2_offset].ReinterpretCast<float>();
-        ll_ubuf_tensor          = ubBase[ubufAlloc.ll_ubuf_offset].ReinterpretCast<float>();
-        ll_stage2_ubuf_tensor   = ubBase[ubufAlloc.ll_ubuf_stage2_offset].ReinterpretCast<float>();
-        gl_ubuf_tensor          = ubBase[ubufAlloc.gl_ubuf_offset].ReinterpretCast<OUT_DTYPE>();
-        gl32_ubuf_tensor        = ubBase[ubufAlloc.gl32_ubuf_offset].ReinterpretCast<float>();
-        tv32_ubuf_tensor        = ubBase[ubufAlloc.tv32_ubuf_offset].ReinterpretCast<float>();
-        go_ubuf_tensor          = ubBase[ubufAlloc.go_ubuf_offset].ReinterpretCast<OUT_DTYPE>();
-        go32_ubuf_tensor        = ubBase[ubufAlloc.go32_ubuf_offset].ReinterpretCast<float>();
+        ls32_ubuf_tensor        = ubBase[ubufAlloc.ls32_ubuf_offset].template ReinterpretCast<float>();
+        ls32_quant_ubuf_tensor  = ubBase[ubufAlloc.ls32_quant_ubuf_offset].template ReinterpretCast<float>();
+        ls16_ubuf_tensor        = ubBase[ubufAlloc.ls32_ubuf_offset].template ReinterpretCast<half>();
+        lp_ubuf_tensor          = ubBase[ubufAlloc.lp_ubuf_offset].template ReinterpretCast<IN_DTYPE>();
+        lp32_ubuf_tensor        = ubBase[ubufAlloc.lp32_ubuf_offset].template ReinterpretCast<float>();
+        mask_ubuf_tensor        = ubBase[ubufAlloc.mask_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
+        lo_ubuf_tensor          = ubBase[ubufAlloc.lo_ubuf_offset].template ReinterpretCast<float>();
+        mask32_ubuf_tensor      = ubBase[ubufAlloc.mask32_ubuf_offset].template ReinterpretCast<float>();
+        lm32_ubuf_tensor        = ubBase[ubufAlloc.lm32_ubuf_offset].template ReinterpretCast<float>();
+        hm32_ubuf_tensor        = ubBase[ubufAlloc.hm32_ubuf_offset].template ReinterpretCast<float>();
+        pm32_ubuf_tensor        = ubBase[ubufAlloc.pm32_ubuf_offset].template ReinterpretCast<float>();
+        pm32_ubuf_stage2_tensor = ubBase[ubufAlloc.pm32_ubuf_stage2_offset].template ReinterpretCast<float>();
+        gm32_ubuf_tensor        = ubBase[ubufAlloc.gm32_ubuf_offset].template ReinterpretCast<float>();
+        dm32_ubuf_tensor        = ubBase[ubufAlloc.dm32_ubuf_offset].template ReinterpretCast<float>();
+        dm32_stage2_ubuf_tensor = ubBase[ubufAlloc.dm32_ubuf_stage2_offset].template ReinterpretCast<float>();
+        descale_q1_ubuf_tensor  = ubBase[ubufAlloc.descale1_offset].template ReinterpretCast<float>();
+        descale_k1_ubuf_tensor  = ubBase[ubufAlloc.descale2_offset].template ReinterpretCast<float>();
+        ll_ubuf_tensor          = ubBase[ubufAlloc.ll_ubuf_offset].template ReinterpretCast<float>();
+        ll_stage2_ubuf_tensor   = ubBase[ubufAlloc.ll_ubuf_stage2_offset].template ReinterpretCast<float>();
+        gl_ubuf_tensor          = ubBase[ubufAlloc.gl_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
+        gl32_ubuf_tensor        = ubBase[ubufAlloc.gl32_ubuf_offset].template ReinterpretCast<float>();
+        tv32_ubuf_tensor        = ubBase[ubufAlloc.tv32_ubuf_offset].template ReinterpretCast<float>();
+        go_ubuf_tensor          = ubBase[ubufAlloc.go_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
+        go32_ubuf_tensor        = ubBase[ubufAlloc.go32_ubuf_offset].template ReinterpretCast<float>();
     }
 
     __aicore__ __attribute__((always_inline)) inline void SetArgs2(
@@ -1114,8 +1136,7 @@ private:
     AscendC::GlobalTensor<OUT_DTYPE> lse_gm_tensor;
 
     // ---- GM raw pointers (bound in SetArgs) ----
-    __gm__ mm1CopyType *__restrict__ s_gm{nullptr};
-    __gm__ IN_DTYPE *__restrict__ p_gm{nullptr};
+    // A5 shared-UB: S/P GM pointers removed (S from ls32_ubuf, P to lp_ubuf).
     __gm__ mm2CopyType *__restrict__ o_tmp_gm{nullptr};
     __gm__ float *__restrict__ go_gm{nullptr};
     __gm__ int32_t *__restrict__ gm_block_tables_{nullptr};
@@ -1126,9 +1147,7 @@ private:
     // ---- GlobalTensor views (bound in SetArgs) ----
     AscendC::GlobalTensor<OUT_DTYPE> mask_gm_tensor;
     AscendC::GlobalTensor<OUT_DTYPE> o_gm_tensor;
-    AscendC::GlobalTensor<mm1CopyType> s_gm_tensor;
     AscendC::GlobalTensor<float> s_rope_gm_tensor;
-    AscendC::GlobalTensor<IN_DTYPE> p_gm_tensor;
     AscendC::GlobalTensor<mm2OutputType> o_tmp_gm_tensor;
     AscendC::GlobalTensor<float> go_gm_tensor;
     AscendC::GlobalTensor<float> tmp_gm_tensor;

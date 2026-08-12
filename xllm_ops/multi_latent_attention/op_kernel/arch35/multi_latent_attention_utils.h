@@ -351,6 +351,44 @@ __aicore__ __attribute__((always_inline)) inline void CopyQKResultToGMRaw(
 }
 
 // ----------------------------------------------------------------------------
+// CopyQKResultToUBRaw - L0C -> UB (S score), A5 shared-UB variant of
+//   CopyQKResultToGMRaw. Identical FixpipeParamsArch3510 / quantPre selection,
+//   but the destination is a UB LocalTensor instead of GM (A5 FixPipe supports
+//   both L0C->GM and L0C->UB; only the destination tensor kind differs). This
+//   removes the S GM round-trip: AIC writes the QK score straight into the UB
+//   region shared with the two AIV cores in the same AI Core.
+//
+// Parameters mirror CopyQKResultToGMRaw except gmTensor -> ubTensor.
+// ----------------------------------------------------------------------------
+template <typename DstT, typename SrcT>
+__aicore__ __attribute__((always_inline)) inline void CopyQKResultToUBRaw(
+    const AscendC::LocalTensor<DstT> &ubTensor,
+    const AscendC::LocalTensor<SrcT> &l0cTensor,
+    uint32_t mSize,
+    uint32_t nSize,
+    uint32_t srcStride,
+    uint32_t dstStride)
+{
+    AscendC::FixpipeParamsArch3510<AscendC::CO2Layout::ROW_MAJOR> params(
+        /* nSize     */ nSize,
+        /* mSize     */ mSize,
+        /* srcStride */ srcStride,
+        /* dstStride */ dstStride);
+
+    if constexpr (AscendC::IsSameType<DstT, bfloat16_t>::value) {
+        params.quantPre = QuantMode_t::F322BF16;
+    } else if constexpr (AscendC::IsSameType<DstT, half>::value) {
+        params.quantPre = QuantMode_t::F322F16;
+    } else if constexpr (AscendC::IsSameType<DstT, float>::value) {
+        params.quantPre = QuantMode_t::NoQuant;
+    } else {
+        params.quantPre = QuantMode_t::DEQF16;
+    }
+
+    AscendC::Fixpipe<DstT, SrcT, AscendC::CFG_ROW_MAJOR>(ubTensor, l0cTensor, params);
+}
+
+// ----------------------------------------------------------------------------
 // LoadVTransposeToL0BRaw -V (L1) -> L0B with transpose, pure-AscendC replacement
 //   for arch32 AscendC::LoadDataWithTranspose used in PlatformLoadKVTranspose
 //   {SmallN,LargeN}. Both arch32 branches wrap a single LoadDataWithTranspose in

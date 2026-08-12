@@ -66,6 +66,28 @@ __aicore__ __attribute__((always_inline)) inline void CopyGmToL1Nd2Nz(
 }
 
 // ----------------------------------------------------------------------------
+// CopyUbToL1Nd2Nz — one ND -> NZ UB->L1 DataCopy (A5 shared-UB P source).
+//
+// A5 shared-UB replacement for the P GM->L1 stage: instead of reading the
+// softmax result P back from GM, the paired AIV Vector core has already written
+// P into the shared UB (p_ubuf). The Cube core moves it UB->L1 over the MTE3
+// producer channel with the SAME ND->NZ semantics as the GM path — only the
+// source tensor kind (LocalTensor vs GlobalTensor) differs, so AscendC selects
+// the UB->L1 DataCopy overload automatically.
+//   l1Tensor : destination L1 sub-tensor (already offset by the caller)
+//   ubTensor : source UB sub-tensor (already offset by the caller)
+//   params   : fully-populated ND->NZ transfer descriptor
+// ----------------------------------------------------------------------------
+template <typename DstT, typename SrcT>
+__aicore__ __attribute__((always_inline)) inline void CopyUbToL1Nd2Nz(
+    const AscendC::LocalTensor<DstT> &l1Tensor,
+    const AscendC::LocalTensor<SrcT> &ubTensor,
+    const AscendC::Nd2NzParams &params)
+{
+    AscendC::DataCopy(l1Tensor, ubTensor, params);
+}
+
+// ----------------------------------------------------------------------------
 // PlatformSetQLoadComplete — terminal sync after the Q / Q_rope L1 load
 // (arch32 L796-797). A3 issued SET/WAIT_FLAG(MTE2, MTE1, EVENT_ID0) on its
 // UB<->L1 producer channel; on A5 that channel maps to MTE3, so the pair

@@ -500,18 +500,18 @@ __aicore__ __attribute__((always_inline)) inline void ComputeQKMMad(
 }
 
 // ----------------------------------------------------------------------------
-// CopyQKResultToGM 鈥?mm1 L0C -> S GM for one embedding split (arch32 L973-1003).
-// Owns: the write-back trigger condition (INT8 flushes at esi==3, non-INT8 at
-// esi==4) and its SET/WAIT_FLAG(M,FIX,flag) + SET_FLAG(FIX,M,flag) fence.
+// CopyQKResultToUB - A5 shared-UB variant that replaces the A3 CopyQKResultToGM. Instead of the A3
+// L0C->GM(S) round-trip it FixPipes the QK score straight into the UB region the
+// AIC shares with its two paired AIV cores (s_ubuf_tensor == AIV ls32_ubuf,
+// offset 0). Same flush-idx trigger (INT8 esi==3 / non-INT8 esi==4) and the same
+// M<->FIX fence as the GM variant. The UB region is per-AI-Core private, so there
+// is NO block_idx stride; only the n_idx double-buffer half stays.
 // ----------------------------------------------------------------------------
-// Passed by parameter (arch35 policy): private S-GM / mm1-L0C tensors, block_idx
-// and the kIsInt8 flag come from the friend orchestrator ComputeQK.
-template <typename SgmT, typename L0cT>
-__aicore__ __attribute__((always_inline)) inline void CopyQKResultToGM(
-    const AscendC::GlobalTensor<SgmT> &s_gm_tensor,
+template <typename SubufT, typename L0cT>
+__aicore__ __attribute__((always_inline)) inline void CopyQKResultToUB(
+    const AscendC::LocalTensor<SubufT> &s_ubuf_tensor,
     const AscendC::LocalTensor<L0cT> &mm1_l0c_buf_tensor,
-    bool is_int8, uint32_t block_idx,
-    uint32_t esi, uint32_t n_idx, uint32_t l1_kv_pingpong_flag,
+    bool is_int8, uint32_t esi, uint32_t n_idx, uint32_t l1_kv_pingpong_flag,
     uint32_t m, uint32_t qk_n, uint32_t qk_round_n)
 {
     const uint32_t flush_idx = is_int8 ? 3 : 4;
@@ -521,14 +521,21 @@ __aicore__ __attribute__((always_inline)) inline void CopyQKResultToGM(
         return;
     }
     PlatformWaitL0cForFix(l1_kv_pingpong_flag);
-    CopyQKResultToGMRaw(
-        s_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER_A5 +
-                    (uint64_t)(n_idx % 2) * TMP_SIZE_DECODER_A5 / 2],
-        mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
-        m,               // MSize
-        nSize,           // NSize
-        RoundUp<16>(m),  // srcStride
-        qk_round_n);     // dstStride
+    // A5 FixPipe supports L0C(float)->UB(float) (FP16 main path). INT8 L0C is
+    // int32 and A5 has NO Fixpipe<int,float> combo; the INT8 QK score is instead
+    // finalised by ComputeQRope's L0C(float)->s_rope_gm round-trip. So only the
+    // FP16 (float L0C) path FixPipes into the shared UB here; INT8 is a TODO stub.
+    if constexpr (AscendC::IsSameType<L0cT, float>::value) {
+        CopyQKResultToUBRaw(
+            s_ubuf_tensor[(uint64_t)(n_idx % 2) * TMP_SIZE_DECODER_A5 / 2],
+            mm1_l0c_buf_tensor[l1_kv_pingpong_flag * 16384],
+            m,               // MSize
+            nSize,           // NSize
+            RoundUp<16>(m),  // srcStride
+            qk_round_n);     // dstStride
+    }
+    // TODO(INT8): route the int32 L0C QK score into the shared UB (DEQ to half)
+    // once the INT8 decode path is enabled.
     PlatformSetFixComplete(l1_kv_pingpong_flag);
 }
 
@@ -655,8 +662,10 @@ __aicore__ __attribute__((always_inline)) inline void ComputeQK(
         ComputeQKMMad(aic.mm1_l0c_buf_tensor, aic.l0a_buf_tensor, aic.l0b_buf_tensor,
                       kIsInt8, (uint32_t)esi, l1_kv_pingpong_flag,
                       m, qk_n, qk_round_n_l1, embed_split_size);
-        CopyQKResultToGM(aic.s_gm_tensor, aic.mm1_l0c_buf_tensor,
-                         kIsInt8, (uint32_t)block_idx, (uint32_t)esi, n_idx,
+        // A5 shared-UB: FixPipe the QK score straight into the UB region shared
+        // with the paired AIV cores (== AIV ls32_ubuf), no S GM round-trip.
+        CopyQKResultToUB(aic.s_ubuf_tensor, aic.mm1_l0c_buf_tensor,
+                         kIsInt8, (uint32_t)esi, n_idx,
                          l1_kv_pingpong_flag, m, qk_n, qk_round_n);
     }
 
@@ -744,27 +753,32 @@ __aicore__ __attribute__((always_inline)) inline void LoadVTransposeToL0B(
 }
 
 // ----------------------------------------------------------------------------
-// LoadPDataToL0A 鈥?P (softmax output) GM -> L1 -> L0A (arch32
+// LoadPDataToL0A 鈥?P (softmax output) UB -> L1 -> L0A (arch32
 // PlatformLoadPFromGMToL1 L265-282 + PlatformLoadPToL0A{Int8,General} L285-308).
-// Runs only on the first embed split. GM->L1 uses the AscendC Nd2Nz primitive
-// (CopyGmToL1Nd2Nz); L1->L0A uses the INT8 (NZ->ZZ) or General (VECTOR) Raw.
+// Runs only on the first embed split.
+//
+// A5 SHARED-UB: the softmax result P is produced by the paired AIV Vector core
+// directly into the shared UB (p_ubuf), so the A3 P GM->L1 (MTE2) stage becomes
+// a UB->L1 move over the MTE3 producer channel (CopyUbToL1Nd2Nz). UB is per-AI-
+// -Core private, so the block_idx GM stride is dropped; only the (n_idx-1)%2
+// double-buffer half survives, matching the QK score half in CopyQKResultToUB.
+// L1->L0A uses the INT8 (NZ->ZZ) or General (VECTOR) Raw, unchanged.
 // ----------------------------------------------------------------------------
-template <typename L0aT, typename L1pT, typename PgmT>
+template <typename L0aT, typename L1pT, typename PubufT>
 __aicore__ __attribute__((always_inline)) inline void LoadPDataToL0A(
     const AscendC::LocalTensor<L0aT> &l0a_buf_tensor,
     const AscendC::LocalTensor<L1pT> &l1p_buf_addr_tensor,
-    const AscendC::GlobalTensor<PgmT> &p_gm_tensor,
-    bool is_int8, uint32_t block_idx, uint32_t n_idx, uint32_t l0_p_pingpong_flag,
+    const AscendC::LocalTensor<PubufT> &p_ubuf_tensor,
+    bool is_int8, uint32_t n_idx, uint32_t l0_p_pingpong_flag,
     uint32_t row_num, uint64_t k_round_n, uint32_t qk_round_n_2,
     uint32_t qk_round_n_2_l1, uint32_t t_cube_matrix_size, uint32_t t_block_offset,
     uint32_t t_block_size)
 {
-    // --- P GM -> L1 (arch32 gm_to_l1<ND,NZ>, 8-arg form -> Nd2NzParams) ---
+    // --- P UB -> L1 (A5 shared-UB, MTE3; same ND->NZ params as the GM path) ---
     PlatformWaitPBeforeLoad();
-    CopyGmToL1Nd2Nz(
+    CopyUbToL1Nd2Nz(
         l1p_buf_addr_tensor,
-        p_gm_tensor[(uint64_t)block_idx * TMP_SIZE_DECODER_A5 * t_block_offset +
-                    (uint64_t)((n_idx - 1) % 2) * TMP_SIZE_DECODER_A5 * t_block_offset / 2],
+        p_ubuf_tensor[(uint64_t)((n_idx - 1) % 2) * TMP_SIZE_DECODER_A5 / 2],
         AscendC::Nd2NzParams(
             /* ndNum            */ 1,
             /* nValue           */ row_num,
@@ -899,8 +913,10 @@ __aicore__ __attribute__((always_inline)) inline void ComputePV(
                             round_embed_split_size, is_last_split, T_BLOCK_SIZE);
 
         if (esi == 0) {
-            LoadPDataToL0A(aic.l0a_buf_tensor, aic.l1p_buf_addr_tensor, aic.p_gm_tensor,
-                           kIsInt8, (uint32_t)block_idx, n_idx, l0_p_pingpong_flag,
+            // A5 shared-UB: P comes from p_ubuf (written by the paired AIV
+            // softmax), moved UB->L1 over MTE3 instead of read back from p_gm.
+            LoadPDataToL0A(aic.l0a_buf_tensor, aic.l1p_buf_addr_tensor, aic.p_ubuf_tensor,
+                           kIsInt8, n_idx, l0_p_pingpong_flag,
                          row_num, k_round_n, qk_round_n_2, qk_round_n_2_l1,
                            T_CUBE_MATRIX_SIZE, T_BLOCK_OFFSET, T_BLOCK_SIZE);
         }
