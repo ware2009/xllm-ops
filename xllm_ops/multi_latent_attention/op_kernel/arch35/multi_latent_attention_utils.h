@@ -49,6 +49,23 @@ namespace MlaArch35 {
 constexpr uint32_t STRIDE_LIMIT = 65536;
 
 // ----------------------------------------------------------------------------
+// A5(3510) FixPipe L0C->UB direct-write config.
+// The Fixpipe<T, U, config> template takes `config` as a `const FixpipeConfig&`
+// NON-TYPE template parameter, which requires a variable with LINKAGE. A
+// function-local constexpr has NO linkage and is therefore rejected
+// ("invalid explicitly-specified argument for template parameter 'config'").
+// It MUST be defined at namespace scope.
+//
+// The built-in AscendC::CFG_ROW_MAJOR is {ROW_MAJOR, false} (isToUB=false =>
+// L0C->GM). For a UB destination the second field (isToUB) MUST be true so the
+// FIX unit routes to the UB address space; using the GM config against a UB
+// address triggers error171 (FIXP L0C ECC) / 507015.
+// ----------------------------------------------------------------------------
+#if defined(__NPU_ARCH__) && ((__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102))
+constexpr AscendC::FixpipeConfig CFG_ROW_MAJOR_UB = {AscendC::CO2Layout::ROW_MAJOR, true};
+#endif
+
+// ----------------------------------------------------------------------------
 // LoadKVMainFromGMToL1 -K main (compressed latent, dim 512) GM -> L1.
 //
 // Pure-AscendC replacement for arch32 gm_to_l1<..., kNzIn?NZ:ND, NZ>. It owns
@@ -385,7 +402,10 @@ __aicore__ __attribute__((always_inline)) inline void CopyQKResultToUBRaw(
         params.quantPre = QuantMode_t::DEQF16;
     }
 
-    AscendC::Fixpipe<DstT, SrcT, AscendC::CFG_ROW_MAJOR>(ubTensor, l0cTensor, params);
+    // FixPipe L0C->UB direct write. CFG_ROW_MAJOR_UB is defined at namespace
+    // scope (see top of file) because the Fixpipe `config` non-type template
+    // parameter is a `const FixpipeConfig&` and requires a variable with linkage.
+    AscendC::Fixpipe<DstT, SrcT, CFG_ROW_MAJOR_UB>(ubTensor, l0cTensor, params);
 }
 
 // ----------------------------------------------------------------------------

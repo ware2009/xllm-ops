@@ -13,11 +13,12 @@
 ```cpp
 template <TilingKeyType tilingKeyType = TilingKeyType::TILING_HALF_DATA,
           typename IN_DTYPE = half,
-          typename IN_KVDTYPE = half,
-          typename OUT_DTYPE = half,
           typename IN_ROPE_DTYPE = half,
+          typename OUT_DTYPE = half,
+          typename IN_KVDTYPE = half,
           InputFormat KInputType = InputFormat::ND_FORMAT,
-          bool EnableOptimization = false>
+          bool EnableOptimization = false,
+          BlockStack BlockFlow = BlockStack::ONE_FLOW>
 class MLAttentionDecoderAic
 ```
 
@@ -25,11 +26,12 @@ class MLAttentionDecoderAic
 |---|---|---|
 | `tilingKeyType` | `TILING_HALF_DATA` | 数据类型枚举，决定 GEMM 中间精度。HALF/BF16 → float，INT8 → int32_t |
 | `IN_DTYPE` | `half` | Q/P 的输入数据类型 |
-| `IN_KVDTYPE` | `half` | KV 的输入数据类型（BF16 路径下与 IN_DTYPE 不同） |
-| `OUT_DTYPE` | `half` | 输出数据类型 |
 | `IN_ROPE_DTYPE` | `half` | RoPE 解耦维度的数据类型 |
+| `OUT_DTYPE` | `half` | 输出数据类型 |
+| `IN_KVDTYPE` | `half` | KV 的输入数据类型（BF16 路径下与 IN_DTYPE 不同） |
 | `KInputType` | `ND_FORMAT` | KV 输入格式（ND 或 NZ） |
 | `EnableOptimization` | `false` | 优化开关（预留） |
+| `BlockFlow` | `ONE_FLOW` | **A5 shared-UB 布局选择器**，必须与配对的 `MLADecoderAiv` 的 `BlockFlow` 一致，以保证 `UbufAllocA5<BlockFlow>` 计算的 S/P/lo/go UB 偏移在 AIC 与 AIV 两侧完全相同（Normal/Ring 用 `ONE_FLOW`，TP1 用 `FOUR_FLOW`）。偏移不一致是 507015 的潜在诱因。 |
 
 #### 类型别名（Type Aliases）
 
@@ -61,11 +63,11 @@ class MLAttentionDecoderAic
 | `q_rope_gm` | `__gm__ IN_ROPE_DTYPE*` | Query RoPE 解耦向量 GM 地址（d=64） |
 | `k_gm` | `__gm__ IN_KVDTYPE*` | Key 压缩向量 GM 地址（KV Cache，d=512） |
 | `k_rope_gm` | `__gm__ IN_ROPE_DTYPE*` | Key RoPE 解耦向量 GM 地址（d=64） |
-| `s_gm` | `__gm__ mm1CopyType*` | GEMM1 QK score 输出 GM 地址（Attention score） |
-| `p_gm` | `__gm__ IN_DTYPE*` | Softmax(P) 输出 GM 地址（GEMM2 的左矩阵） |
 | `o_tmp_gm` | `__gm__ mm2CopyType*` | GEMM2 PV 输出临时 GM 地址（Attention output） |
 | `block_tables_gm` | `__gm__ int32_t*` | Block table GM 地址（PagedAttention 的块索引表） |
 | `tiling_gm` | `__gm__ uint8_t*` | Tiling 参数 GM 地址（Host 下发的切分参数） |
+
+> **A5 shared-UB 变更**：A3 中的 `s_gm`（QK score）/`p_gm`（softmax P）两个 GM 中转指针在 A5 已**移除**。A5 让 AIC 与 AIV 共享同一物理 UB（同一 AI Core 内 1 Cube + 2 Vector），QK score 经 FixPipe 从 L0C 直达 UB（`s_ubuf_tensor`），softmax P 经 MTE3 从 UB 直达 L1（`p_ubuf_tensor`），消除了 A3 的 S/P GM 往返，不再需要 `s_gm`/`p_gm`。
 
 #### 2. GlobalTensor 包装器
 
@@ -77,11 +79,11 @@ class MLAttentionDecoderAic
 | `q_rope_gm_tensor` | `GlobalTensor<IN_ROPE_DTYPE>` | Query RoPE GlobalTensor |
 | `k_gm_tensor` | `GlobalTensor<IN_KVDTYPE>` | Key 压缩向量 GlobalTensor |
 | `k_rope_gm_tensor` | `GlobalTensor<IN_ROPE_DTYPE>` | Key RoPE GlobalTensor |
-| `s_gm_tensor` | `GlobalTensor<mm1CopyType>` | QK score GlobalTensor（GEMM1 输出） |
-| `p_gm_tensor` | `GlobalTensor<IN_DTYPE>` | P (softmax 结果) GlobalTensor |
 | `o_tmp_gm_tensor` | `GlobalTensor<mm2CopyType>` | PV 输出 GlobalTensor（GEMM2 输出） |
 | `block_tables_gm_tensor` | `GlobalTensor<int32_t>` | Block table GlobalTensor |
 | `s_rope_gm_tensor` | `GlobalTensor<float>` | INT8 路径专用：QK RoPE score 输出 GlobalTensor |
+
+> **A5 shared-UB 变更**：随 `s_gm`/`p_gm` 裸指针移除，A3 中的 `s_gm_tensor`（QK score）/`p_gm_tensor`（softmax P）两个 GlobalTensor 在 A5 也已**移除**，改由共享 UB 的 `s_ubuf_tensor`/`p_ubuf_tensor` 承担（详见「共享 UB 基础设施」章节）。
 
 #### 3. L1 Buffer 偏移量常量
 
@@ -109,13 +111,17 @@ L1 (512KB = 524288 bytes)
   INT8:      5区域 (Q/Q_rope/KV/KV_rope/P)
 ```
 
-#### 4. L1 Buffer Tensor
+#### 4. L1 Buffer 管理器与 L1 Buffer Tensor
 
-通过 `AsdopsBuffer` 分配的 LocalTensor，绑定到 L1 片上存储区域。
+A5 使用 AscendC 的 `TPipe` + `TBuf<TPosition>` 管理片上各层级存储（**不再使用 A3 的 `AsdopsBuffer<ArchType::ASCEND_V220>`**）。`TPipe` 统一管理 buffer 生命周期，`TBuf<TPosition>` 按硬件位置声明各层级缓冲区，再由其上分配 `LocalTensor`。
 
 | 属性 | 类型 | 说明 |
 |---|---|---|
-| `buf` | `AsdopsBuffer<ArchType::ASCEND_V220>` | L1 buffer 管理器，提供 `GetBuffer` 接口分配各层级 LocalTensor |
+| `pipe` | `AscendC::TPipe` | 统一 buffer 管理器，负责各 `TBuf` 的初始化与地址分配 |
+| `l1TBuf` | `AscendC::TBuf<AscendC::TPosition::A1>` | L1 缓冲区句柄（TPosition::A1 = L1） |
+| `l0aTBuf` | `AscendC::TBuf<AscendC::TPosition::A2>` | L0A 缓冲区句柄（TPosition::A2 = L0A） |
+| `l0bTBuf` | `AscendC::TBuf<AscendC::TPosition::B2>` | L0B 缓冲区句柄（TPosition::B2 = L0B） |
+| `l0cTBuf` | `AscendC::TBuf<AscendC::TPosition::CO1>` | L0C 缓冲区句柄（TPosition::CO1 = L0C） |
 | `l1q_buf_addr_tensor` | `LocalTensor<IN_DTYPE>` | L1 中 Q 数据缓冲区 |
 | `l1q_rope_buf_addr_tensor` | `LocalTensor<IN_ROPE_DTYPE>` | L1 中 Q RoPE 数据缓冲区（INT8 路径） |
 | `l1kv_buf_addr_tensor` | `LocalTensor<IN_KVDTYPE>` | L1 中 KV 数据缓冲区（PingPong 双缓冲） |
@@ -136,9 +142,25 @@ if constexpr (tilingKeyType == TilingKeyType::TILING_INT8_DATA) {
     // BF16/HALF: 3 个 buffer，Q+RoPE 连续存储，KV+RoPE 连续存储
     l1q_buf_addr_tensor  = buf.GetBuffer<..., IN_DTYPE>(l1q_buf_addr_offset);   // 0
     l1kv_buf_addr_tensor = buf.GetBuffer<..., IN_KVDTYPE>(l1kv_buf_addr_offset); // 147456
-    l1p_buf_addr_tensor  = buf.GetBuffer<..., IN_DTYPE>(l1p_buf_addr_offset);   // 442368
 }
 ```
+
+> **A3→A5 变更**：A3 通过 `AsdopsBuffer<ArchType::ASCEND_V220>::GetBuffer` 按字节偏移直接分配各层级 LocalTensor；A5 改为标准 `TPipe` + `TBuf<TPosition>` 范式，由 `pipe.InitBuffer` 初始化各 `TBuf` 后再切分子 tensor，L1 偏移布局（0/65536/147456/278528/442368）保持不变。
+
+#### 4b. 共享 UB 基础设施（A5 新增）
+
+A5 让 **同一 AI Core 内的 1 个 Cube（AIC）与 2 个 Vector（AIV）共享同一块物理 UB**（248KB，`MAX_UB_SIZE_A5 = 253952`）。AIC 通过 `TBuf<TPosition::VECCALC>` 声明 UB 句柄，并用 `UbufAllocA5<BlockFlow>` 统一计算各子区域偏移，使 AIC 与配对 AIV 上的 S/P/lo/go 偏移**完全一致**。这是 A5 消除 A3 的 S/P GM 中转的核心基础设施。
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `ubTBuf` | `AscendC::TBuf<AscendC::TPosition::VECCALC>` | 共享 UB 缓冲区句柄（VECCALC = UB） |
+| `ubufAlloc` | `UbufAllocA5<BlockFlow>` | UB 子区域偏移计算器，`BlockFlow` 必须与 AIV 侧一致，保证两核偏移对齐 |
+| `s_ubuf_tensor` | `LocalTensor<float>` | QK score，经 FixPipe 从 L0C→UB（对应 AIV 侧 `ls32`） |
+| `p_ubuf_tensor` | `LocalTensor<IN_DTYPE>` | softmax P，作为 MTE3 从 UB→L1 的搬运源（对应 AIV 侧 `lp`） |
+| `go_ubuf_tensor` | `LocalTensor<OUT_DTYPE>` | PV 输出 O，经 FixPipe 从 L0C→UB（对应 AIV 侧 `go`） |
+| `lo_ubuf_tensor` | `LocalTensor<float>` | PV mmad 中间结果，L0C→UB，长度 4×BLK（对应 AIV 侧 `lo`） |
+
+> **对齐约束**：AIC 与 AIV 必须使用相同的 `BlockFlow` 模板实参（Normal/Ring 用 `ONE_FLOW`，TP1 用 `FOUR_FLOW`），否则 `UbufAllocA5<BlockFlow>` 在两核算出的 `s/p/lo/go` UB 偏移不一致，会导致读写错位——此为 507015 的潜在诱因之一。
 
 #### 5. L0A/L0B/L0C Tensor
 
@@ -288,20 +310,20 @@ WAIT_FLAG(FIX, MTE1, EVENT_ID0~5)  // Cleanup
 | **EVENT_ID 数量** | 6 (ID0~ID5) |
 | **功能** | FixPipe 完成当前迭代的 L0C→UB 搬运后，释放 MTE1 加载下一轮迭代的 L1 数据。6 个事件 ID 支持计算与搬运的深度流水重叠，使得下一轮的 GM→L1 加载可以在当前轮 GEMM 计算期间启动。 |
 
-##### 第 5 组：MTE3 → FIX（×1，EVENT_ID0）
+##### 第 5 组：M → FIX（×1，EVENT_ID0）
 
 ```
-SET_FLAG(MTE3, FIX, EVENT_ID0)    // Init
-WAIT_FLAG(MTE3, FIX, EVENT_ID0)   // Cleanup
+SET_FLAG(M, FIX, EVENT_ID0)    // Init
+WAIT_FLAG(M, FIX, EVENT_ID0)   // Cleanup
 ```
 
 | 属性 | 值 |
 |---|---|
-| **事件源** | MTE3 (UB→L1 搬运) |
+| **事件源** | M (Scalar) |
 | **事件目标** | FIX (FixPipe, L0C→UB) |
 | **EVENT_ID 数量** | 1 (ID0) |
-| **功能** | MTE3 完成 UB→L1 数据搬运后，释放 FixPipe 进行 L0C→UB 的结果消费。1 个事件 ID 用于单级同步，确保 FixPipe 消费的 L1 数据已就绪。 |
-| **A3→A5 差异** | A3 使用 `(MTE2, FIX)` 事件对，A5 改为 `(MTE3, FIX)`。原因同第 3 组。 |
+| **功能** | Scalar 完成 FixPipe 参数/地址设置后，释放 FixPipe 进行 L0C→UB 的结果消费。1 个事件 ID 用于单级同步。 |
+| **A3→A5 差异** | A3 使用 `(MTE2, FIX)` 事件对，A5 **无 MTE3→FIX 通道**，改用 `(M, FIX)`。代码注释明确：`A3 used MTE2->FIX; A5 has no MTE3->FIX, use M->FIX instead`。 |
 
 #### 事件总数汇总
 
@@ -311,7 +333,7 @@ WAIT_FLAG(MTE3, FIX, EVENT_ID0)   // Cleanup
 | 2 | FixPipe→Scalar 释放 | FIX → M | ID0~ID1 | 2 |
 | 3 | L1 加载→UB→L1 搬运同步 | MTE1 → MTE3 | ID0~ID7 | 8 |
 | 4 | FixPipe→下一轮 L1 重载 | FIX → MTE1 | ID0~ID5 | 6 |
-| 5 | UB→L1→FixPipe 消费 | MTE3 → FIX | ID0 | 1 |
+| 5 | Scalar→FixPipe 消费 | M → FIX | ID0 | 1 |
 | | **合计** | | | **25** |
 
 #### A3 → A5 同步事件映射
@@ -324,9 +346,9 @@ A5 硬件架构新增了 MTE3（UB→L1）片上直达通道，替代了 A3 中 
 | 第 2 组 | `(FIX, M)` | `(FIX, M)` | 不变（L0C→UB 路径未变） |
 | 第 3 组 | `(MTE1, MTE2)` | `(MTE1, MTE3)` | MTE2 是 UB↔L1 搬运管道，A5 改用 MTE3 |
 | 第 4 组 | `(FIX, MTE1)` | `(FIX, MTE1)` | 不变（GM→L1 路径未变） |
-| 第 5 组 | `(MTE2, FIX)` | `(MTE3, FIX)` | 同第 3 组 |
+| 第 5 组 | `(MTE2, FIX)` | `(M, FIX)` | A5 无 MTE3→FIX 通道，改用 Scalar 释放 FixPipe（`A5 has no MTE3->FIX, use M->FIX instead`） |
 
-> **关键变化**：仅第 3 组和第 5 组的源/目标管道从 MTE2 变为 MTE3，涉及 9 个事件（8+1）。其余 16 个事件保持不变。
+> **关键变化**：第 3 组源/目标管道从 MTE2 变为 MTE3（8 个事件）；第 5 组因 A5 无 MTE3→FIX 通道，由 `(MTE2, FIX)` 改为 `(M, FIX)`（1 个事件）。合计 9 个事件变更，其余 16 个保持不变。
 
 #### 8 事件乒乓流水线工作原理
 
@@ -345,6 +367,6 @@ M:      设置 设置                               (GEMM参数, 事件ID0~1)
 - **第 3 组（MTE1→MTE3 ×8）**：8 级 UB→L1 搬运流水，与第 1 组一一对应
 - **第 4 组（FIX→MTE1 ×6）**：6 级 FixPipe→MTE1 回流，支持 6 深度的计算-加载重叠
 - **第 2 组（FIX→M ×2）**：2 级 FixPipe→Scalar 回流，支持 2 深度的 GEMM 设置流水
-- **第 5 组（MTE3→FIX ×1）**：1 级 UB→L1→FixPipe 消费同步
+- **第 5 组（M→FIX ×1）**：1 级 Scalar→FixPipe 消费同步（A5 无 MTE3→FIX 通道）
 
 Cleanup 阶段通过 `WAIT_FLAG` 等待所有 25 个事件完成，最后 `PIPE_BARRIER(ALL)` 确保全管道同步后退出。
