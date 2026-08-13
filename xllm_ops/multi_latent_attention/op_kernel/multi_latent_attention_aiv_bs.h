@@ -10,6 +10,8 @@
 // 本文件仅被 MLADecoderAiv 类 include，包含 Vector 侧业务调度函数。
 // AIC 侧业务函数在 multi_latent_attention_bs.h 中。
 
+#pragma once
+
 // ====== AIV refactor: context struct + init functions ======
 
 // 非 TP1 路径上下文
@@ -497,7 +499,7 @@ __aicore__ __attribute__((always_inline)) inline void Stage2MergeAccumulate(
     AscendC::GlobalTensor<float> go_gm_tensor,
     AscendC::LocalTensor<float> go32_ubuf_tensor,
     AscendC::LocalTensor<float> lo_ubuf_tensor,
-    AscendC::LocalTensor<uint32_t> tv32_ubuf_tensor,
+    AscendC::LocalTensor<float> tv32_ubuf_tensor,
     AscendC::LocalTensor<float> dm32_ubuf_tensor,
     uint32_t sub_m,
     uint32_t round_sub_m,
@@ -505,7 +507,7 @@ __aicore__ __attribute__((always_inline)) inline void Stage2MergeAccumulate(
     uint32_t head_loop)
 {
     // brcb dm → tv, go = go * dm_block
-    PlatformMulVectorByBroadcast(go32_ubuf_tensor, tv32_ubuf_tensor,
+    PlatformMulVectorByBroadcast(go32_ubuf_tensor, tv32_ubuf_tensor.template ReinterpretCast<uint32_t>(),
         dm32_ubuf_tensor, sub_m, round_sub_m, round_v, __v);
 
     if (head_loop > 1) {
@@ -534,7 +536,7 @@ __aicore__ __attribute__((always_inline)) inline void Stage2FinalizeAndOutput(
     AscendC::GlobalTensor<float> go_gm_tensor,
     AscendC::LocalTensor<float> go32_ubuf_tensor,
     AscendC::LocalTensor<OUT_DTYPE> go_ubuf_tensor,
-    AscendC::LocalTensor<uint32_t> tv32_ubuf_tensor,
+    AscendC::LocalTensor<float> tv32_ubuf_tensor,
     AscendC::LocalTensor<float> gl32_ubuf_tensor,
     AscendC::LocalTensor<float> lse32_ubuf_tensor,
     AscendC::LocalTensor<OUT_DTYPE> lse_conv_ubuf_tensor,
@@ -555,7 +557,7 @@ __aicore__ __attribute__((always_inline)) inline void Stage2FinalizeAndOutput(
     uint32_t sub_m_d64 = (sub_m + 63) / 64;
 
     // go = go / gl_block
-    PlatformDivVectorByBroadcast(go32_ubuf_tensor, tv32_ubuf_tensor,
+    PlatformDivVectorByBroadcast(go32_ubuf_tensor, tv32_ubuf_tensor.template ReinterpretCast<uint32_t>(),
         gl32_ubuf_tensor, sub_m, round_sub_m, round_v, __v, head_loop_idx);
 
     // go = castfp32to16(go) + V→MTE3 同步

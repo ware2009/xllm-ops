@@ -10,6 +10,8 @@
 // 本文件仅被 MLADecoderAiv 类 include，包含 Vector 侧平台同步函数。
 // AIC 侧平台函数在 multi_latent_attention_arch32.h 中。
 
+#pragma once
+
 // 平台函数：非TP1 SoftmaxStage1 前置管道同步
 // 在 SoftmaxStage1 调用之前执行：等待 QK 就绪 + 等待 MTE3→MTE2 管道同步
 __aicore__ __attribute__((always_inline)) inline void PlatformSoftmaxStage1PreSync()
@@ -134,7 +136,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformMulVectorByBroadca
         dm32_ubuf_tensor.ReinterpretCast<uint32_t>(),
         1,               // dstBlockStride
         8,               // dstRepeatStride
-        round_sub_m / FLOAT_BLOCK_SIZE  // repeat
+        (uint8_t)(round_sub_m / FLOAT_BLOCK_SIZE)  // repeat
     );
     PIPE_BARRIER(V);
 
@@ -143,13 +145,13 @@ __aicore__ __attribute__((always_inline)) inline void PlatformMulVectorByBroadca
     for (uint32_t vmul_idx = 0; vmul_idx < __v / FLOAT_VECTOR_SIZE; ++vmul_idx) {
         mul_v<ArchType::ASCEND_V220, float>(go32_ubuf_tensor[vmul_idx * FLOAT_VECTOR_SIZE],
             go32_ubuf_tensor[vmul_idx * FLOAT_VECTOR_SIZE],
-            tv32_ubuf_tensor,
-            sub_m,        // repeat
+            tv32_ubuf_tensor.template ReinterpretCast<float>(),
+            (uint8_t)sub_m,        // repeat
             1,            // dstBlockStride
             1,            // src0BlockStride
             0,            // src1BlockStride
-            round_v / FLOAT_BLOCK_SIZE,  // dstRepeatStride
-            round_v / FLOAT_BLOCK_SIZE,  // src0RepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // dstRepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // src0RepeatStride
             1             // src1RepeatStride
         );
     }
@@ -158,13 +160,13 @@ __aicore__ __attribute__((always_inline)) inline void PlatformMulVectorByBroadca
         __set_mask(__v % FLOAT_VECTOR_SIZE);
         mul_v<ArchType::ASCEND_V220, float>(go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
             go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-            tv32_ubuf_tensor,
-            sub_m,        // repeat
+            tv32_ubuf_tensor.template ReinterpretCast<float>(),
+            (uint8_t)sub_m,        // repeat
             1,            // dstBlockStride
             1,            // src0BlockStride
             0,            // src1BlockStride
-            round_v / FLOAT_BLOCK_SIZE,  // dstRepeatStride
-            round_v / FLOAT_BLOCK_SIZE,  // src0RepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // dstRepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // src0RepeatStride
             1             // src1RepeatStride
         );
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
@@ -190,7 +192,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformDivVectorByBroadca
         gl32_ubuf_tensor.ReinterpretCast<uint32_t>()[head_loop_idx * 16],
         1,               // dstBlockStride
         8,               // dstRepeatStride
-        round_sub_m / FLOAT_BLOCK_SIZE  // repeat
+        (uint8_t)(round_sub_m / FLOAT_BLOCK_SIZE)  // repeat
     );
     PIPE_BARRIER(V);
 
@@ -199,13 +201,13 @@ __aicore__ __attribute__((always_inline)) inline void PlatformDivVectorByBroadca
     for (uint32_t vdiv_idx = 0; vdiv_idx < __v / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
         div_v<ArchType::ASCEND_V220, float>(go32_ubuf_tensor[vdiv_idx * FLOAT_VECTOR_SIZE],
             go32_ubuf_tensor[vdiv_idx * FLOAT_VECTOR_SIZE],
-            tv32_ubuf_tensor,
-            sub_m,                 // repeat
+            tv32_ubuf_tensor.template ReinterpretCast<float>(),
+            (uint8_t)sub_m,                 // repeat
             1,                     // dstBlockStride
             1,                     // src0BlockStride
             0,                     // src1BlockStride
-            round_v / FLOAT_BLOCK_SIZE,  // dstRepeatStride
-            round_v / FLOAT_BLOCK_SIZE,  // src0RepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // dstRepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // src0RepeatStride
             1                      // src1RepeatStride
         );
     }
@@ -214,13 +216,13 @@ __aicore__ __attribute__((always_inline)) inline void PlatformDivVectorByBroadca
         __set_mask(__v % FLOAT_VECTOR_SIZE);
         div_v<ArchType::ASCEND_V220, float>(go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
             go32_ubuf_tensor[__v / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-            tv32_ubuf_tensor,
-            sub_m,                 // repeat
+            tv32_ubuf_tensor.template ReinterpretCast<float>(),
+            (uint8_t)sub_m,                 // repeat
             1,                     // dstBlockStride
             1,                     // src0BlockStride
             0,                     // src1BlockStride
-            round_v / FLOAT_BLOCK_SIZE,  // dstRepeatStride
-            round_v / FLOAT_BLOCK_SIZE,  // src0RepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // dstRepeatStride
+            (uint8_t)(round_v / FLOAT_BLOCK_SIZE),  // src0RepeatStride
             1                      // src1RepeatStride
         );
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);  // fix hidden_size=96
@@ -661,7 +663,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformMaxV(
     uint32_t repeat)
 {
     max_v<ArchType::ASCEND_V220, float>(
-        dst, src0, src1, repeat, 1, 1, 1, 8, 8, 8);
+        dst, src0, src1, (uint8_t)repeat, 1, 1, 1, 8, 8, 8);
 }
 
 // 平台函数：sub_v（逐元素减法）
@@ -672,7 +674,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformSubV(
     uint32_t repeat)
 {
     sub_v<ArchType::ASCEND_V220, float>(
-        dst, src0, src1, repeat, 1, 1, 1, 8, 8, 8);
+        dst, src0, src1, (uint8_t)repeat, 1, 1, 1, 8, 8, 8);
 }
 
 // 平台函数：exp_v（指数运算）
@@ -682,7 +684,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformExpV(
     uint32_t repeat)
 {
     exp_v<ArchType::ASCEND_V220, float>(
-        dst, src, repeat, 1, 1, 8, 8);
+        dst, src, (uint8_t)repeat, 1, 1, 8, 8);
 }
 
 // 平台函数：mul_v（逐元素乘法）
@@ -693,7 +695,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformMulV(
     uint32_t repeat)
 {
     mul_v<ArchType::ASCEND_V220, float>(
-        dst, src0, src1, repeat, 1, 1, 1, 8, 8, 8);
+        dst, src0, src1, (uint8_t)repeat, 1, 1, 1, 8, 8, 8);
 }
 
 // 平台函数：add_v（逐元素加法）
@@ -704,7 +706,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformAddV(
     uint32_t repeat)
 {
     add_v<ArchType::ASCEND_V220, float>(
-        dst, src0, src1, repeat, 1, 1, 1, 8, 8, 8);
+        dst, src0, src1, (uint8_t)repeat, 1, 1, 1, 8, 8, 8);
 }
 
 // 平台函数：muls_v（标量乘法，单次调用）
@@ -715,7 +717,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformMulsV(
     uint32_t repeat)
 {
     muls_v<ArchType::ASCEND_V220, float>(
-        dst, src, scalar, repeat, 1, 1, 8, 8);
+        dst, src, scalar, (uint8_t)repeat, 1, 1, 8, 8);
 }
 
 // 平台函数：brcb_v（广播，uint32_t）
@@ -724,7 +726,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformBrcbV(
     AscendC::LocalTensor<uint32_t> src,
     uint32_t repeat)
 {
-    brcb_v<ArchType::ASCEND_V220, uint32_t>(dst, src, 1, 8, repeat);
+    brcb_v<ArchType::ASCEND_V220, uint32_t>(dst, src, 1, 8, (uint8_t)repeat);
 }
 
 // 平台函数：brcb_v（广播，float）
@@ -736,7 +738,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformBrcbVFloat(
     brcb_v<ArchType::ASCEND_V220, uint32_t>(
         dst.ReinterpretCast<uint32_t>(),
         src.ReinterpretCast<uint32_t>(),
-        1, 8, round_sub_m / FLOAT_BLOCK_SIZE);
+        1, 8, (uint8_t)(round_sub_m / FLOAT_BLOCK_SIZE));
 }
 
 // 平台函数：conv_v（float→OUT_DTYPE 转换）
@@ -746,7 +748,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformConvVToOutput(
     uint32_t repeat)
 {
     conv_v<ArchType::ASCEND_V220, float, OUT_DTYPE>(
-        dst, src, repeat, 1, 1, 4, 8);
+        dst, src, (uint8_t)repeat, 1, 1, 4, 8);
 }
 
 // 平台函数：conv_v（int32_t→float 转换，含 repeat_times<255 分支）
@@ -758,12 +760,12 @@ __aicore__ __attribute__((always_inline)) inline void PlatformConvInt32ToFloat(
     uint32_t repeat_times = (count + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE;
     if (repeat_times < 255) {
         conv_v<ArchType::ASCEND_V220, int32_t, float>(
-            dst, temp, repeat_times, 1, 1, 8, 8);
+            dst, temp, (uint8_t)repeat_times, 1, 1, 8, 8);
     } else {
         for (uint64_t vconv_idx = 0; vconv_idx < 2; ++vconv_idx) {
             conv_v<ArchType::ASCEND_V220, int32_t, float>(
                 dst[vconv_idx * count / 2], temp[vconv_idx * count / 2],
-                (count / 2 + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE,
+                (uint8_t)((count / 2 + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE),
                 1, 1, 8, 8);
         }
     }
@@ -779,13 +781,13 @@ __aicore__ __attribute__((always_inline)) inline void PlatformConvFloatToHalf(
         conv_v<ArchType::ASCEND_V220, float, half>(
             dst.template ReinterpretCast<half>(),
             dst.template ReinterpretCast<float>(),
-            repeat_times, 1, 1, 4, 8);
+            (uint8_t)repeat_times, 1, 1, 4, 8);
     } else {
         for (uint64_t vconv_idx = 0; vconv_idx < 2; ++vconv_idx) {
             conv_v<ArchType::ASCEND_V220, float, half>(
                 dst.template ReinterpretCast<half>()[vconv_idx * count / 2],
                 dst.template ReinterpretCast<float>()[vconv_idx * count / 2],
-                (count / 2 + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE,
+                (uint8_t)((count / 2 + FLOAT_VECTOR_SIZE - 1) / FLOAT_VECTOR_SIZE),
                 1, 1, 4, 8);
         }
     }
@@ -837,24 +839,24 @@ __aicore__ __attribute__((always_inline)) inline void PlatformTensorSubValueRepe
     brcb_v<ArchType::ASCEND_V220, uint32_t>(
         tempMaxTensor.ReinterpretCast<uint32_t>(),
         MaxTensor.ReinterpretCast<uint32_t>(),
-        1, 8, round_sub_m / FLOAT_BLOCK_SIZE);
+        1, 8, (uint8_t)(round_sub_m / FLOAT_BLOCK_SIZE));
     PIPE_BARRIER(V);
     for (uint32_t sub_v_idx = 0; sub_v_idx < qk_n / FLOAT_VECTOR_SIZE; ++sub_v_idx) {
         sub_v<ArchType::ASCEND_V220, float>(
             dst[sub_v_idx * FLOAT_VECTOR_SIZE],
             src[sub_v_idx * FLOAT_VECTOR_SIZE],
-            tempMaxTensor, sub_m, 1, 1, 0,
-            qk_round_n / FLOAT_BLOCK_SIZE,
-            qk_round_n / FLOAT_BLOCK_SIZE, 1);
+            tempMaxTensor, (uint8_t)sub_m, 1, 1, 0,
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE), 1);
     }
     if (qk_n % FLOAT_VECTOR_SIZE > 0) {
         __set_mask(qk_n % FLOAT_VECTOR_SIZE);
         sub_v<ArchType::ASCEND_V220, float>(
             dst[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
             src[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-            tempMaxTensor, sub_m, 1, 1, 0,
-            qk_round_n / FLOAT_BLOCK_SIZE,
-            qk_round_n / FLOAT_BLOCK_SIZE, 1);
+            tempMaxTensor, (uint8_t)sub_m, 1, 1, 0,
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE), 1);
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
     PIPE_BARRIER(V);
@@ -872,18 +874,18 @@ __aicore__ __attribute__((always_inline)) inline void PlatformTensorDivRepeatM(
         div_v<ArchType::ASCEND_V220, float>(
             dst[vadd_idx * FLOAT_VECTOR_SIZE],
             src[vadd_idx * FLOAT_VECTOR_SIZE],
-            src1, sub_m, 1, 1, 0,
-            qk_round_n / FLOAT_BLOCK_SIZE,
-            qk_round_n / FLOAT_BLOCK_SIZE, 1);
+            src1, (uint8_t)sub_m, 1, 1, 0,
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE), 1);
     }
     if (qk_n % FLOAT_VECTOR_SIZE > 0) {
         __set_mask(qk_n % FLOAT_VECTOR_SIZE);
         div_v<ArchType::ASCEND_V220, float>(
             dst[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
             src[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-            src1, sub_m, 1, 1, 0,
-            qk_round_n / FLOAT_BLOCK_SIZE,
-            qk_round_n / FLOAT_BLOCK_SIZE, 1);
+            src1, (uint8_t)sub_m, 1, 1, 0,
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE), 1);
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
     PIPE_BARRIER(V);
@@ -901,7 +903,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformReduceMaxRepeatM(
     if (qk_n <= FLOAT_VECTOR_SIZE) {
         __set_mask(qk_n);
         cmax_v<ArchType::ASCEND_V220, float, AscendC::ReduceOrder::ORDER_ONLY_VALUE>(
-            dst, src, sub_m, 1, 1, qk_round_n / FLOAT_BLOCK_SIZE);
+            dst, src, (uint8_t)sub_m, 1, 1, (uint16_t)(qk_round_n / FLOAT_BLOCK_SIZE));
     } else {
         ub_to_ub<ArchType::ASCEND_V220, float>(
             tempTensor, src, 0, sub_m,
@@ -911,7 +913,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformReduceMaxRepeatM(
         for (uint32_t rowmax_idx = 1; rowmax_idx < qk_n / FLOAT_VECTOR_SIZE; ++rowmax_idx) {
             max_v<ArchType::ASCEND_V220, float>(
                 tempTensor, tempTensor, src[rowmax_idx * FLOAT_VECTOR_SIZE],
-                sub_m, 1, 1, 1, 8, 8, qk_round_n / FLOAT_BLOCK_SIZE);
+                (uint8_t)sub_m, 1, 1, 1, 8, 8, (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE));
             PIPE_BARRIER(V);
         }
         if (qk_n % FLOAT_VECTOR_SIZE > 0) {
@@ -919,12 +921,12 @@ __aicore__ __attribute__((always_inline)) inline void PlatformReduceMaxRepeatM(
             max_v<ArchType::ASCEND_V220, float>(
                 tempTensor, tempTensor,
                 src[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                sub_m, 1, 1, 1, 8, 8, qk_round_n / FLOAT_BLOCK_SIZE);
+                (uint8_t)sub_m, 1, 1, 1, 8, 8, (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE));
         }
         PIPE_BARRIER(V);
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         cmax_v<ArchType::ASCEND_V220, float, AscendC::ReduceOrder::ORDER_ONLY_VALUE>(
-            dst, tempTensor, sub_m, 1, 1, 8);
+            dst, tempTensor, (uint8_t)sub_m, 1, 1, 8);
     }
     SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     PIPE_BARRIER(V);
@@ -941,16 +943,16 @@ __aicore__ __attribute__((always_inline)) inline void PlatformReduceSumRepeatM(
     if (qk_n <= FLOAT_VECTOR_SIZE) {
         __set_mask(qk_n);
         cadd_v<ArchType::ASCEND_V220, float>(
-            dst, src, sub_m, 1, 1, qk_round_n / FLOAT_BLOCK_SIZE);
+            dst, src, (uint8_t)sub_m, 1, 1, (uint16_t)(qk_round_n / FLOAT_BLOCK_SIZE));
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     } else {
         for (uint32_t rowsum_idx = 1; rowsum_idx < qk_n / FLOAT_VECTOR_SIZE; ++rowsum_idx) {
             add_v<ArchType::ASCEND_V220, float>(
                 src, src, src[rowsum_idx * FLOAT_VECTOR_SIZE],
-                sub_m, 1, 1, 1,
-                qk_round_n / FLOAT_BLOCK_SIZE,
-                qk_round_n / FLOAT_BLOCK_SIZE,
-                qk_round_n / FLOAT_BLOCK_SIZE);
+                (uint8_t)sub_m, 1, 1, 1,
+                (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+                (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+                (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE));
             PIPE_BARRIER(V);
         }
         if (qk_n % FLOAT_VECTOR_SIZE > 0) {
@@ -958,15 +960,15 @@ __aicore__ __attribute__((always_inline)) inline void PlatformReduceSumRepeatM(
             add_v<ArchType::ASCEND_V220, float>(
                 src, src,
                 src[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-                sub_m, 1, 1, 1,
-                qk_round_n / FLOAT_BLOCK_SIZE,
-                qk_round_n / FLOAT_BLOCK_SIZE,
-                qk_round_n / FLOAT_BLOCK_SIZE);
+                (uint8_t)sub_m, 1, 1, 1,
+                (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+                (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+                (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE));
             SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         }
         PIPE_BARRIER(V);
         cadd_v<ArchType::ASCEND_V220, float>(
-            dst, src, sub_m, 1, 1, qk_round_n / FLOAT_BLOCK_SIZE);
+            dst, src, (uint8_t)sub_m, 1, 1, (uint16_t)(qk_round_n / FLOAT_BLOCK_SIZE));
     }
 }
 
@@ -982,18 +984,18 @@ __aicore__ __attribute__((always_inline)) inline void PlatformTensorMulRepeatM(
         mul_v<ArchType::ASCEND_V220, float>(
             dst[vadd_idx * FLOAT_VECTOR_SIZE],
             src[vadd_idx * FLOAT_VECTOR_SIZE],
-            src1, sub_m, 1, 1, src1BlockStride,
-            qk_round_n / FLOAT_BLOCK_SIZE,
-            qk_round_n / FLOAT_BLOCK_SIZE, 1);
+            src1, (uint8_t)sub_m, 1, 1, (uint8_t)src1BlockStride,
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE), 1);
     }
     if (qk_n % FLOAT_VECTOR_SIZE > 0) {
         __set_mask(qk_n % FLOAT_VECTOR_SIZE);
         mul_v<ArchType::ASCEND_V220, float>(
             dst[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
             src[qk_n / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
-            src1, sub_m, 1, 1, src1BlockStride,
-            qk_round_n / FLOAT_BLOCK_SIZE,
-            qk_round_n / FLOAT_BLOCK_SIZE, 1);
+            src1, (uint8_t)sub_m, 1, 1, (uint8_t)src1BlockStride,
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE),
+            (uint8_t)(qk_round_n / FLOAT_BLOCK_SIZE), 1);
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
     PIPE_BARRIER(V);
@@ -1032,7 +1034,7 @@ __aicore__ __attribute__((always_inline)) inline void PlatformLoadSrcAndBrcbScal
     brcb_v<ArchType::ASCEND_V220, uint32_t>(
         tempScale.template ReinterpretCast<uint32_t>(),
         deScaleUb.template ReinterpretCast<uint32_t>(),
-        1, 8, RoundUp<16>(sub_m) / FLOAT_BLOCK_SIZE);
+        1, 8, (uint8_t)(RoundUp<16>(sub_m) / FLOAT_BLOCK_SIZE));
     PlatformVPipeBarrier();
 }
 
