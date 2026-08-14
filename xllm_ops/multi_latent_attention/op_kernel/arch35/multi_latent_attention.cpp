@@ -52,6 +52,8 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
 
     SetAtomicnone();
     SetMasknorm();
+#if 0  // [DBG-BISECT-L] ENTIRE entry body disabled — isolate KERNEL_TASK_TYPE/launch layer
+#if 0  // [DBG-BISECT-J] disable entry-head hardware setup — isolate entry-head vs launch layer
     if ASCEND_IS_AIV {
         SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
@@ -59,6 +61,7 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
         SetPadding<uint64_t>(0);
         SetNdpara(1, 0, 0);
     }
+#endif  // [DBG-BISECT-J]
 
     if(TILING_KEY_IS(0)){ // fp16 ND Normal
         if ASCEND_IS_AIC {
@@ -67,10 +70,14 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
             pa_aic_fp16.Run();
         } else if ASCEND_IS_AIV {
             MLADecoderAiv<TilingKeyType::TILING_HALF_DATA, half, half> pa_aiv {};
+#if 0  // [DBG-BISECT-I] disable AIV SetArgs (TILING_KEY=0) — isolate entry-head vs AIV SetArgs
             pa_aiv.SetArgs(block_tables_gm, deq_qk_gm, deq_pv_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, go_gm, tmp_gm, tiling_para_gm, mask_gm);
             pa_aiv.Run();
+#endif  // [DBG-BISECT-I]
         }
-    } else if (TILING_KEY_IS(1)) { // bf16 ND Normal
+    }
+#if 0  // [DBG-BISECT-K] disable ALL non-key0 branches — isolate other templates' illegal .text
+    else if (TILING_KEY_IS(1)) { // bf16 ND Normal
         if ASCEND_IS_AIC {
             MLAttentionDecoderAic<TilingKeyType::TILING_BF16_DATA, bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t, InputFormat::ND_FORMAT> pa_aic_bf16 {};
             pa_aic_bf16.SetArgs(q_gm, q_rope_gm, ctkv_gm, ctkv_rope_gm, block_tables_gm, o_gm, s_gm, s_rope_out_gm, p_gm, o_tmp_gm, tiling_para_gm);
@@ -249,4 +256,6 @@ __attribute__((noinline)) static __aicore__ void mla_arch35_entry(
             pa_aiv.Run();
         }
     }
+#endif  // [DBG-BISECT-K]
+#endif  // [DBG-BISECT-L]
 }

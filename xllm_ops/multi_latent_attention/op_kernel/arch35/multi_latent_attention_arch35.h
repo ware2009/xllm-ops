@@ -89,15 +89,19 @@ __aicore__ __attribute__((always_inline)) inline void CopyUbToL1Nd2Nz(
 
 // ----------------------------------------------------------------------------
 // PlatformSetQLoadComplete — terminal sync after the Q / Q_rope L1 load
-// (arch32 L796-797). A3 issued SET/WAIT_FLAG(MTE2, MTE1, EVENT_ID0) on its
-// UB<->L1 producer channel; on A5 that channel maps to MTE3, so the pair
-// becomes SET/WAIT_FLAG(MTE3, MTE1, EVENT_ID0). Encapsulated here so bs.h
-// stays arch-neutral (name aligned with the arch32 platform layer).
+// (arch32 L796-797). Q / Q_rope are brought GM->L1 by DataCopy, which is issued
+// on the MTE2 (load) pipe on BOTH A3 and A5 — MTE3 is the L1/UB->GM store pipe
+// and carries NO Q-load event. The consumer that reads Q from L1 into L0A runs
+// on MTE1, so the correct hand-off is SET/WAIT_FLAG(MTE2, MTE1, EVENT_ID0),
+// identical to arch32. (An earlier port wrongly used MTE3 here, so MTE1 waited
+// on an event never produced on MTE3 — the broken hand-off let MTE1 consume Q
+// before it was resident in L1 and tripped the CCU instruction-address check
+// -> 507015.) Encapsulated here so bs.h stays arch-neutral.
 // ----------------------------------------------------------------------------
 __aicore__ __attribute__((always_inline)) inline void PlatformSetQLoadComplete()
 {
-    SET_FLAG(MTE3, MTE1, EVENT_ID0);
-    WAIT_FLAG(MTE3, MTE1, EVENT_ID0);
+    SET_FLAG(MTE2, MTE1, EVENT_ID0);
+    WAIT_FLAG(MTE2, MTE1, EVENT_ID0);
 }
 
 // ----------------------------------------------------------------------------
@@ -108,27 +112,30 @@ __aicore__ __attribute__((always_inline)) inline void PlatformSetQLoadComplete()
 //   1. before loading  : wait the consumer to release this slot.
 //   2. after K main     : publish K main, then wait the rope sub-slot (flag+2).
 //   3. after K rope     : publish the whole block to the L0B consumer.
-// A3 drove these on its MTE2 UB<->L1 producer channel; on A5 that channel maps
-// to MTE3, so every SET/WAIT below uses MTE3<->MTE1. Encapsulated here so bs.h
-// never names a raw pipe (name aligned with the arch32 platform layer).
+// A3 drove these on its MTE2 GM->L1 load channel; on A5 the KV block is ALSO
+// brought GM->L1 by DataCopy, which is issued on the MTE2 (load) pipe — MTE3 is
+// the L1/UB->GM store pipe and carries no KV-load event. So every SET/WAIT below
+// keeps MTE2<->MTE1, identical to arch32. (An earlier port wrongly mapped these
+// to MTE3, breaking the producer/consumer hand-off with the Cube L1->L0B reader.)
+// Encapsulated here so bs.h never names a raw pipe (name aligned with arch32).
 // ----------------------------------------------------------------------------
 __aicore__ __attribute__((always_inline)) inline void PlatformWaitKVLoadReady(
     uint32_t flag)
 {
-    WAIT_FLAG(MTE1, MTE3, flag);
+    WAIT_FLAG(MTE1, MTE2, flag);
 }
 
 __aicore__ __attribute__((always_inline)) inline void PlatformSetKVMainLoadComplete(
     uint32_t flag)
 {
-    SET_FLAG(MTE3, MTE1, flag);
-    WAIT_FLAG(MTE1, MTE3, flag + 2);
+    SET_FLAG(MTE2, MTE1, flag);
+    WAIT_FLAG(MTE1, MTE2, flag + 2);
 }
 
 __aicore__ __attribute__((always_inline)) inline void PlatformSetKVRopeLoadComplete(
     uint32_t flag)
 {
-    SET_FLAG(MTE3, MTE1, flag + 2);
+    SET_FLAG(MTE2, MTE1, flag + 2);
 }
 
 // ============================================================================
@@ -156,25 +163,26 @@ __aicore__ __attribute__((always_inline)) inline void PlatformSetL0ALoadComplete
 }
 
 // -- LoadKVFromL1ToL0B: KV L1->L0B publish/consume handshakes. esi==0/esi==4
-//    carry the extra KV ping-pong (flag / flag+2) producer sync (A3 MTE2->A5
-//    MTE3), the common path guards the L0B slot (esi%2+2) and, at esi==0, waits
-//    the FIX->M release of the mm1 L0C block.
+//    carry the extra KV ping-pong (flag / flag+2) producer sync issued by the
+//    GM->L1 loader on MTE2 (same as arch32; MTE3 is the store pipe and carries
+//    no KV-load event), the common path guards the L0B slot (esi%2+2) and, at
+//    esi==0, waits the FIX->M release of the mm1 L0C block.
 __aicore__ __attribute__((always_inline)) inline void PlatformWaitKVMainSlot(
     uint32_t kvFlag)
 {
-    WAIT_FLAG(MTE3, MTE1, kvFlag);
+    WAIT_FLAG(MTE2, MTE1, kvFlag);
 }
 
 __aicore__ __attribute__((always_inline)) inline void PlatformWaitKVRopeSlot(
     uint32_t kvFlag)
 {
-    WAIT_FLAG(MTE3, MTE1, kvFlag + 2);
+    WAIT_FLAG(MTE2, MTE1, kvFlag + 2);
 }
 
 __aicore__ __attribute__((always_inline)) inline void PlatformSetKVRopeSlotFree(
     uint32_t kvFlag)
 {
-    SET_FLAG(MTE1, MTE3, kvFlag + 2);
+    SET_FLAG(MTE1, MTE2, kvFlag + 2);
 }
 
 __aicore__ __attribute__((always_inline)) inline void PlatformWaitL0BReady(
@@ -248,12 +256,14 @@ __aicore__ __attribute__((always_inline)) inline void PlatformWaitPVL0BReady(
 }
 
 // -- SetKVLoadComplete: publish the L1 KV slot to the L0B consumer on the last
-//    embed split (arch32 L256-262, A3 SET_FLAG(MTE1,MTE2,flag) -> A5 MTE3).
+//    embed split (arch32 L256-262). KV is brought GM->L1 by DataCopy on the MTE2
+//    (load) pipe, so the producer hand-off stays MTE2<->MTE1 as in arch32.
+//    (An earlier A5 port wrongly mapped this to MTE3.)
 __aicore__ __attribute__((always_inline)) inline void PlatformSetPVKVLoadComplete(
     bool is_last_split, uint32_t l1KvFlag)
 {
     if (is_last_split) {
-        SET_FLAG(MTE1, MTE3, l1KvFlag);
+        SET_FLAG(MTE2, MTE1, l1KvFlag);
     }
 }
 

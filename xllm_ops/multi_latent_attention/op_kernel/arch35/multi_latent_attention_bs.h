@@ -288,9 +288,14 @@ template <typename CubeT>
 __aicore__ __attribute__((always_inline)) inline void LoadQData(
     CubeT &aic, const MLAContext &ctx)
 {
+    // [DBG-BISECT-C] step3: ALL Q loads disabled. If pytest no longer traps
+    // 507015 -> confirms root cause is Q main Nd2Nz (first gm_to_l1). If it
+    // STILL traps -> root cause is even earlier, inside InitMLAContext.
+#if 0  // [DBG-BISECT-C] entire Q load disabled
     LoadQMainFromGMToL1(aic, ctx);
     LoadQRopeFromGMToL1(aic, ctx);
     PlatformSetQLoadComplete();
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -495,7 +500,15 @@ __aicore__ __attribute__((always_inline)) inline void ComputeQKMMad(
         m,
         is_int8 ? qk_round_n_l1 : qk_n,   // n
         (uint32_t)embed_split_size,       // k
-        esi == 0);                        // cmatrixInitVal
+        esi == 0,                         // cmatrixInitVal
+        // A5 CUBE pipeline unit flag: the QK GEMM accumulates across the
+        // embedding-split loop into a single L0C. Non-final splits continue the
+        // accumulation (unitFlag = 2); the final Mmad commits the pipeline
+        // (unitFlag = 3). For FP16 the final split is esi == 4 (the one that
+        // FixPipes in CopyQKResultToUB). For INT8 the main loop never commits
+        // here (its L0C is finalised later by ComputeQRope's RoPE tail Mmad),
+        // so every INT8 main-loop split stays at 2.
+        (uint8_t)((!is_int8 && esi == 4u) ? 3 : 2));
     PlatformSetMmadComplete(esi % 2);
 }
 

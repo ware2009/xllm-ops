@@ -341,6 +341,7 @@ public:
         __gm__ uint8_t *__restrict__ tiling_para_gm)
     {
         // --- A5 hardware state setup ---
+#if 0  // [DBG-BISECT-H] disable ENTIRE SetArgs body (isolate SetArgs vs entry-head)
         SetPadding<uint64_t>(0);
         SetAtomicnone();
         SetNdpara(1, 0, 0);
@@ -382,6 +383,7 @@ public:
         //   p_ubuf  @ lp_ubuf_offset   : softmax P source for UB->L1 (MTE3)
         //   lo_ubuf @ lo_ubuf_offset   : PV mmad result written L0C->UB (FixPipe)
         //   go_ubuf @ go_ubuf_offset   : final O staged for copy-out
+#if 0  // [DBG-BISECT-G] disable CUBE-side UB InitBuffer (suspect: AIC InitBuffer UB illegal)
         pipe.InitBuffer(ubTBuf, MAX_UB_SIZE_A5);
         auto ubBase = ubTBuf.Get<uint8_t>();
         s_ubuf_tensor  = ubBase[ubufAlloc.ls32_ubuf_offset].template ReinterpretCast<float>();
@@ -389,6 +391,7 @@ public:
         go_ubuf_tensor = ubBase[ubufAlloc.go_ubuf_offset].template ReinterpretCast<OUT_DTYPE>();
         // PV mmad result (lo) shares the same physical UB as AIV lo_ubuf (4*BLK).
         lo_ubuf_tensor = ubBase[ubufAlloc.lo_ubuf_offset].template ReinterpretCast<float>();
+#endif  // [DBG-BISECT-G]
 
         // Get base tensors (required before sub-buffer offset assignment)
         auto l1BaseTensor = l1TBuf.Get<uint8_t>();
@@ -451,6 +454,7 @@ public:
         // If tiling didn't fill it, default to 128 for safety
         embed_split_size_qk = (block_size_calc > 0) ? block_size_calc : 128;
         embed_split_loop_qk = (embedding_size + embed_split_size_qk - 1) / embed_split_size_qk;
+#endif  // [DBG-BISECT-H] end disable ENTIRE SetArgs body
     }
 
     // ========================================================================
@@ -482,6 +486,7 @@ public:
     __aicore__ __attribute__((always_inline)) inline void Run()
     {
         // --- Init: pre-set sync flags for 8-event ping-pong pipeline ---
+#if 0  // [DBG-BISECT-E] disable SET_FLAG init skeleton
         // M -> MTE1: Scalar tells MTE1 it can start loading L1 from GM
         SET_FLAG(M, MTE1, EVENT_ID0);
         SET_FLAG(M, MTE1, EVENT_ID1);
@@ -496,16 +501,20 @@ public:
         SET_FLAG(FIX, M, EVENT_ID0);
         SET_FLAG(FIX, M, EVENT_ID1);
 
-        // MTE1 -> MTE3: MTE1 (L1 load) releases MTE3 for UB->L1 transfer
-        // (A3 used MTE2 here; A5 uses MTE3 for the new UB->L1 on-chip path)
-        SET_FLAG(MTE1, MTE3, EVENT_ID0);
-        SET_FLAG(MTE1, MTE3, EVENT_ID1);
-        SET_FLAG(MTE1, MTE3, EVENT_ID2);
-        SET_FLAG(MTE1, MTE3, EVENT_ID3);
-        SET_FLAG(MTE1, MTE3, EVENT_ID4);
-        SET_FLAG(MTE1, MTE3, EVENT_ID5);
-        SET_FLAG(MTE1, MTE3, EVENT_ID6);
-        SET_FLAG(MTE1, MTE3, EVENT_ID7);
+        // MTE1 -> MTE2: initial KV ping-pong slot-free signal. The KV block is
+        // loaded GM->L1 by DataCopy on the MTE2 (load) pipe, so the producer
+        // hand-off to the MTE1 (L1->L0B) consumer runs on MTE2<->MTE1 — identical
+        // to arch32. (An earlier A5 port wrongly pre-set these to MTE3; the KV
+        // runtime WAIT_FLAG(MTE1,MTE2,flag) then had no matching initial signal
+        // and the first loop iteration deadlocked.)
+        SET_FLAG(MTE1, MTE2, EVENT_ID0);
+        SET_FLAG(MTE1, MTE2, EVENT_ID1);
+        SET_FLAG(MTE1, MTE2, EVENT_ID2);
+        SET_FLAG(MTE1, MTE2, EVENT_ID3);
+        SET_FLAG(MTE1, MTE2, EVENT_ID4);
+        SET_FLAG(MTE1, MTE2, EVENT_ID5);
+        SET_FLAG(MTE1, MTE2, EVENT_ID6);
+        SET_FLAG(MTE1, MTE2, EVENT_ID7);
 
         // FIX -> MTE1: FixPipe releases MTE1 for next iteration's L1 reload
         SET_FLAG(FIX, MTE1, EVENT_ID0);
@@ -518,8 +527,10 @@ public:
         // M -> FIX: Scalar releases FixPipe for L0C->UB consumption
         // (A3 used MTE2->FIX; A5 has no MTE3->FIX, use M->FIX instead)
         SET_FLAG(M, FIX, EVENT_ID0);
+#endif  // [DBG-BISECT-E]
 
         // --- Task loop ---
+#if 0  // [DBG-BISECT-F] empty Run() body to isolate SetArgs init
         uint64_t cur_batch = 0;
         uint32_t q_block_num_per_batch = (q_heads + cur_qn_blk_size - 1) / cur_qn_blk_size;
         uint32_t process_num = q_block_num_per_batch * num_batches;
@@ -547,8 +558,10 @@ public:
             InnerRunCubeMLA(cur_batch, start_head, cur_head_num, start_kv,
                             cur_q_seq_len, cur_kv_seqlen, offset_tiling);
         }
+#endif  // [DBG-BISECT-F]
 
         // --- Cleanup: wait all sync flags ---
+#if 0  // [DBG-BISECT-E] disable WAIT_FLAG cleanup skeleton
         WAIT_FLAG(M, MTE1, EVENT_ID0);
         WAIT_FLAG(M, MTE1, EVENT_ID1);
         WAIT_FLAG(M, MTE1, EVENT_ID2);
@@ -559,14 +572,14 @@ public:
         WAIT_FLAG(M, MTE1, EVENT_ID7);
         WAIT_FLAG(FIX, M, EVENT_ID0);
         WAIT_FLAG(FIX, M, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID0);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID2);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID3);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID4);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID5);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID6);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID7);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID0);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID1);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID2);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID3);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID4);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID5);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID6);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID7);
         WAIT_FLAG(FIX, MTE1, EVENT_ID0);
         WAIT_FLAG(FIX, MTE1, EVENT_ID1);
         WAIT_FLAG(FIX, MTE1, EVENT_ID2);
@@ -575,6 +588,7 @@ public:
         WAIT_FLAG(FIX, MTE1, EVENT_ID5);
         WAIT_FLAG(M, FIX, EVENT_ID0);
         PIPE_BARRIER(ALL);
+#endif  // [DBG-BISECT-E]
     }
 
     // ========================================================================
@@ -601,14 +615,14 @@ public:
         SET_FLAG(M, MTE1, EVENT_ID7);
         SET_FLAG(FIX, M, EVENT_ID0);
         SET_FLAG(FIX, M, EVENT_ID1);
-        SET_FLAG(MTE1, MTE3, EVENT_ID0);
-        SET_FLAG(MTE1, MTE3, EVENT_ID1);
-        SET_FLAG(MTE1, MTE3, EVENT_ID2);
-        SET_FLAG(MTE1, MTE3, EVENT_ID3);
-        SET_FLAG(MTE1, MTE3, EVENT_ID4);
-        SET_FLAG(MTE1, MTE3, EVENT_ID5);
-        SET_FLAG(MTE1, MTE3, EVENT_ID6);
-        SET_FLAG(MTE1, MTE3, EVENT_ID7);
+        SET_FLAG(MTE1, MTE2, EVENT_ID0);
+        SET_FLAG(MTE1, MTE2, EVENT_ID1);
+        SET_FLAG(MTE1, MTE2, EVENT_ID2);
+        SET_FLAG(MTE1, MTE2, EVENT_ID3);
+        SET_FLAG(MTE1, MTE2, EVENT_ID4);
+        SET_FLAG(MTE1, MTE2, EVENT_ID5);
+        SET_FLAG(MTE1, MTE2, EVENT_ID6);
+        SET_FLAG(MTE1, MTE2, EVENT_ID7);
         SET_FLAG(FIX, MTE1, EVENT_ID0);
         SET_FLAG(FIX, MTE1, EVENT_ID1);
         SET_FLAG(FIX, MTE1, EVENT_ID2);
@@ -683,14 +697,14 @@ public:
         WAIT_FLAG(M, MTE1, EVENT_ID7);
         WAIT_FLAG(FIX, M, EVENT_ID0);
         WAIT_FLAG(FIX, M, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID0);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID1);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID2);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID3);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID4);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID5);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID6);
-        WAIT_FLAG(MTE1, MTE3, EVENT_ID7);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID0);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID1);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID2);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID3);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID4);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID5);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID6);
+        WAIT_FLAG(MTE1, MTE2, EVENT_ID7);
         WAIT_FLAG(FIX, MTE1, EVENT_ID0);
         WAIT_FLAG(FIX, MTE1, EVENT_ID1);
         WAIT_FLAG(FIX, MTE1, EVENT_ID2);
@@ -699,6 +713,7 @@ public:
         WAIT_FLAG(FIX, MTE1, EVENT_ID5);
         WAIT_FLAG(M, FIX, EVENT_ID0);
         PIPE_BARRIER(ALL);
+#endif  // [DBG-BISECT-E]
     }
 
 private:
@@ -740,6 +755,11 @@ private:
         uint32_t cur_batch, uint32_t start_head, uint32_t cur_head_num, uint32_t start_kv,
         uint32_t cur_q_seqlen, uint32_t cur_kv_seqlen, uint32_t offset_tiling)
     {
+        // [DBG-BISECT-A] 507015 bisection step 1: keep ONLY Q load, comment out
+        // the whole KV pipeline. If pytest still traps 507015 -> root cause is in
+        // LoadQData (Q Nd2Nz / PlatformSetQLoadComplete). If it does NOT trap ->
+        // root cause is in KV load / QK / PV. This uses only the binary crash
+        // signal (no printf / no GM marker needed, both proven dead ends).
         MLAContext ctx;
         InitMLAContext(*this, ctx, cur_batch, start_head, cur_head_num, start_kv,
                        cur_q_seqlen, cur_kv_seqlen, offset_tiling);
@@ -747,6 +767,7 @@ private:
         // --- Load Q / Q_rope into L1 (blocks until Q is resident) ---
         LoadQData(*this, ctx);
 
+#if 0  // [DBG-BISECT-A] KV pipeline disabled for isolation
         // --- KV-block software pipeline ---
         for (uint32_t n_idx = 0; n_idx < ctx.n_loop + 1; ++n_idx) {
             if (n_idx != ctx.n_loop) {
@@ -760,6 +781,7 @@ private:
             // guarded inside ComputePV, which also publishes UPDATE_READY).
             ComputePV(*this, ctx, n_idx);
         }
+#endif
     }
 
     // --- Raw GM pointers ---
@@ -1029,9 +1051,14 @@ public:
         //   - business  (aiv_bs.h ScheduleVectorTasks): batch/head task dispatch
         //   - platform  (aiv_arch35.h): SET/WAIT_FLAG MTE3/V/MTE2 pipe sync
         // ====================================================================
+        // [DBG-BISECT-D] AIV Run fully disabled. If pytest no longer traps
+        // 507015 -> root cause is on the AIV (Vector) side. If it STILL traps
+        // -> root cause is on the AIC (Cube) side SET/WAIT_FLAG init/cleanup.
+#if 0  // [DBG-BISECT-D] entire AIV pipeline disabled
         PlatformInitVectorPipeSync();
         ScheduleVectorTasks();
         PlatformWaitVectorPipeSync();
+#endif
     }
 
     __aicore__ __attribute__((always_inline)) inline void RunTP1()

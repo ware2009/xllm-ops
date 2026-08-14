@@ -44,7 +44,9 @@ extern "C" __global__ __aicore__ void multi_latent_attention(GM_ADDR query, GM_A
                                                              GM_ADDR contextLens, GM_ADDR mask, GM_ADDR qSeqlen,
                                                              GM_ADDR qkDescale, GM_ADDR pvDescale, GM_ADDR attenOut,
                                                              GM_ADDR lseOut, GM_ADDR workspace, GM_ADDR tiling) {
+#if 0  // [DBG-BISECT-M] disable KERNEL_TASK_TYPE_DEFAULT — isolate task-type vs host launch layer
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#endif  // [DBG-BISECT-M]
 #if defined(MLA_ARCH35)
     mla_arch35_entry(query, queryRope, kvCache, kvCacheRope, block_tables,
                      contextLens, mask, qSeqlen, qkDescale, pvDescale,

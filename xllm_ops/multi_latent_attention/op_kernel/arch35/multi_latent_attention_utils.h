@@ -302,15 +302,21 @@ __aicore__ __attribute__((always_inline)) inline void ComputeQKMMadRaw(
     uint32_t m,
     uint32_t n,
     uint32_t k,
-    bool initC)
+    bool initC,
+    uint8_t unitFlag = 3)
 {
     // A5 (DAV_3510) Mmad idiom -mirror the official asc-devkit mmad.asc demo,
     // which calls AscendC::Mmad(co1, a2, b2, params) with the explicit prefix.
+    // unitFlag drives the A5 CUBE pipeline unit grouping: 2 = mid-accumulation
+    // (continue), 3 = pipeline end (commit). A K-split accumulation loop must set
+    // 2 on the non-final split and 3 on the final split; a single-shot Mmad = 3.
+    // A stuck unitFlag == 0 leaves the CUBE instruction stream with no terminator,
+    // so the PC runs off into an illegal address (error263 CCU addr check 0x10f8).
     AscendC::MmadParams mmadParams;
     mmadParams.m = m;
     mmadParams.n = n;
     mmadParams.k = k;
-    mmadParams.unitFlag = 0;
+    mmadParams.unitFlag = unitFlag;
     mmadParams.cmatrixSource = false;
     mmadParams.cmatrixInitVal = initC;
     AscendC::Mmad(l0cTensor, l0aTensor, l0bTensor, mmadParams);
@@ -351,6 +357,8 @@ __aicore__ __attribute__((always_inline)) inline void CopyQKResultToGMRaw(
         /* mSize     */ mSize,
         /* srcStride */ srcStride,
         /* dstStride */ dstStride);
+    // A5 FixPipe closes the CUBE pipeline: unitFlag = 3 (pipeline end / commit).
+    params.unitFlag = 3;
 
     if constexpr (AscendC::IsSameType<DstT, bfloat16_t>::value) {
         params.quantPre = QuantMode_t::F322BF16;
@@ -388,9 +396,14 @@ __aicore__ __attribute__((always_inline)) inline void CopyQKResultToUBRaw(
 {
     AscendC::FixpipeParamsArch3510<AscendC::CO2Layout::ROW_MAJOR> params(
         /* nSize     */ nSize,
-        /* mSize     */ mSize,
+        /* mSize     */ ((mSize + 1) / 2) * 2,  // A5 UB direct-write needs M-dim
+                                                // even alignment (== DivCeil(m,2)*2)
         /* srcStride */ srcStride,
         /* dstStride */ dstStride);
+    // A5 UB-direct FixPipe: dualDstCtl = 0b01 splits by the M dim across the two
+    // paired AIV UB halves; unitFlag = 3 terminates the CUBE pipeline.
+    params.dualDstCtl = 0b01;
+    params.unitFlag = 3;
 
     if constexpr (AscendC::IsSameType<DstT, bfloat16_t>::value) {
         params.quantPre = QuantMode_t::F322BF16;
