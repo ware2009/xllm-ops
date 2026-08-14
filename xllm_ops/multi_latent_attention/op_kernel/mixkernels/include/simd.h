@@ -189,7 +189,8 @@ __aicore__ inline void exp_v(AscendC::LocalTensor<DType> dst,
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
     // 3510: Use PRECISION_1ULP_FTZ_FALSE to preserve Subnormal numbers,
     // improving online softmax precision for large kv_seqlen.
-    AscendC::Exp<DType, false, AscendC::ExpConfig{AscendC::ExpAlgo::PRECISION_1ULP_FTZ_FALSE}>(
+    static constexpr AscendC::ExpConfig MLA_EXP_CFG{AscendC::ExpAlgo::PRECISION_1ULP_FTZ_FALSE};
+    AscendC::Exp<DType, false, MLA_EXP_CFG>(
         dst,
         src,
         (uint64_t)0,
