@@ -329,7 +329,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
 
         #  ### JD's in-house operators ####
         "beam_search_group"
-        # "x_attention"  # A5 暂不参与编译, 集中解决 x_flash_attention_infer
+        "x_attention"  
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
