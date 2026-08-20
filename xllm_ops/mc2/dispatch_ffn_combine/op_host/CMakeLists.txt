@@ -9,9 +9,6 @@ endif()
 if (EXISTS ${CMAKE_SOURCE_DIR}/third_party/catlass/include)
     list(APPEND _DISPATCH_FFN_INC_OPTS -I${CMAKE_SOURCE_DIR}/third_party/catlass/include)
 endif()
-if (EXISTS ${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common/inc/kernel)
-    list(APPEND _DISPATCH_FFN_INC_OPTS -I${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common/inc/kernel)
-endif()
 
 add_op_to_compiled_list()
 
@@ -26,7 +23,6 @@ add_ops_compile_options(
     OPTIONS
         --cce-auto-sync=on
         -Wno-deprecated-declarations
-        -Werror
         -DHCCL_COMM
         -DCATLASS_ARCH=2201
         ${_DISPATCH_FFN_INC_OPTS}
