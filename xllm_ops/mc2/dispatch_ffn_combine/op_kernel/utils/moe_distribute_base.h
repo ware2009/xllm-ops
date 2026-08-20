@@ -22,7 +22,6 @@
 #include "kernel_operator.h"
 #endif
 #include "adv_api/hccl/hccl.h"
-#include "moe_distribute_comm_ctx.h"
 
 constexpr uint32_t LOCAL_NOTIFY_MAX_NUM = 64;
 constexpr uint32_t CUR_LOCAL_STREAM_MAX_NUM = 40U;
