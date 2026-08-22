@@ -1987,6 +1987,105 @@ mega_gdn_mtp_decode(
       conv_out, conv_state, ssm_state, out);
 }
 
+// ==================== quant_lightning_indexer_v2 (two-stage) ====================
+// Helper: metadata op.
+static void quant_lightning_indexer_v2_metadata_helper(
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t batch_size, int64_t max_seq_q, int64_t max_seq_k,
+    char* layout_q_c, char* layout_k_c,
+    int64_t topk, int64_t quant_mode,
+    int64_t mask_mode, int64_t cmp_ratio,
+    at::Tensor& meta_t) {
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata,
+               aslq, aslk, num_heads_q, num_heads_k, head_dim,
+               batch_size, max_seq_q, max_seq_k,
+               layout_q_c, layout_k_c,
+               topk, quant_mode, mask_mode, cmp_ratio,
+               meta_t);
+}
+
+// Helper: main op.
+static void quant_lightning_indexer_v2_main_helper(
+    const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& weights, const at::Tensor& q_scale, const at::Tensor& k_scale,
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    const at::Tensor& block_table, const at::Tensor& meta_t,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t topk, int64_t quant_mode,
+    char* layout_q_c, char* layout_k_c,
+    int64_t mask_mode, int64_t cmp_ratio, int64_t return_value,
+    at::Tensor& idx_out, at::Tensor& val_out) {
+  const c10::optional<at::Tensor> null_opt;
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2,
+               query, key, weights, q_scale, k_scale,
+               aslq, aslk, null_opt, null_opt, null_opt,
+               block_table, null_opt, meta_t,
+               num_heads_q, num_heads_k, head_dim,
+               topk, quant_mode,
+               layout_q_c, layout_k_c,
+               mask_mode, cmp_ratio, return_value,
+               idx_out, val_out);
+}
+
+// Public impl: runs metadata then main, returns idx_out.
+at::Tensor quant_lightning_indexer_v2_impl_npu(
+    const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& weights, const at::Tensor& q_scale, const at::Tensor& k_scale,
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    const at::Tensor& block_table,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t topk, int64_t quant_mode,
+    std::string layout_q, std::string layout_k,
+    int64_t mask_mode, int64_t cmp_ratio, int64_t return_value) {
+  auto q_sizes = query.sizes().vec();
+  const int64_t batch_size = q_sizes[0];
+  const int64_t max_seq_q = q_sizes[1];
+  const int64_t max_seq_k = aslk.max().item<int64_t>();
+  const int64_t QLI_V2_META_SIZE = 1024;
+  auto opts_i32 = query.options().dtype(at::kInt);
+  at::Tensor meta_t = at::empty({QLI_V2_META_SIZE}, opts_i32.device(query.device()));
+  char* lq = const_cast<char*>(layout_q.c_str());
+  char* lk = const_cast<char*>(layout_k.c_str());
+  // Step 1: metadata
+  quant_lightning_indexer_v2_metadata_helper(
+      aslq, aslk, num_heads_q, num_heads_k, head_dim,
+      batch_size, max_seq_q, max_seq_k, lq, lk,
+      topk, quant_mode, mask_mode, cmp_ratio, meta_t);
+  // Step 2: main
+  at::Tensor idx_out = at::empty({batch_size, max_seq_q, num_heads_k, topk}, opts_i32.device(query.device()));
+  at::Tensor val_out = at::empty({0}, query.options().dtype(at::kBFloat16));
+  quant_lightning_indexer_v2_main_helper(
+      query, key, weights, q_scale, k_scale, aslq, aslk, block_table, meta_t,
+      num_heads_q, num_heads_k, head_dim,
+      topk, quant_mode, lq, lk,
+      mask_mode, cmp_ratio, return_value,
+      idx_out, val_out);
+  return idx_out;
+}
+
+// quant_lightning_indexer_v2_metadata (standalone entry)
+at::Tensor quant_lightning_indexer_v2_metadata_impl_npu(
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t batch_size, int64_t max_seq_q, int64_t max_seq_k,
+    std::string layout_q, std::string layout_k,
+    int64_t topk, int64_t quant_mode,
+    int64_t mask_mode, int64_t cmp_ratio) {
+  const int64_t QLI_V2_META_SIZE = 1024;
+  auto opts_i32 = aslq.options().dtype(at::kInt);
+  at::Tensor meta_t = at::empty({QLI_V2_META_SIZE}, opts_i32.device(aslq.device()));
+  char* lq = const_cast<char*>(layout_q.c_str());
+  char* lk = const_cast<char*>(layout_k.c_str());
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata,
+               aslq, aslk, num_heads_q, num_heads_k, head_dim,
+               batch_size, max_seq_q, max_seq_k,
+               lq, lk,
+               topk, quant_mode, mask_mode, cmp_ratio,
+               meta_t);
+  return meta_t;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_unshared_kv", &select_unshared_kv_impl_npu, "select_unshared_kv");
   m.def("cache_unshared_kv", &cache_unshared_kv_impl_npu, "cache_unshared_kv");
@@ -2085,4 +2184,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sparse_attn_sharedkv_metadata", &sparse_attn_sharedkv_metadata_impl_npu, "sparse_attn_sharedkv_metadata");
   m.def("quant_lightning_indexer_metadata", &quant_lightning_indexer_metadata_impl_npu, "quant_lightning_indexer_metadata");
   m.def("lightning_indexer_quant_metadata", &lightning_indexer_quant_metadata_impl_npu, "lightning_indexer_quant_metadata");
+  m.def("quant_lightning_indexer_v2", &quant_lightning_indexer_v2_impl_npu, "quant_lightning_indexer_v2");
+  m.def("quant_lightning_indexer_v2_metadata", &quant_lightning_indexer_v2_metadata_impl_npu, "quant_lightning_indexer_v2_metadata");
 }

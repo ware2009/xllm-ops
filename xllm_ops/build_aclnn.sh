@@ -124,7 +124,8 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "compressor"
         "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
         "quant_lightning_indexer_metadata"
-        "lightning_indexer_quant_metadata"
+        "quant_lightning_indexer_v2"
+        "lightning_indexer_v2"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
