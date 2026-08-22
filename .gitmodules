@@ -4,5 +4,4 @@
 [submodule "third_party/pto-isa"]
 	path = third_party/pto-isa
 	url = https://gitcode.com/cann/pto-isa.git
-[submodule "third_part/catlass"]
-	rul = https://gitcode.com/cann/catlass.git
+
