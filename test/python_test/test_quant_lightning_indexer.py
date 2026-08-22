@@ -17,7 +17,7 @@ import pytest
 import torch
 import torch_npu
 
-from custom_ops import quant_lightning_indexer_npu
+from custom_ops import quant_lightning_indexer_npu, quant_lightning_indexer_metadata_npu
 
 INVALID_IDX = -1
 
@@ -128,14 +128,22 @@ def _valid_set(row):
 
 # ============ Test cases ============
 
+# (B, q_seq, k_seq, q_head, k_head, head_dim, block_size,
+#  sparse_count, sparse_mode, cmp_ratio, cache_blocks)
+# cache_blocks: total KV cache capacity in blocks; 0 = size the cache exactly
+# to the referenced blocks. When cache_blocks > referenced blocks, the valid
+# data is embedded in a larger zero-padded cache and block_table only
+# references the first blocks (decode-style large-cache scenario).
 CASES = [
-    # (B, q_seq, k_seq, q_head, k_head, head_dim, block_size, sparse_count, sparse_mode, cmp_ratio)
-    (1, 4, 128, 64, 1, 128, 128, 8, 3, 1),
+    (1, 4, 128, 64, 1, 128, 128, 8, 3, 1, 0),
+    # decode shape: qSeq=1, topk=512, cmp_ratio=4, 12448-block cache capacity,
+    # key_seq_lens = 92 * 4 = 368 -> floor(368/4) = 92 valid indices (in [90, 94])
+    (1, 1, 92, 64, 1, 128, 128, 512, 3, 4, 12448),
 ]
 
 
-@pytest.mark.parametrize("B,Q_SEQ,K_SEQ,Q_HEAD,K_HEAD,HD,BLOCK_SIZE,SPARSE_COUNT,SPARSE_MODE,CMP_RATIO", CASES)
-def test_quant_lightning_indexer(B, Q_SEQ, K_SEQ, Q_HEAD, K_HEAD, HD, BLOCK_SIZE, SPARSE_COUNT, SPARSE_MODE, CMP_RATIO):
+@pytest.mark.parametrize("B,Q_SEQ,K_SEQ,Q_HEAD,K_HEAD,HD,BLOCK_SIZE,SPARSE_COUNT,SPARSE_MODE,CMP_RATIO,CACHE_BLOCKS", CASES)
+def test_quant_lightning_indexer(B, Q_SEQ, K_SEQ, Q_HEAD, K_HEAD, HD, BLOCK_SIZE, SPARSE_COUNT, SPARSE_MODE, CMP_RATIO, CACHE_BLOCKS):
     np.random.seed(2026)
     torch.manual_seed(2026)
 
@@ -189,6 +197,15 @@ def test_quant_lightning_indexer(B, Q_SEQ, K_SEQ, Q_HEAD, K_HEAD, HD, BLOCK_SIZE
     key_pa, kscale_pa, block_table = to_paged_key(
         key_deq, k_scale_f32, B, K_HEAD, K_SEQ, HD, BLOCK_SIZE)
 
+    # Optionally embed the referenced blocks into a larger zero-padded cache
+    # (decode-style large KV cache; block_table only references valid blocks)
+    if CACHE_BLOCKS > key_pa.shape[0]:
+        key_cache = np.zeros((CACHE_BLOCKS, BLOCK_SIZE, K_HEAD, HD), dtype=key_pa.dtype)
+        kscale_cache = np.zeros((CACHE_BLOCKS, BLOCK_SIZE, K_HEAD), dtype=kscale_pa.dtype)
+        key_cache[:key_pa.shape[0]] = key_pa
+        kscale_cache[:kscale_pa.shape[0]] = kscale_pa
+        key_pa, kscale_pa = key_cache, kscale_cache
+
     # Prepare NPU tensors
     query_npu = query_quant.npu()
     if qk_dtype == torch.float8_e4m3fn:
@@ -202,7 +219,21 @@ def test_quant_lightning_indexer(B, Q_SEQ, K_SEQ, Q_HEAD, K_HEAD, HD, BLOCK_SIZE
     aslk_npu = torch.tensor(act_seq_k, dtype=torch.int32).npu()
     bt_npu = torch.from_numpy(block_table).int().npu()
 
-    # Run NPU
+    # Stage 1: metadata op -> qli_metadata [1024] int32
+    # (the binding below regenerates it internally; here we additionally
+    #  verify the standalone metadata stage shape/dtype)
+    qli_metadata = quant_lightning_indexer_metadata_npu(
+        aslq_npu, aslk_npu,
+        num_heads_q=Q_HEAD, num_heads_k=K_HEAD, head_dim=HD,
+        query_quant_mode=0, key_quant_mode=0,
+        batch_size=B, max_seq_q=Q_SEQ, max_seq_k=max(act_seq_k),
+        layout_query="BSND", layout_key="PA_BSND",
+        sparse_count=SPARSE_COUNT, sparse_mode=SPARSE_MODE,
+        cmp_ratio=CMP_RATIO)
+    assert tuple(qli_metadata.shape) == (1024,), f"metadata shape: {qli_metadata.shape}"
+    assert qli_metadata.dtype == torch.int32, f"metadata dtype: {qli_metadata.dtype}"
+
+    # Stage 2: main op
     npu_out = quant_lightning_indexer_npu(
         query_npu, key_npu, weights_npu, q_scale_npu, k_scale_npu,
         aslq_npu, aslk_npu, bt_npu,
@@ -220,6 +251,11 @@ def test_quant_lightning_indexer(B, Q_SEQ, K_SEQ, Q_HEAD, K_HEAD, HD, BLOCK_SIZE
             for kh in range(K_HEAD):
                 got = _valid_set(npu_result[b, s1, kh])
                 exp = _valid_set(golden_idx[b, s1, kh])
+                # valid-count check: expect ~min(sparse_count, floor(act_seq_k/cmp_ratio)),
+                # allow small tolerance for rounding differences
+                expect_valid = min(SPARSE_COUNT, K_SEQ)
+                assert abs(len(got) - expect_valid) <= 2, (
+                    f"b={b} s1={s1} kh={kh}: valid count {len(got)}, expected ~{expect_valid}")
                 overlap = len(got & exp)
                 min_match = max(1, int(len(exp) * 0.5))
                 assert overlap >= min_match, (
@@ -228,3 +264,5 @@ def test_quant_lightning_indexer(B, Q_SEQ, K_SEQ, Q_HEAD, K_HEAD, HD, BLOCK_SIZE
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
