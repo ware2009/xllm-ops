@@ -111,6 +111,8 @@ CASES = [
     ((12, 12, 8),       2, 9,  2, torch.float32, torch.int64),
     ((5, 7),            1, 3,  1, torch.float16, torch.int32),
     ((3, 4, 5, 6, 4),   4, 7,  0, torch.float32, torch.int32),
+    # KV cache slot update: value [9472, 512] bf16, slots [84, 1] int32, value_2d [84, 512] bf16, 84/84 valid rows
+    ((9472, 512),       1, 84, 0, torch.bfloat16, torch.int32),
 ]
 
 
