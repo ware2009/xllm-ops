@@ -40,6 +40,11 @@ inline static bool IsAiCoreSupport(const aclTensor* self) {
         GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910_93) {
         return CheckType(self->GetDataType(), ASCEND910B_AICORE_DTYPE_SUPPORT_LIST);
         }
+    if (GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND950) {
+        // Ascend950: 自定义 AiCore kernel 已覆盖声明的全部 dtype，直接走 AiCore，
+        // 否则 bf16 会误走 AiCPU 分支（未传 strides 且不支持 bf16）导致执行失败。
+        return true;
+    }
     return CheckType(self->GetDataType(), AICORE_DTYPE_SUPPORT_LIST);
 }
 
