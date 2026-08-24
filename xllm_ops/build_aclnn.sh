@@ -124,7 +124,6 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "compressor"
         "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
         "quant_lightning_indexer_metadata"
-        "lightning_indexer_quant_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
@@ -326,9 +325,12 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "gamma_add_rms_norm"
         "lightning_indexer_quant" 
         "lightning_indexer_quant_metadata"
+        "lightning_indexer_v2"
         "compressor"
         "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
         "quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2"
+        "quant_lightning_indexer_v2_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"

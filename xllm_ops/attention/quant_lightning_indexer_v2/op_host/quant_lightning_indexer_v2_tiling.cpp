@@ -329,10 +329,11 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
                     return ge::GRAPH_FAILED);
     } else if (npuArch_ == NpuArch::DAV_3510) {
         OP_CHECK_IF(
-            ((std::string(opParamInfo_.layOutKey) != "PA_BBND") && (std::string(opParamInfo_.layOutKey) != "BSND") &&
+            ((std::string(opParamInfo_.layOutKey) != "PA_BBND") && (std::string(opParamInfo_.layOutKey) != "PA_BSND") &&
+             (std::string(opParamInfo_.layOutKey) != "BSND") &&
              (std::string(opParamInfo_.layOutKey) != "TND")),
             OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "layout_k", std::string(opParamInfo_.layOutKey).c_str(),
-                                                  "Layout_k only supports PA_BBND, BSND or TND"),
+                                                  "Layout_k only supports PA_BBND, PA_BSND, BSND or TND"),
             return ge::GRAPH_FAILED);
     }
 
@@ -367,6 +368,7 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
         return ge::GRAPH_FAILED);
     OP_CHECK_IF(
         ((std::string(opParamInfo_.layOutKey) != "PA_BBND") &&
+         (std::string(opParamInfo_.layOutKey) != "PA_BSND") &&
          (std::string(opParamInfo_.layOutQuery)) != (std::string(opParamInfo_.layOutKey))),
         OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(opName_, "layout_q and layout_k", layout_query + " and " + layout_key,
                                                "Outside of PA, layout_q and layout_k must be the same"),

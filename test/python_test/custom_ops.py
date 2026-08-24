@@ -722,14 +722,10 @@ def quant_lightning_indexer_v2_npu(query, key, weights, q_scale, k_scale,
                                     layout_q="BSND", layout_k="PA_BSND",
                                     mask_mode=3, cmp_ratio=1,
                                     return_value=0):
-    return custom_ops_lib.quant_lightning_indexer_v2(
+    return custom_ops_lib.quant_lightning_indexer_v2_main(
         query, key, weights, q_scale, k_scale,
         actual_seq_lengths_query, actual_seq_lengths_key,
-        None, None,  # seqused_q, seqused_k (unused, pass None)
-        None,       # cmp_residual_k (optional)
-        block_table,
-        None,       # output_idx_offset (optional)
-        metadata,
+        block_table, metadata,
         num_heads_q, num_heads_k, head_dim,
         topk, quant_mode,
         layout_q, layout_k,
@@ -744,14 +740,11 @@ def quant_lightning_indexer_v2_metadata_npu(actual_seq_lengths_query, actual_seq
                                              batch_size=1, max_seqlen_q=4, max_seqlen_k=128,
                                              layout_q="BSND", layout_k="PA_BSND",
                                              topk=2048, quant_mode=1,
-                                             mask_mode=3, cmp_ratio=1,
-                                             return_value=0):
+                                             mask_mode=3, cmp_ratio=1):
     return custom_ops_lib.quant_lightning_indexer_v2_metadata(
         actual_seq_lengths_query, actual_seq_lengths_key,
-        None, None,  # seqused_q, seqused_k (unused)
-        None,       # cmp_residual_k (optional)
         num_heads_q, num_heads_k, head_dim,
         batch_size, max_seqlen_q, max_seqlen_k,
         layout_q, layout_k,
         topk, quant_mode,
-        mask_mode, cmp_ratio, return_value)
+        mask_mode, cmp_ratio)

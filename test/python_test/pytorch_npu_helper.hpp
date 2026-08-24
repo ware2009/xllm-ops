@@ -377,9 +377,11 @@ limitations under the License.
      AT_ERROR("When ConvertType, tensor item size of cannot be zero.");
      return nullptr;
    }
-   if (acl_data_type != ACL_STRING) {
-     storageDims.push_back(at_tensor.storage().nbytes() / itemsize);
-   }
+    if (acl_data_type != ACL_STRING) {
+      for (int64_t i = 0; i < at_tensor.sizes().size(); i++) {
+        storageDims.push_back(at_tensor.sizes()[i]);
+      }
+    }
  
    const auto dimNum = at_tensor.sizes().size();
    aclFormat format = ACL_FORMAT_ND;

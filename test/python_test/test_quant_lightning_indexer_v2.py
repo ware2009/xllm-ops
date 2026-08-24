@@ -116,6 +116,7 @@ def _valid_set(row):
 CASES = [
     # (B, q_seq, k_seq, q_head, k_head, head_dim, block_size, topk, mask_mode, cmp_ratio)
     (1, 4, 128, 64, 1, 128, 128, 8, 3, 1),
+    (1, 1, 128, 64, 1, 128, 128, 512, 3, 4),
 ]
 
 

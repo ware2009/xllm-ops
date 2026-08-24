@@ -1987,6 +1987,113 @@ mega_gdn_mtp_decode(
       conv_out, conv_state, ssm_state, out);
 }
 
+// ==================== quant_lightning_indexer_v2 (two-stage) ====================
+// Helper: main op.
+at::Tensor quant_lightning_indexer_v2_main_helper(
+    const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& weights, const at::Tensor& q_scale, const at::Tensor& k_scale,
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    const at::Tensor& block_table, const at::Tensor& meta_t,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t topk, int64_t quant_mode,
+    std::string layout_q, std::string layout_k,
+    int64_t mask_mode, int64_t cmp_ratio, int64_t return_value) {
+  auto q_sizes = query.sizes().vec();
+  const int64_t batch_size = q_sizes[0];
+  const bool is_tnd = (layout_q == "TND");
+  const int64_t max_seq_q = is_tnd ? q_sizes[0] : q_sizes[1];
+  auto opts_i32 = query.options().dtype(at::kInt);
+  at::Tensor idx_out = is_tnd
+      ? at::empty({max_seq_q, num_heads_k, topk}, opts_i32.device(query.device()))
+      : at::empty({batch_size, max_seq_q, num_heads_k, topk}, opts_i32.device(query.device()));
+  at::Tensor val_out = is_tnd
+      ? at::empty({max_seq_q, num_heads_k, topk}, query.options().dtype(at::kBFloat16))
+      : at::empty({batch_size, max_seq_q, num_heads_k, topk}, query.options().dtype(at::kBFloat16));
+  char* lq = const_cast<char*>(layout_q.c_str());
+  char* lk = const_cast<char*>(layout_k.c_str());
+  const c10::optional<at::Tensor> null_opt;
+  const int64_t max_seqlen_q = is_tnd ? q_sizes[0] : q_sizes[1];
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2,
+               query, key, weights, q_scale, k_scale,
+               aslq, aslk, null_opt, null_opt, null_opt,
+               block_table, null_opt, meta_t,
+               topk, quant_mode,
+               max_seqlen_q,
+               lq, lk,
+               mask_mode, cmp_ratio, return_value,
+               idx_out, val_out);
+  return idx_out;
+}
+
+// Public impl: runs metadata then main, returns idx_out.
+at::Tensor quant_lightning_indexer_v2_impl_npu(
+    const at::Tensor& query, const at::Tensor& key,
+    const at::Tensor& weights, const at::Tensor& q_scale, const at::Tensor& k_scale,
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    const at::Tensor& block_table,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t topk, int64_t quant_mode,
+    std::string layout_q, std::string layout_k,
+    int64_t mask_mode, int64_t cmp_ratio, int64_t return_value) {
+  auto q_sizes = query.sizes().vec();
+  const int64_t batch_size = q_sizes[0];
+  const int64_t max_seq_q = q_sizes[1];
+  const int64_t max_seq_k = aslk.max().item<int64_t>();
+  const int64_t QLI_V2_META_SIZE = 1024;
+  auto opts_i32 = query.options().dtype(at::kInt);
+  at::Tensor meta_t = at::empty({QLI_V2_META_SIZE}, opts_i32.device(query.device()));
+  char* lq = const_cast<char*>(layout_q.c_str());
+  char* lk = const_cast<char*>(layout_k.c_str());
+  // Step 1: metadata
+  at::Tensor emptyTensor;
+  at::Tensor cmpResidualK = (cmp_ratio != 1 && mask_mode == 3)
+      ? at::zeros({batch_size}, opts_i32.device(query.device()))
+      : emptyTensor;
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata,
+               emptyTensor, emptyTensor, aslq, aslk, cmpResidualK,
+               num_heads_q, num_heads_k, head_dim,
+               topk, quant_mode,
+               batch_size, max_seq_q, max_seq_k,
+               lq, lk,
+               mask_mode, cmp_ratio,
+               meta_t);
+  // Step 2: main
+  at::Tensor idx_out = quant_lightning_indexer_v2_main_helper(
+      query, key, weights, q_scale, k_scale, aslq, aslk, block_table, meta_t,
+      num_heads_q, num_heads_k, head_dim,
+      topk, quant_mode, lq, lk,
+      mask_mode, cmp_ratio, return_value);
+  return idx_out;
+}
+
+// quant_lightning_indexer_v2_metadata (standalone entry)
+at::Tensor quant_lightning_indexer_v2_metadata_impl_npu(
+    const at::Tensor& aslq, const at::Tensor& aslk,
+    int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim,
+    int64_t batch_size, int64_t max_seq_q, int64_t max_seq_k,
+    std::string layout_q, std::string layout_k,
+    int64_t topk, int64_t quant_mode,
+    int64_t mask_mode, int64_t cmp_ratio) {
+  const int64_t QLI_V2_META_SIZE = 1024;
+  auto opts_i32 = aslq.options().dtype(at::kInt);
+  at::Tensor meta_t = at::empty({QLI_V2_META_SIZE}, opts_i32.device(aslq.device()));
+  char* lq = const_cast<char*>(layout_q.c_str());
+  char* lk = const_cast<char*>(layout_k.c_str());
+  at::Tensor emptyTensor;
+  at::Tensor cmpResidualK = (cmp_ratio != 1 && mask_mode == 3)
+      ? at::zeros({batch_size}, opts_i32.device(aslq.device()))
+      : emptyTensor;
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2Metadata,
+               emptyTensor, emptyTensor, aslq, aslk, cmpResidualK,
+               num_heads_q, num_heads_k, head_dim,
+               topk, quant_mode,
+               batch_size, max_seq_q, max_seq_k,
+               lq, lk,
+               mask_mode, cmp_ratio,
+               meta_t);
+  return meta_t;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("select_unshared_kv", &select_unshared_kv_impl_npu, "select_unshared_kv");
   m.def("cache_unshared_kv", &cache_unshared_kv_impl_npu, "cache_unshared_kv");
@@ -2085,4 +2192,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sparse_attn_sharedkv_metadata", &sparse_attn_sharedkv_metadata_impl_npu, "sparse_attn_sharedkv_metadata");
   m.def("quant_lightning_indexer_metadata", &quant_lightning_indexer_metadata_impl_npu, "quant_lightning_indexer_metadata");
   m.def("lightning_indexer_quant_metadata", &lightning_indexer_quant_metadata_impl_npu, "lightning_indexer_quant_metadata");
+  m.def("quant_lightning_indexer_v2", &quant_lightning_indexer_v2_impl_npu, "quant_lightning_indexer_v2");
+  m.def("quant_lightning_indexer_v2_main", &quant_lightning_indexer_v2_main_helper, "quant_lightning_indexer_v2_main");
+  m.def("quant_lightning_indexer_v2_metadata", &quant_lightning_indexer_v2_metadata_impl_npu, "quant_lightning_indexer_v2_metadata");
 }
