@@ -16,6 +16,7 @@
 #include <register/op_impl_registry.h>
 
 #include "err/ops_err.h"
+#include "err_compat.h"
 #include "log/log.h"
 
 using namespace ge;

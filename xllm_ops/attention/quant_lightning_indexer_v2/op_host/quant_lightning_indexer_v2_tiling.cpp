@@ -15,6 +15,7 @@
 
 #include "quant_lightning_indexer_v2_tiling.h"
 
+#include "err_compat.h"
 #include "../op_kernel/quant_lightning_indexer_v2_template_tiling_key.h"
 
 using namespace ge;
