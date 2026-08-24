@@ -705,3 +705,53 @@ def lightning_indexer_quant_metadata_npu(aslq, aslk,
         batch_size, max_seq_q, max_seq_k,
         layout_query, layout_key,
         sparse_count, sparse_mode, is_fd, pre_token, next_token, cmp_ratio)
+
+
+# quant_lightning_indexer_v2: two-stage (metadata + main) quantized indexer V2 with PA.
+#   query:(B,qSeq,numHeadsQ,headDim), key:(blockNum,blockSize,numHeadsK,headDim),
+#   weights:(B,qSeq,numHeadsQ), q_scale:(B,qSeq,numHeadsQ),
+#   k_scale:(blockNum,blockSize,numHeadsK),
+#   actual_seq_lengths_query/key:(B,) int32, block_table:(B,maxBlocks) int32,
+#   metadata: int32 tensor of size 1024.
+#   Output: sparse_indices (B, qSeq, numHeadsK, topk) int32.
+def quant_lightning_indexer_v2_npu(query, key, weights, q_scale, k_scale,
+                                    actual_seq_lengths_query, actual_seq_lengths_key,
+                                    block_table, metadata,
+                                    num_heads_q=64, num_heads_k=1, head_dim=128,
+                                    topk=2048, quant_mode=1,
+                                    layout_q="BSND", layout_k="PA_BSND",
+                                    mask_mode=3, cmp_ratio=1,
+                                    return_value=0):
+    return custom_ops_lib.quant_lightning_indexer_v2(
+        query, key, weights, q_scale, k_scale,
+        actual_seq_lengths_query, actual_seq_lengths_key,
+        None, None,  # seqused_q, seqused_k (unused, pass None)
+        None,       # cmp_residual_k (optional)
+        block_table,
+        None,       # output_idx_offset (optional)
+        metadata,
+        num_heads_q, num_heads_k, head_dim,
+        topk, quant_mode,
+        layout_q, layout_k,
+        mask_mode, cmp_ratio, return_value)
+
+
+# quant_lightning_indexer_v2_metadata: AICPU metadata op for quant_lightning_indexer_v2.
+#   Computes tiling/scheduling metadata for two-stage quantized indexer V2.
+#   Output: int32 tensor of size 1024 (opaque scheduling metadata).
+def quant_lightning_indexer_v2_metadata_npu(actual_seq_lengths_query, actual_seq_lengths_key,
+                                             num_heads_q=64, num_heads_k=1, head_dim=128,
+                                             batch_size=1, max_seqlen_q=4, max_seqlen_k=128,
+                                             layout_q="BSND", layout_k="PA_BSND",
+                                             topk=2048, quant_mode=1,
+                                             mask_mode=3, cmp_ratio=1,
+                                             return_value=0):
+    return custom_ops_lib.quant_lightning_indexer_v2_metadata(
+        actual_seq_lengths_query, actual_seq_lengths_key,
+        None, None,  # seqused_q, seqused_k (unused)
+        None,       # cmp_residual_k (optional)
+        num_heads_q, num_heads_k, head_dim,
+        batch_size, max_seqlen_q, max_seqlen_k,
+        layout_q, layout_k,
+        topk, quant_mode,
+        mask_mode, cmp_ratio, return_value)
