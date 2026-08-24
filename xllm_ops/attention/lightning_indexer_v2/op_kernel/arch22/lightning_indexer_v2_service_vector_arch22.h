@@ -9,18 +9,18 @@
   */
 
 /*!
- * \file lightning_indexer_v2_service_vector.h
+ * \file lightning_indexer_v2_service_vector_arch22.h
  * \brief Vector核服务类：加权ReLU求和(DoScale/DoReduce)、TopK排序(SortAll/MergeSort)、LD归约(ProcessLD)、输出写回
  */
-#ifndef LIGHTNING_INDEXER_V2_SERVICE_VECTOR_H
-#define LIGHTNING_INDEXER_V2_SERVICE_VECTOR_H
+#ifndef LIGHTNING_INDEXER_V2_SERVICE_VECTOR_ARCH22_H
+#define LIGHTNING_INDEXER_V2_SERVICE_VECTOR_ARCH22_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_v2_common.h"
+#include "lightning_indexer_v2_common_arch22.h"
 #include "lightning_indexer_v2_vector.h"
 
 namespace LIV2Kernel {
@@ -687,4 +687,4 @@ __aicore__ inline void LightningIndexerV2ServiceVector<LIT>::ProcessLD()
     }
 }
 } // namespace LIV2Kernel
-#endif // LIGHTNING_INDEXER_V2_SERVICE_VECTOR_H
+#endif // LIGHTNING_INDEXER_V2_SERVICE_VECTOR_ARCH22_H

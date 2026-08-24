@@ -13,7 +13,7 @@
  * \brief
  */
 
-#include "cann_oploge_compat.h"
+#include "log/log.h"
 #include "opdev/format_utils.h"
 #include "opdev/op_log.h"
 #include "opdev/data_type_utils.h"
@@ -177,11 +177,10 @@ aclnnStatus CheckSingleParamQliV2(int64_t numHeadsQ, int64_t numHeadsK, int64_t 
         OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "layout_k", "Layout_k is null");
         return ACLNN_ERR_PARAM_INVALID;
     }
-    if ((strcmp(layoutKOptional, "PA_BBND") != 0) && (strcmp(layoutKOptional, "PA_BSND") != 0) &&
-        (strcmp(layoutQOptional, layoutKOptional) != 0)) {
+    if ((strcmp(layoutKOptional, "PA_BBND") != 0) && (strcmp(layoutQOptional, layoutKOptional) != 0)) {
         OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "layout_q and layout_k",
                                                std::string(layoutQOptional) + " and " + std::string(layoutKOptional),
-                                               "For layout_k != PA_BBND/PA_BSND, layout_q and layout_k must be the same");
+                                               "For layout_k != PA_BBND, layout_q and layout_k must be the same");
         return ACLNN_ERR_PARAM_INVALID;
     }
     // 校验 A2/A3 参数
@@ -239,9 +238,9 @@ aclnnStatus CheckSingleParamQliV2(int64_t numHeadsQ, int64_t numHeadsK, int64_t 
             return ACLNN_ERR_PARAM_INVALID;
         }
         if ((strcmp(layoutKOptional, "TND") != 0) && (strcmp(layoutKOptional, "BSND") != 0) &&
-            (strcmp(layoutKOptional, "PA_BBND") != 0) && (strcmp(layoutKOptional, "PA_BSND") != 0)) {
+            (strcmp(layoutKOptional, "PA_BBND") != 0)) {
             OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "layout_k", layoutKOptional,
-                                                  "The value of layout_k must be in [TND, BSND, PA_BBND, PA_BSND]");
+                                                  "The value of layout_k must be in [TND, BSND, PA_BBND]");
             return ACLNN_ERR_PARAM_INVALID;
         }
     }
@@ -276,10 +275,9 @@ aclnnStatus CheckExistenceQliV2(int64_t maskMode, int64_t cmpRatio, const aclTen
                                 const char *layoutKOptional, const aclTensor *metadata)
 {
     // cu_seqlens_q 存在性校验
-    if ((strcmp(layoutQOptional, "TND") == 0) && !IsTensorExistQliV2(cuSeqlensQOptional) &&
-        !IsTensorExistQliV2(sequsedQOptional)) {
+    if ((strcmp(layoutQOptional, "TND") == 0) && !IsTensorExistQliV2(cuSeqlensQOptional)) {
         OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "cu_seqlens_q",
-                                                 "When layout_q is TND, cu_seqlens_q or seqused_q must be provided");
+                                                 "When layout_q is TND, cu_seqlens_q must be provided");
         return ACLNN_ERR_PARAM_INVALID;
     }
     // layout_q BSND, seqused_q 不存在时，max_seqlen_q 不能为-1
@@ -290,17 +288,15 @@ aclnnStatus CheckExistenceQliV2(int64_t maskMode, int64_t cmpRatio, const aclTen
         return ACLNN_ERR_PARAM_INVALID;
     }
     // cu_seqlens_k 存在性校验
-    if ((strcmp(layoutKOptional, "TND") == 0) && !IsTensorExistQliV2(cuSeqlensKOptional) &&
-        !IsTensorExistQliV2(sequsedKOptional)) {
+    if ((strcmp(layoutKOptional, "TND") == 0) && !IsTensorExistQliV2(cuSeqlensKOptional)) {
         OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "cu_seqlens_k",
-                                                 "When layout_k is TND, cu_seqlens_k or seqused_k must be provided");
+                                                 "When layout_k is TND, cu_seqlens_k must be provided");
         return ACLNN_ERR_PARAM_INVALID;
     }
     // seqused_k 存在性校验
-    if ((strcmp(layoutKOptional, "PA_BBND") == 0 || strcmp(layoutKOptional, "PA_BSND") == 0) &&
-        !IsTensorExistQliV2(sequsedKOptional)) {
+    if ((strcmp(layoutKOptional, "PA_BBND") == 0) && !IsTensorExistQliV2(sequsedKOptional)) {
         OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(QLI_V2_ACLNN_OP_NAME, "seqused_k",
-                                                 "When layout_k is PA_BBND/PA_BSND, seqused_k must be provided");
+                                                 "When layout_k is PA_BBND, seqused_k must be provided");
         return ACLNN_ERR_PARAM_INVALID;
     }
     // layout_k BSND, seqused_k 不存在时，max_seqlen_k 不能为-1
@@ -456,8 +452,7 @@ aclnnStatus CheckConsistencyQliV2(int64_t batchSize, const aclTensor *cuSeqlensQ
         return ACLNN_ERR_PARAM_INVALID;
     }
     // 校验TND场景q维度一致性
-    if (strcmp(layoutQOptional, "TND") == 0 && IsTensorExistQliV2(sequsedQOptional) &&
-        IsTensorExistQliV2(cuSeqlensQOptional)) {
+    if (strcmp(layoutQOptional, "TND") == 0 && IsTensorExistQliV2(sequsedQOptional)) {
         int64_t cuSeqlensQBatchSize = cuSeqlensQOptional->GetViewShape().GetDim(0) - 1;
         CHECK_COND(
             cuSeqlensQBatchSize == queryBatchSize, ACLNN_ERR_PARAM_INVALID,
@@ -475,8 +470,7 @@ aclnnStatus CheckConsistencyQliV2(int64_t batchSize, const aclTensor *cuSeqlensQ
         }
     }
     // 校验TND场景k维度一致性
-    if (strcmp(layoutKOptional, "TND") == 0 && IsTensorExistQliV2(sequsedKOptional) &&
-        IsTensorExistQliV2(cuSeqlensKOptional)) {
+    if (strcmp(layoutKOptional, "TND") == 0 && IsTensorExistQliV2(sequsedKOptional)) {
         int64_t cuSeqlensKBatchSize = cuSeqlensKOptional->GetViewShape().GetDim(0) - 1;
         if (cuSeqlensKBatchSize != keyBatchSize) {
             OP_LOGE_FOR_INVALID_SHAPESIZES_WITH_REASON(
@@ -489,10 +483,7 @@ aclnnStatus CheckConsistencyQliV2(int64_t batchSize, const aclTensor *cuSeqlensQ
         }
     }
     // 校验 cmp_residual_k 元素数
-    int64_t cmpResidualKBatch = -1;
-    if (IsTensorExistQliV2(cmpResidualKOptional)) {
-        cmpResidualKBatch = cmpResidualKOptional->GetViewShape().GetDim(0);
-    }
+    auto cmpResidualKBatch = cmpResidualKOptional->GetViewShape().GetDim(0);
     if (IsTensorExistQliV2(cmpResidualKOptional) && (cmpResidualKBatch != queryBatchSize)) {
         if (IsTensorSourceQLiV2(querySource)) {
             OP_LOGE_FOR_INVALID_SHAPESIZES_WITH_REASON(

@@ -9,12 +9,12 @@
  */
 
 /*!
-* \file vf_topk_16_gather.h
+* \file vf_topk_16_gather_quant_v2.h
 * \brief
 */
 
-#ifndef VF_TOPK_16_GATHER_H
-#define VF_TOPK_16_GATHER_H
+#ifndef VF_TOPK_16_GATHER_QUANT_V2_H
+#define VF_TOPK_16_GATHER_QUANT_V2_H
 
 namespace topkb16gather {
 
@@ -511,4 +511,4 @@ __aicore__ inline void LiTopKLDGatherVF(const LocalTensor<uint32_t>& outputIdxLo
     FindLDRealIndexVFImpl(outputIdxBuf, tmpIdxBuf, hisIdxBuf, topkLoopNum32);
 }
 }
-#endif  // VF_TOPK_16_GATHER_H
+#endif  // VF_TOPK_16_GATHER_QUANT_V2_H

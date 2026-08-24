@@ -9,18 +9,18 @@
   */
 
 /*!
- * \file lightning_indexer_v2_service_vector.h
+ * \file lightning_indexer_v2_service_vector_arch35.h
  * \brief
  */
-#ifndef LIGHTNING_INDEXER_V2_SERVICE_VECTOR_H
-#define LIGHTNING_INDEXER_V2_SERVICE_VECTOR_H
+#ifndef LIGHTNING_INDEXER_V2_SERVICE_VECTOR_ARCH35_H
+#define LIGHTNING_INDEXER_V2_SERVICE_VECTOR_ARCH35_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_v2_common.h"
+#include "lightning_indexer_v2_common_arch35.h"
 #include "../arch35/vf/lightning_indexer_v2_vector1.h"
 #include "../arch35/vf/lightning_indexer_v2_topk.h"
 

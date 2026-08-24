@@ -24,7 +24,6 @@
 #include "err/ops_err.h"
 #include "platform/platform_info.h"
 #include "op_host/tiling_util.h"
-#include "cann_oploge_compat.h"
 
 namespace optiling {
 // ------------------公共定义--------------------------

@@ -9,18 +9,18 @@
   */
 
 /*!
- * \file lightning_indexer_v2_service_cube.h
+ * \file lightning_indexer_v2_service_cube_arch35.h
  * \brief use 5 buffer for matmul l1, better pipeline
  */
-#ifndef LIGHTNING_INDEXER_V2_SERVICE_CUBE_H
-#define LIGHTNING_INDEXER_V2_SERVICE_CUBE_H
+#ifndef LIGHTNING_INDEXER_V2_SERVICE_CUBE_ARCH35_H
+#define LIGHTNING_INDEXER_V2_SERVICE_CUBE_ARCH35_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_v2_common.h"
+#include "lightning_indexer_v2_common_arch35.h"
 
 namespace LIV2Kernel {
 using namespace LIV2Common;

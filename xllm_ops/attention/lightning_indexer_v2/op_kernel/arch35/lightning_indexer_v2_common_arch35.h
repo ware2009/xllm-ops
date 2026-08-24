@@ -9,11 +9,11 @@
   */
 
 /*!
- * \file lightning_indexer_v2_common.h
+ * \file lightning_indexer_v2_common_arch35.h
  * \brief
  */
-#ifndef LIGHTNING_INDEXER_V2_COMMON_H
-#define LIGHTNING_INDEXER_V2_COMMON_H
+#ifndef LIGHTNING_INDEXER_V2_COMMON_ARCH35_H
+#define LIGHTNING_INDEXER_V2_COMMON_ARCH35_H
 using namespace AscendC;
 namespace LIV2Common {
 

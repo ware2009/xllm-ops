@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file quant_lightning_indexer_v2_kernel.h
+ * \file quant_lightning_indexer_v2_kernel_arch22.h
  * \brief
  */
 
@@ -21,9 +21,9 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "quant_lightning_indexer_v2_common.h"
-#include "quant_lightning_indexer_v2_service_vector.h"
-#include "quant_lightning_indexer_v2_service_cube.h"
+#include "quant_lightning_indexer_v2_common_arch22.h"
+#include "quant_lightning_indexer_v2_service_vector_arch22.h"
+#include "quant_lightning_indexer_v2_service_cube_arch22.h"
 #include "../quant_lightning_indexer_v2_metadata.h"
 
 namespace QLIV2Kernel {

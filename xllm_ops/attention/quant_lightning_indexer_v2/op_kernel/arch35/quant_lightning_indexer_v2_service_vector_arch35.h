@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file quant_lightning_indexer_v2_service_vector.h
+ * \file quant_lightning_indexer_v2_service_vector_arch35.h
  * \brief
  */
 #ifndef QUANT_LIGHTNING_INDEXER_V2_SERVICE_VECTOR_H
@@ -20,7 +20,7 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "quant_lightning_indexer_v2_common.h"
+#include "quant_lightning_indexer_v2_common_arch35.h"
 #include "../arch35/vf/quant_lightning_indexer_v2_vector1.h"
 #include "../arch35/vf/quant_lightning_indexer_v2_topk.h"
 

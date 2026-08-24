@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file quant_lightning_indexer_v2_common.h
+ * \file quant_lightning_indexer_v2_common_arch35.h
  * \brief
  */
 #ifndef QUANT_LIGHTNING_INDEXER_V2_COMMON_H

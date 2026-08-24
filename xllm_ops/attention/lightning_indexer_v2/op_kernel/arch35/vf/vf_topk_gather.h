@@ -9,12 +9,12 @@
   */
 
 /*!
-* \file vf_topk_gather.h
+* \file vf_topk_gather_v2.h
 * \brief
 */
 
-#ifndef LI_V2_VF_TOP_K_GATHER_H
-#define LI_V2_VF_TOP_K_GATHER_H
+#ifndef VF_TOPK_GATHER_V2_H
+#define VF_TOPK_GATHER_V2_H
 
 namespace liV2Topkb32gather {
 template<typename T>

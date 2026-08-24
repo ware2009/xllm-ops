@@ -9,21 +9,21 @@
   */
 
 /*!
- * \file lightning_indexer_v2_kernel.h
+ * \file lightning_indexer_v2_kernel_arch22.h
  * \brief LIV2主Kernel类：初始化Tiling/Buffer、分核(SplitCore)、主循环(ProcessMain)、基本块处理(ProcessBaseBlock)、LD归约(ProcessDecode)
  */
 
-#ifndef LIGHTNING_INDEXER_V2_KERNEL_H
-#define LIGHTNING_INDEXER_V2_KERNEL_H
+#ifndef LIGHTNING_INDEXER_V2_KERNEL_ARCH22_H
+#define LIGHTNING_INDEXER_V2_KERNEL_ARCH22_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_v2_common.h"
-#include "lightning_indexer_v2_service_vector.h"
-#include "lightning_indexer_v2_service_cube.h"
+#include "lightning_indexer_v2_common_arch22.h"
+#include "lightning_indexer_v2_service_vector_arch22.h"
+#include "lightning_indexer_v2_service_cube_arch22.h"
 
 namespace LIV2Kernel {
 using namespace LIV2Common;
@@ -739,4 +739,4 @@ __aicore__ inline void LightningIndexerV2Kernel<LIT>::ProcessDecode()
     }
 }
 } // namespace LIV2Kernel
-#endif // LIGHTNING_INDEXER_V2_KERNEL_H
+#endif // LIGHTNING_INDEXER_V2_KERNEL_ARCH22_H

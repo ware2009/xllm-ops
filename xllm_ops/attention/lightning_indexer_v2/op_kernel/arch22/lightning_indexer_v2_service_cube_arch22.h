@@ -9,18 +9,18 @@
   */
 
 /*!
- * \file lightning_indexer_v2_service_cube.h
+ * \file lightning_indexer_v2_service_cube_arch22.h
  * \brief Cube核Matmul服务：5-buffer L1流水线，支持Nd2Nz搬运、L0a/L0b加载、L0c计算(Mmad)、Fixp写回，支持PA场景
  */
-#ifndef LIGHTNING_INDEXER_V2_SERVICE_CUBE_H
-#define LIGHTNING_INDEXER_V2_SERVICE_CUBE_H
+#ifndef LIGHTNING_INDEXER_V2_SERVICE_CUBE_ARCH22_H
+#define LIGHTNING_INDEXER_V2_SERVICE_CUBE_ARCH22_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_v2_common.h"
+#include "lightning_indexer_v2_common_arch22.h"
 
 namespace LIV2Kernel {
 using namespace LIV2Common;
@@ -424,4 +424,4 @@ __aicore__ inline void LightningIndexerV2ServiceCube<LIT>::FreeEventID()
     WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
 }
 } // namespace LIV2Kernel
-#endif // LIGHTNING_INDEXER_V2_SERVICE_CUBE_H
+#endif // LIGHTNING_INDEXER_V2_SERVICE_CUBE_ARCH22_H

@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file quant_lightning_indexer_v2_service_cube.h
+ * \file quant_lightning_indexer_v2_service_cube_arch35.h
  * \brief use 5 buffer for matmul l1, better pipeline
  */
 #ifndef QUANT_LIGHTNING_INDEXER_V2_SERVICE_CUBE_H
@@ -20,7 +20,7 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "quant_lightning_indexer_v2_common.h"
+#include "quant_lightning_indexer_v2_common_arch35.h"
 
 namespace QLIV2Kernel {
 using namespace QLIV2Common;

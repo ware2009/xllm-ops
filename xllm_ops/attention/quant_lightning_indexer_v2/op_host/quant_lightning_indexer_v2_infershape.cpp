@@ -17,7 +17,6 @@
 
 #include "err/ops_err.h"
 #include "log/log.h"
-#include "cann_oploge_compat.h"
 
 using namespace ge;
 

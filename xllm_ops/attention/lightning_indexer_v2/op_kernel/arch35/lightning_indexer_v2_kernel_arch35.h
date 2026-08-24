@@ -9,21 +9,21 @@
   */
 
 /*!
- * \file lightning_indexer_v2_kernel.h
+ * \file lightning_indexer_v2_kernel_arch35.h
  * \brief
  */
 
-#ifndef LIGHTNING_INDEXER_V2_KERNEL_H
-#define LIGHTNING_INDEXER_V2_KERNEL_H
+#ifndef LIGHTNING_INDEXER_V2_KERNEL_ARCH35_H
+#define LIGHTNING_INDEXER_V2_KERNEL_ARCH35_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_v2_common.h"
-#include "lightning_indexer_v2_service_vector.h"
-#include "lightning_indexer_v2_service_cube.h"
+#include "lightning_indexer_v2_common_arch35.h"
+#include "lightning_indexer_v2_service_vector_arch35.h"
+#include "lightning_indexer_v2_service_cube_arch35.h"
 #include "../lightning_indexer_v2_metadata.h"
 
 namespace LIV2Kernel {
@@ -917,4 +917,4 @@ __aicore__ inline void LightningIndexerV2Kernel<LIT>::ProcessDecode()
     }
 }
 }  // namespace LIKernel
-#endif  // LIGHTNING_INDEXER_V2_KERNEL_H
+#endif  // LIGHTNING_INDEXER_V2_KERNEL_ARCH35_H

@@ -33,12 +33,12 @@ public:
             .DataTypeList({ge::DT_FLOAT16})
             .FormatList({ge::FORMAT_ND})
             .IgnoreContiguous();
-        this->Input("actual_seq_lengths_query")
+        this->Input("cu_seqlens_q")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("actual_seq_lengths_key")
+        this->Input("cu_seqlens_k")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
@@ -120,12 +120,12 @@ public:
             .DataType({ge::DT_FLOAT, ge::DT_FLOAT8_E8M0, ge::DT_FLOAT, ge::DT_FLOAT8_E8M0, ge::DT_FLOAT16})
             .FormatList({ge::FORMAT_ND})
             .IgnoreContiguous();
-        aicore_config_95.Input("actual_seq_lengths_query")
+        aicore_config_95.Input("cu_seqlens_q")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        aicore_config_95.Input("actual_seq_lengths_key")
+        aicore_config_95.Input("cu_seqlens_k")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})

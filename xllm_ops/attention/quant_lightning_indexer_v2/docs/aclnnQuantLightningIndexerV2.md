@@ -175,6 +175,7 @@ aclnnStatus aclnnQuantLightningIndexerV2(
       <td>
           <ul>
                 <li>quantMode为3/5时，layout_query为BSND时shape为(B,S1,N1,D/64,2)，layout_query为TND时shape为(T1,N1,D/64,2)。</li>
+                <li>quantMode为4时，shape为(1,)。</li>
                 <li>其他场景shape与weights保持一致。</li>
           </ul>
       </td>
@@ -190,7 +191,8 @@ aclnnStatus aclnnQuantLightningIndexerV2(
       <td>
           <ul>
                 <li>quantMode为3/5时，layout_key为PA_BSND、BSND、TND对应的shape分别为(block_num,block_size,N2,D/64,2)、(B,K_S,N2,D/64,2)、(K_T,N2,D/64,2)。</li>
-                <li>其他场景下，layout_key为PA_BSND时shape为(block_num, block_size, N2)。</li>
+                <li>quantMode为4时，shape为(1,)。</li>
+                <li>其他场景下，layout_key为PA_BSND、BSND、TND对应的shape分别为(block_num,block_size,N2)、(B,K_S,N2)、(K_T,N2)。</li>
           </ul>
       </td>
       <td>支持0轴非连续</td>
@@ -280,7 +282,7 @@ aclnnStatus aclnnQuantLightningIndexerV2(
       <td>-</td>
       <td>INT32</td>
       <td>ND</td>
-      <td>-</td>
+      <td>layout_query为BSND时shape为(B,S1,N2)，layout_query为TND时shape为(T1,N2)。</td>
       <td>x</td>
     </tr>
     <tr>
@@ -301,7 +303,7 @@ aclnnStatus aclnnQuantLightningIndexerV2(
     <tr>
       <td>topk</td>
       <td>输入</td>
-      <td>topK阶段需要保留的block数量。</td>
+      <td>topK阶段需要保留的Key token索引数量。</td>
       <td>支持[1, 8192]。</td>
       <td>INT64</td>
       <td>-</td>
@@ -424,13 +426,12 @@ aclnnStatus aclnnQuantLightningIndexerV2(
       <td>公式中的Indices输出对应的value值。</td>
       <td>
           <ul>
-                <li>不支持空tensor。</li>
-                <li>仅当returnValue为1时输出有效值，否则输出bf16负无穷。</li>
+                <li>returnValue为1时输出有效值，无效部分填bf16负无穷；returnValue为0时输出shape为(0,)的空tensor。</li>
           </ul>
       </td>
       <td>BFLOAT16</td>
       <td>ND</td>
-      <td>shape与sparseIndicesOut保持一致。</td>
+      <td>returnValue为1时shape与sparseIndicesOut保持一致；returnValue为0时shape为(0,)。</td>
       <td>x</td>
     </tr>
     <tr>
@@ -472,6 +473,7 @@ aclnnStatus aclnnQuantLightningIndexerV2(
   - `layout_key` 仅支持 PA_BSND。
   - `quant_mode` 仅支持 2（Per-Token-Head量化）。
   - `cmp_ratio` 仅支持 2 的幂次方且范围为 [1, 128]，即 1/2/4/8/16/32/64/128。
+  - 不支持 `outputIdxOffsetOptional`。
   - 不支持 `return_value`。
   - query 和 key：支持 INT8，不支持 FLOAT8_e4m3fn、HIFLOAT8 和 FLOAT4_e2m1。
   - query_dequant_scale 和 key_dequant_scale：支持 FLOAT16，不支持 FLOAT32 和 FLOAT8_e8m0。
@@ -559,6 +561,7 @@ aclnnStatus aclnnQuantLightningIndexerV2(
 - block_size 取值为 16 的倍数，最大支持 1024。
 - 当 `layout_key` 不为 PA_BSND 时，`layout_query` 和 `layout_key` 必须一致。
 - 当 `quant_mode` 为 3/5 时，`queryDequantScale` 和 `keyDequantScale` 的维数分别比 `query` 和 `key` 多 1，前缀维度保持一致，末两维为(D/64, 2)；D必须为64的倍数，每个scale对应D轴上连续32个逻辑元素。
+- 当传入的参数layout_query为TND时，必须传入cuSeqlensQOptional，如果也传入sequsedQOptional，应保证由sequsedQOptional传入的各个batch的query长度不超过根据cuSeqlensQOptional计算出的各个batch的q序列长度。当某个batch由sequsedQOptional传入的q序列长度seqlen1小于由cuSeqlensQOptional计算出的query长度seqlen2时，会启用TND Padding功能，将该batch的seqlen2与seqlen1差值部分的query输出的sparseIndices和sparseValues全部置为无效值。部分长序列场景下，如果需要填充的无效数据过多，由于硬件限制可能会导致aicore执行超时，可以通过(seqlen2 - seqlen1) * topk来计算需要填充的数据量，建议将这个数据量控制在4亿以内。
 - **确定性说明：** aclnnQuantLightningIndexerV2 默认确定性实现。
 
 ## 调用示例
@@ -587,6 +590,7 @@ aclnnStatus aclnnQuantLightningIndexerV2(
 #include "securec.h"
 #include "acl/acl.h"
 #include "aclnnop/aclnn_quant_lightning_indexer_v2.h"
+#include "aclnn/opdev/platform.h"
 
 using namespace std;
 
@@ -844,6 +848,9 @@ void CleanupResources(TensorResources& resources, void* workspaceAddr,
 } // namespace
 
 int main() {
+    if (op::GetCurrentPlatformInfo().GetCurNpuArch() != NpuArch::DAV_3510) {
+        return 0;
+    }
     int32_t deviceId = 0;
     aclrtStream stream = nullptr;
     TensorResources resources = {};

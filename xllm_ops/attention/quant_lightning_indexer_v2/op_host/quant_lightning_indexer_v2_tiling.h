@@ -23,7 +23,6 @@
 #include "register/tilingdata_base.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling/tiling_api.h"
-#include "cann_oploge_compat.h"
 #include "op_host/tiling_util.h"
 
 namespace optiling {
@@ -47,8 +46,8 @@ constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t WEIGTHS_INDEX = 2;
 constexpr uint32_t QUERY_DEQUANT_SCALE_INDEX = 3;
 constexpr uint32_t KEY_DEQUANT_SCALE_INDEX = 4;
-constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 5;
-constexpr uint32_t ACTUAL_SEQ_K_INDEX = 6;
+constexpr uint32_t CU_SEQLENS_Q_INDEX = 5;
+constexpr uint32_t CU_SEQLENS_K_INDEX = 6;
 constexpr uint32_t SEQUSED_Q_INDEX = 7;
 constexpr uint32_t SEQUSED_K_INDEX = 8;
 constexpr uint32_t CMP_RESIDUAL_K_INDEX = 9;
@@ -127,8 +126,8 @@ struct QLIV2ParaInfo {
     TilingRequiredParaInfo weights = {nullptr, nullptr};
     TilingRequiredParaInfo query_dequant_scale = {nullptr, nullptr};
     TilingRequiredParaInfo key_dequant_scale = {nullptr, nullptr};
-    TilingOptionalParaInfo actualSeqLensQ = {nullptr, nullptr};
-    TilingOptionalParaInfo actualSeqLensK = {nullptr, nullptr};
+    TilingOptionalParaInfo cuSeqLensQ = {nullptr, nullptr};
+    TilingOptionalParaInfo cuSeqLensK = {nullptr, nullptr};
     TilingOptionalParaInfo sequsedQ = {nullptr, nullptr};
     TilingOptionalParaInfo sequsedK = {nullptr, nullptr};
     TilingOptionalParaInfo cmpResidualK = {nullptr, nullptr};

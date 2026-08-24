@@ -9,11 +9,11 @@
   */
 
 /*!
- * \file lightning_indexer_v2_common.h
+ * \file lightning_indexer_v2_common_arch22.h
  * \brief LIV2公共定义：Layout枚举、类型模板LIV2Type、运行时信息RunInfo/ConstInfo/SplitCoreInfo、工具函数Align/Min/Max/CeilDiv
  */
-#ifndef LIGHTNING_INDEXER_V2_COMMON_H
-#define LIGHTNING_INDEXER_V2_COMMON_H
+#ifndef LIGHTNING_INDEXER_V2_COMMON_ARCH22_H
+#define LIGHTNING_INDEXER_V2_COMMON_ARCH22_H
 
 namespace LIV2Common {
 
@@ -145,4 +145,4 @@ __aicore__ inline T CeilDiv(T num, T rnd)
 }
 } // namespace LIV2Common
 
-#endif // LIGHTNING_INDEXER_V2_COMMON_H
+#endif // LIGHTNING_INDEXER_V2_COMMON_ARCH22_H

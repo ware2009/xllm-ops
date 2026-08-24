@@ -16,13 +16,15 @@ if (BUILD_WITH_INSTALLED_DEPENDENCY_CANN_PKG)
 
   # aicpu json
   file(GLOB_RECURSE JSON_FILE ${CMAKE_CURRENT_SOURCE_DIR}/*.json)
+  set_property(GLOBAL APPEND PROPERTY AICPU_JSON_FILES ${JSON_FILE})
 
   # aicpu cust kernel
   file(GLOB AICPU_SRC ${CMAKE_CURRENT_SOURCE_DIR}/*_aicpu*.cpp)
   message(STATUS "[quant_lightning_indexer_v2_metadata] Found aicpu sources: ${AICPU_SRC}, ascend dir: ${ASCEND_DIR}, ophsot name: ${OPHOST_NAME}")
 
   set(OBJ_NAME quant_lightning_indexer_v2_metadata_cust_obj)
-  add_aicpu_cust_kernel_modules(${OBJ_NAME} "${AICPU_SRC}" "${JSON_FILE}")
+  add_aicpu_cust_kernel_modules(${OBJ_NAME})
+  target_sources(${OBJ_NAME} PRIVATE ${AICPU_SRC})
 endif()
 
 if(UT_TEST_ALL OR OP_KERNEL_AICPU_UT)
