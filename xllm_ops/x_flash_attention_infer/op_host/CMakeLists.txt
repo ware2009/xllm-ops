@@ -15,11 +15,21 @@ if (BUILD_OPEN_PROJECT)
     )
 endif()
 
+string(TOLOWER "${SOC_VERSION}" _XFA_SOC_LOWER)
+string(TOLOWER "${ASCEND_COMPUTE_UNIT}" _XFA_UNIT_LOWER)
+if(_XFA_SOC_LOWER MATCHES "ascend950" OR _XFA_SOC_LOWER MATCHES "ascend310p5"
+   OR _XFA_UNIT_LOWER MATCHES "ascend950" OR _XFA_UNIT_LOWER MATCHES "ascend310p5")
+    set(XFA_CATLASS_ARCH_DEF "-DCATLASS_ARCH=3510")
+else()
+    set(XFA_CATLASS_ARCH_DEF "-DCATLASS_ARCH=2201")
+endif()
+
 add_ops_compile_options(
     OP_NAME XFlashAttentionInfer
     OPTIONS --cce-auto-sync=on
             -Wno-deprecated-declarations
             -Werror
+            ${XFA_CATLASS_ARCH_DEF}
             -I${CANN_3RD_LIB_PATH}/catlass/include
 )
 
