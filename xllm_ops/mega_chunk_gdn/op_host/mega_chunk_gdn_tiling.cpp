@@ -28,6 +28,9 @@ namespace {
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kChunkSize = 128;
 constexpr uint32_t kHalfBytes = 2;
+constexpr uint64_t kHWorkspacePadBytes = 512;
+constexpr uint64_t kHWorkspaceAlignmentBytes = 16 * 1024 * 1024;
+constexpr uint64_t kHWorkspaceMaxPhaseBytes = 8 * 1024 * 1024;
 
 enum InputIndex {
     Q_INDEX = 0,
@@ -63,7 +66,10 @@ uint64_t CalcUserWorkspaceBytes(uint32_t blockDim)
 {
     const uint64_t tileBytes = static_cast<uint64_t>(kChunkSize) * kChunkSize * kHalfBytes;
     constexpr uint64_t kWorkspaceTileCount = 11;
-    return static_cast<uint64_t>(blockDim) * kWorkspaceTileCount * tileBytes;
+    return static_cast<uint64_t>(blockDim) *
+               (kWorkspaceTileCount * tileBytes +
+                4 * kHWorkspacePadBytes) +
+           kHWorkspaceAlignmentBytes + kHWorkspaceMaxPhaseBytes;
 }
 
 std::string ShapeToString(const gert::Shape &shape)

@@ -138,6 +138,10 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
+        "mega_gdn_draft_decode"
+        "mega_gdn_decode"
+        "mega_gdn_mtp_decode"
+        "mega_gdn_prefill_op"
         "convert_kv_cache_format"
         "beam_search"
         "index_group_matmul"
@@ -191,6 +195,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "compressor"
         "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
         "quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2"
+        "quant_lightning_indexer_v2_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
@@ -199,6 +205,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "rms_norm_dynamic_quant"
         "inplace_partial_rotary_mul"
         "dispatch_ffn_combine"
+        "dispatch_gmm_combine_decode"
         "dequant_swiglu_quant"  ## 已在 CANN 中内置，见 aarch64-linux/include/aclnnop/aclnn_dequant_swiglu_quant.h
         "scatter_nd_update_v2"
 
@@ -208,6 +215,10 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
+        "mega_gdn_draft_decode"
+        "mega_gdn_decode"
+        "mega_gdn_mtp_decode"
+        "mega_gdn_prefill_op"
         "convert_kv_cache_format"
         "beam_search"
         "index_group_matmul"
@@ -286,6 +297,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
+        "mega_gdn_draft_decode"
+        "mega_gdn_decode"
+        "mega_gdn_mtp_decode"
         "convert_kv_cache_format"
         "beam_search"
         "index_group_matmul"
@@ -295,6 +309,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "moe_grouped_matmul_swiglu_quant"
         "pp_matmul_opt"
         "replace_token"
+        "mtp_prepare_next_draft"
         "reshape_and_cache_a5"
         "select_unshared_kv"
         # "x_attention_tl"  # A5 kernel not adapted
@@ -304,6 +319,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
          "multi_latent_attention"
         "laser_attention"
         "mega_chunk_gdn"
+        "mega_gdn_prefill_op"
         "layer_norm_fwd"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

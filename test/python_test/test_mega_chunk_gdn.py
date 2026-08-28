@@ -16,24 +16,37 @@ def _has_npu():
 pytestmark = pytest.mark.skipif(not _has_npu(), reason="NPU is required")
 
 
-SUPPORTED_HEAD_CONFIGS = [
-    pytest.param(2, 1, id="H2-Hg1"),
-    pytest.param(4, 2, id="H4-Hg2"),
-    pytest.param(6, 2, id="H6-Hg2"),
-    pytest.param(16, 4, id="H16-Hg4"),
-    pytest.param(16, 8, id="H16-Hg8"),
-    pytest.param(16, 16, id="H16-Hg16"),
-    pytest.param(24, 8, id="H24-Hg8"),
+QWEN35_TP_HEAD_CONFIGS = [
+    pytest.param(16, 16, id="V16-TP1"),
+    pytest.param(8, 8, id="V16-TP2"),
+    pytest.param(4, 4, id="V16-TP4"),
+    pytest.param(2, 2, id="V16-TP8"),
+    pytest.param(1, 1, id="V16-TP16"),
+    pytest.param(32, 16, id="V32-TP1"),
+    pytest.param(16, 8, id="V32-TP2"),
+    pytest.param(8, 4, id="V32-TP4"),
+    pytest.param(4, 2, id="V32-TP8"),
+    pytest.param(2, 1, id="V32-TP16"),
+    pytest.param(48, 16, id="V48-TP1"),
+    pytest.param(24, 8, id="V48-TP2"),
+    pytest.param(12, 4, id="V48-TP4"),
+    pytest.param(6, 2, id="V48-TP8"),
+    pytest.param(3, 1, id="V48-TP16"),
+    pytest.param(64, 16, id="V64-TP1"),
+    pytest.param(32, 8, id="V64-TP2"),
+    pytest.param(16, 4, id="V64-TP4"),
+    pytest.param(8, 2, id="V64-TP8"),
+    pytest.param(4, 1, id="V64-TP16"),
+]
+
+
+SUPPORTED_HEAD_CONFIGS = QWEN35_TP_HEAD_CONFIGS + [
     pytest.param(32, 4, id="H32-Hg4"),
-    pytest.param(32, 8, id="H32-Hg8"),
-    pytest.param(32, 16, id="H32-Hg16"),
     pytest.param(32, 32, id="H32-Hg32"),
     pytest.param(48, 8, id="H48-Hg8"),
     pytest.param(48, 12, id="H48-Hg12"),
-    pytest.param(48, 16, id="H48-Hg16"),
     pytest.param(64, 4, id="H64-Hg4"),
     pytest.param(64, 8, id="H64-Hg8"),
-    pytest.param(64, 16, id="H64-Hg16"),
 ]
 
 

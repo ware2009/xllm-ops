@@ -29,14 +29,14 @@
 // K/S ready.
 //
 // Inputs:
-//   K  [total_tokens, Hg, D] DTYPE_Q   — keys (BSND layout; GQA/MQA group heads)
-//   W  [total_tokens, H, D]  DTYPE_Q   — wy_fast output (BSND layout)
-//   U  [total_tokens, H, D]  DTYPE_Q   — values pre-residual (BSND layout)
+//   K  [total_tokens, Hg, D] ComputeT   — keys (BSND layout; GQA/MQA group heads)
+//   W  [total_tokens, H, D]  ComputeT   — wy_fast output (BSND layout)
+//   U  [total_tokens, H, D]  ComputeT   — values pre-residual (BSND layout)
 //   G  [H, total_tokens]     float  — pre-transposed cumulative gates
-//   S  [total_chunks, H, D, D] DTYPE_Q — per-chunk state snapshots (output)
-//   V  [total_tokens, H, D]  DTYPE_Q   — residual-corrected values (output)
-//   FS [batch, H, D, D]      DTYPE_Q   — final state per sequence (output)
-//   H0 [batch, H, D, D]      DTYPE_Q   — optional initial state per sequence
+//   S  [total_chunks, H, D, D] ComputeT — per-chunk state snapshots (output)
+//   V  [total_tokens, H, D]  ComputeT   — residual-corrected values (output)
+//   FS [batch, H, D, D]      ComputeT   — final state per sequence (output)
+//   H0 [batch, H, D, D]      ComputeT   — optional initial state per sequence
 //   workspace [per-core scratch]     — Cube↔Vec communication buffer
 //
 // NPU memory hierarchy:
@@ -53,7 +53,7 @@
 //   TLOAD(dst, gm)          — dst = gm_data        (DMA: GM→L1 or GM→UB)
 //   TSTORE(gm, src)         — gm_data = src        (DMA: UB/L0C→GM)
 //   TASSIGN(tile, addr)     — tile = memory[addr]   (bind tile to buffer address)
-//   TCVT(dst, src, mode)    — converts between float and DTYPE_Q
+//   TCVT(dst, src, mode)    — converts between float and ComputeT
 //   TMOV(dst, src)          — dst = src.clone()
 //   TADD(d, a, b)           — d = a + b
 //   TSUB(d, a, b)           — d = a - b
@@ -66,14 +66,15 @@
 //   TFILLPAD(dst, src)      — zero-fill L1 tile padding (for tail chunks)
 //   TEXTRACT(l0, l1, r, c)  — L1 sub-tile → L0A/L0B
 //   TRESHAPE(zn, nz)        — reinterpret layout NZ↔ZN (logical transpose, free)
-//   TMATMUL(C, A, B)        — C = A @ B (Cube GEMM, DTYPE_Q inputs → FP32 accum)
+//   TMATMUL(C, A, B)        — C = A @ B (Cube GEMM, ComputeT inputs → FP32 accum)
 //   set_flag/wait_flag      — pipe sync within same core
 //   ffts_cross_core_sync    — cross-core signal Cube↔Vec
 //   wait_flag_dev(flag)     — wait for cross-core signal
 //   GetValue(idx)           — read a single scalar from a UB tile (slow, use sparingly)
 //
 // ── Workspace memory layout (shared between Cube and Vec via GM) ──────
-// Each AI core has its own workspace region to avoid contention:
+// The workspace is field-major so adjacent cores do not all hit GM with the
+// same 128 KiB stride:
 //   WS_WS [C×D]:  Cube writes WS = W @ S here → Vec reads it
 //   WS_K  [D×C]:  Vec writes K_scaled here → Cube reads it for KV = K^T @ V
 //   WS_S  [D×D]:  Vec writes current state S here → Cube reads it for GEMM 1
@@ -91,7 +92,7 @@
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
+#include "gdn_sync.h"
 using namespace pto;
 
 #ifndef GDN_D
@@ -100,6 +101,10 @@ using namespace pto;
 
 #ifndef GDN_C
 #define GDN_C 128
+#endif
+
+#ifndef GDN_PAIR_DEBUG_STAGE
+#define GDN_PAIR_DEBUG_STAGE 0
 #endif
 
 #ifdef __CCE_AICORE__
@@ -284,24 +289,522 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
   wait_flag(PIPE_M, PIPE_FIX, war_event_id);
 }
 
+#if defined(__DAV_C220_CUBE__)
+template <int32_t D, int32_t C, int32_t FlagBase,
+          bool WaitStateReady = true, bool PublishReady = true>
+AICORE PTO_INLINE void paired_cube_ws(
+    __gm__ ComputeT *W_handle, __gm__ ComputeT *workspace_handle,
+    int64_t head, int64_t chunk_start, int32_t valid, int32_t H,
+    int64_t ws_ws_base, int64_t ws_s_base,
+    TileMatL1<ComputeT, D, D, D, D> &s_l1,
+    TileMatL1<ComputeT, C, D, C, D> &w_l1,
+    TileAcc<float, C, D, C, D> &ws_l0)
+{
+  if constexpr (WaitStateReady) {
+    wait_flag_dev(FlagBase + 3);
+  }
+
+  const int64_t w_offset = (chunk_start * H + head) * D;
+  {
+    GmShape2D w_shape(valid, D);
+    GmStride2D w_stride(H * D);
+    GmTensor2D<ComputeT> w_global(W_handle + w_offset, w_shape, w_stride);
+    TLOAD(w_l1, w_global);
+    if (valid != C) {
+      TFILLPAD(w_l1, w_l1);
+    }
+  }
+  set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+  {
+    GmShape2D s_shape(D, D);
+    GmStride2D s_stride(D);
+    GmTensor2D<ComputeT> s_global(workspace_handle + ws_s_base, s_shape,
+                                 s_stride);
+    TLOAD(s_l1, s_global);
+  }
+#ifdef MEGA_STOP_AFTER_H
+  if constexpr (GDN_PAIR_DEBUG_STAGE == 8) {
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID3);
+    ffts_cross_core_sync(PIPE_FIX,
+                         1 | (2 << 4) | (FlagBase << 8));
+    return;
+  }
+#endif
+
+#ifdef MEGA_STOP_AFTER_H
+  if constexpr (GDN_PAIR_DEBUG_STAGE == 14 ||
+                GDN_PAIR_DEBUG_STAGE == 15) {
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 14) {
+      ffts_cross_core_sync(PIPE_MTE2,
+                           1 | (2 << 4) | (FlagBase << 8));
+      return;
+    }
+    TileMatL0A<ComputeT, C, D, C, D> w_l0a;
+    TileMatL0B<ComputeT, D, D, D, D> s_l0b;
+    TASSIGN(w_l0a, 0);
+    TASSIGN(s_l0b, 0);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+    TEXTRACT(w_l0a, w_l1, 0, 0);
+    TEXTRACT(s_l0b, s_l1, 0, 0);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+    TMATMUL(ws_l0, w_l0a, s_l0b);
+    ffts_cross_core_sync(PIPE_M, 1 | (2 << 4) | (FlagBase << 8));
+    return;
+  }
+#endif
+
+  set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  gemm_v0<ComputeT, float, C, D, D, C, D, D, D, false, false>(
+      w_l1, s_l1, ws_l0, true);
+#ifdef MEGA_STOP_AFTER_H
+  if constexpr (GDN_PAIR_DEBUG_STAGE == 9) {
+    ffts_cross_core_sync(PIPE_M,
+                         1 | (2 << 4) | (FlagBase << 8));
+    return;
+  }
+#endif
+
+  {
+    GmShape2D ws_shape(C, D);
+    GmStride2D ws_stride(D);
+    GmTensor2D<ComputeT> ws_global(workspace_handle + ws_ws_base, ws_shape,
+                                  ws_stride);
+    DynAccTile<float, C, D> ws_store(C, D);
+    TASSIGN(ws_store, 0);
+    TSTORE(ws_global, ws_store);
+  }
+  if constexpr (PublishReady) {
+    ffts_cross_core_sync(PIPE_FIX,
+                         1 | (2 << 4) | (FlagBase << 8));
+  }
+}
+
+template <int32_t D, int32_t C>
+AICORE PTO_INLINE void paired_cube_qs(
+    __gm__ ComputeT *Q_handle, __gm__ ComputeT *S_handle, int64_t head,
+    int64_t head_g, int64_t chunk_start, int64_t chunk_offset, int32_t ci,
+    int32_t valid, int32_t H, int32_t Hg,
+    TileMatL1<ComputeT, D, D, D, D> &s_l1,
+    TileMatL1<ComputeT, C, D, C, D> &q_l1,
+    TileAcc<float, C, D, C, D> &ws_l0)
+{
+  constexpr int32_t DD = D * D;
+  const int64_t q_offset = (chunk_start * Hg + head_g) * D;
+  GmShape2D q_shape(valid, D);
+  GmStride2D q_stride(Hg * D);
+  GmTensor2D<ComputeT> q_global(Q_handle + q_offset, q_shape, q_stride);
+  DynMatL1<ComputeT, C, D> q_l1_load(valid, D);
+  TASSIGN(q_l1_load, D * D * static_cast<int32_t>(sizeof(ComputeT)));
+  TLOAD(q_l1_load, q_global);
+  if (valid != C) {
+    TFILLPAD(q_l1_load, q_l1_load);
+  }
+
+  set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  gemm_v0<ComputeT, float, C, D, D, C, D, D, D, false, false>(
+      q_l1, s_l1, ws_l0, true);
+
+  const int64_t qs_offset = ((chunk_offset + ci) * H + head) * DD;
+  GmShape2D qs_shape(C, D);
+  GmStride2D qs_stride(D);
+  GmTensor2D<ComputeT> qs_global(S_handle + qs_offset, qs_shape, qs_stride);
+  DynAccTile<float, C, D> qs_store(C, D);
+  TASSIGN(qs_store, 0);
+  TSTORE(qs_global, qs_store);
+}
+
+template <int32_t D, int32_t C, int32_t FlagBase,
+          bool WaitInputReady = true, bool PublishReady = true>
+AICORE PTO_INLINE void paired_cube_kv(
+    __gm__ ComputeT *V_handle, __gm__ ComputeT *workspace_handle,
+    int32_t valid, int32_t v_stride, int64_t v_offset,
+    int64_t ws_k_base, int64_t ws_kv_base,
+    TileMatL1<ComputeT, D, C, D, C> &k_l1,
+    TileMatL1<ComputeT, C, D, C, D> &v_l1,
+    TileAcc<float, D, D, D, D> &kv_l0)
+{
+  if constexpr (WaitInputReady) {
+    wait_flag_dev(FlagBase + 1);
+  }
+  {
+    GmShape2D k_shape(D, C);
+    GmStride2D k_stride(C);
+    GmTensor2D<ComputeT> k_global(workspace_handle + ws_k_base, k_shape,
+                                 k_stride);
+    DynMatL1<ComputeT, D, C> k_l1_load(D, C);
+    TASSIGN(k_l1_load,
+            (D * D + C * D) * static_cast<int32_t>(sizeof(ComputeT)));
+    TLOAD(k_l1_load, k_global);
+  }
+  {
+    GmShape2D v_shape(valid, D);
+    GmStride2D v_gm_stride(v_stride);
+    GmTensor2D<ComputeT> v_global(V_handle + v_offset, v_shape,
+                                 v_gm_stride);
+    DynMatL1<ComputeT, C, D> v_l1_load(valid, D);
+    TASSIGN(v_l1_load,
+            (D * D + C * D + D * C) *
+                static_cast<int32_t>(sizeof(ComputeT)));
+    TLOAD(v_l1_load, v_global);
+    if (valid != C) {
+      TFILLPAD(v_l1_load, v_l1_load);
+    }
+  }
+
+  set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+  gemm_v0<ComputeT, float, D, D, C, D, D, C, C, true, false>(
+      k_l1, v_l1, kv_l0, true);
+  {
+    GmShape2D kv_shape(D, D);
+    GmStride2D kv_stride(D);
+    GmTensor2D<ComputeT> kv_global(workspace_handle + ws_kv_base, kv_shape,
+                                  kv_stride);
+    DynAccTile<float, D, D> kv_store(D, D);
+    TASSIGN(kv_store, C * D * static_cast<int32_t>(sizeof(float)));
+    TSTORE(kv_global, kv_store);
+  }
+  if constexpr (PublishReady) {
+    ffts_cross_core_sync(
+        PIPE_FIX, 1 | (2 << 4) | ((FlagBase + 2) << 8));
+  }
+}
+#endif
+
+#if defined(__DAV_C220_VEC__)
+template <int32_t D, int32_t C, int32_t FlagBase,
+          bool PublishReady = true>
+AICORE PTO_INLINE void paired_vec_init_zero(
+    __gm__ ComputeT *S_handle, __gm__ ComputeT *workspace_handle,
+    int64_t head, int64_t chunk_offset, int32_t H, int32_t vid,
+    int64_t ws_s_base,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half)
+{
+  constexpr int32_t HalfC = C / 2;
+  constexpr int32_t DD = D * D;
+  TEXPANDS(state_ub, 0.0f);
+  TCVT(state_half, state_ub, pto::RoundMode::CAST_NONE);
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+  {
+    GmShape2D s_shape(HalfC, D);
+    GmStride2D s_stride(D);
+    GmTensor2D<ComputeT> s_global(
+        workspace_handle + ws_s_base + vid * HalfC * D, s_shape, s_stride);
+    TSTORE(s_global, state_half);
+  }
+  {
+    const int64_t s_out_offset = (chunk_offset * H + head) * DD;
+    GmShape2D s_out_shape(HalfC, D);
+    GmStride2D s_out_stride(D);
+    GmTensor2D<ComputeT> s_out_global(
+        S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
+        s_out_stride);
+    TSTORE(s_out_global, state_half);
+  }
+  if constexpr (PublishReady) {
+    ffts_cross_core_sync(
+        PIPE_MTE3, 1 | (2 << 4) | ((FlagBase + 3) << 8));
+  } else {
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+  }
+}
+
+template <int32_t D, int32_t C, int32_t FlagBase, int32_t GUbAddr,
+          int32_t CoeffUbAddr, int32_t UUbAddr>
+AICORE PTO_INLINE void paired_vec_front(
+    __gm__ ComputeT *K_handle, __gm__ ComputeT *U_handle,
+    __gm__ float *G_handle, __gm__ ComputeT *V_handle,
+    __gm__ ComputeT *workspace_handle, int64_t head, int64_t head_g,
+    int64_t chunk_start, int64_t valid, int32_t ci, int32_t H,
+    int32_t Hg, int64_t total_tokens, int32_t vid, int32_t v_stride,
+    int64_t v_head_base, int64_t v_chunk_stride, int64_t ws_ws_base,
+    int64_t ws_k_base,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D,
+                 pto::PadValue::Zero> &k_ub_half,
+    TileUbDataND<float, 1, C, 1, C, pto::PadValue::Zero> &g_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D,
+                 pto::PadValue::Zero> &u_ub_half,
+    TileUbDataND<float, C / 2, D, C / 2, D> &k_ub,
+    TileUbDataND<float, 1, 8, 1, 8> &g_last_tail_ub,
+    TileUbDataND<float, 1, 64, 1, 64> &coeff_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &u_ub,
+    TileUbDataND<float, C / 2, D, C / 2, D> &ws_ub)
+{
+  constexpr int32_t HalfC = C / 2;
+  constexpr int32_t ExpTailElements = 8;
+  const int32_t qkv_stride = H * D;
+  const int32_t k_stride = Hg * D;
+  int32_t valid_rows =
+      static_cast<int32_t>(valid - static_cast<int64_t>(vid) * HalfC);
+  if (valid_rows < 0) valid_rows = 0;
+  if (valid_rows > HalfC) valid_rows = HalfC;
+
+  const int64_t u_offset =
+      (chunk_start * H + head) * D + vid * HalfC * qkv_stride;
+  if (valid_rows > 0) {
+    GmShape2D u_shape(valid_rows, D);
+    GmStride2D u_stride(qkv_stride);
+    GmTensor2D<ComputeT> u_global(U_handle + u_offset, u_shape, u_stride);
+    TLOAD(u_ub_half, u_global);
+  } else {
+    TEXPANDS(u_ub, 0.0f);
+    TCVT(u_ub_half, u_ub, pto::RoundMode::CAST_NONE);
+  }
+
+  const int64_t k_offset =
+      (chunk_start * Hg + head_g) * D + vid * HalfC * k_stride;
+  if (valid_rows > 0) {
+    GmShape2D k_shape(valid_rows, D);
+    GmStride2D k_gm_stride(k_stride);
+    GmTensor2D<ComputeT> k_global(K_handle + k_offset, k_shape,
+                                 k_gm_stride);
+    TLOAD(k_ub_half, k_global);
+  } else {
+    TEXPANDS(k_ub, 0.0f);
+    TCVT(k_ub_half, k_ub, pto::RoundMode::CAST_NONE);
+  }
+
+  {
+    GmShape2D g_shape(1, static_cast<int32_t>(valid));
+    GmStride2D g_stride(1);
+    GmTensor2D<float> g_global(G_handle + head * total_tokens + chunk_start,
+                               g_shape, g_stride);
+    TLOAD(g_ub, g_global);
+  }
+
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  TCVT(k_ub, k_ub_half, pto::RoundMode::CAST_NONE);
+
+  TileUbDataND<float, 1, 64, 1, 64> g_ub_temp;
+  TASSIGN(g_ub_temp, GUbAddr + vid * 64 * sizeof(float));
+  set_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
+  const float g_last = g_ub.GetValue(static_cast<int32_t>(valid) - 1);
+  TADDS(coeff_ub, g_ub_temp, -g_last);
+  pipe_barrier(PIPE_V);
+  TNEG(coeff_ub, coeff_ub);
+  pipe_barrier(PIPE_V);
+  TEXP(coeff_ub, coeff_ub);
+  if (valid == C) {
+    TEXP(g_last_tail_ub, g_last_tail_ub);
+  } else {
+    TEXP(g_ub, g_ub);
+  }
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+  TileUbDataDN<float, HalfC, 1, HalfC, 1> coeff_col_ub;
+  TASSIGN(coeff_col_ub, CoeffUbAddr);
+  TileUbDataND<float, HalfC, D, HalfC, D> coeff_2d_ub;
+  TASSIGN(coeff_2d_ub, UUbAddr);
+  TROWEXPAND(coeff_2d_ub, coeff_col_ub);
+  pipe_barrier(PIPE_V);
+  TMUL(k_ub, k_ub, coeff_2d_ub);
+  pipe_barrier(PIPE_V);
+  TCVT(k_ub_half, k_ub, pto::RoundMode::CAST_NONE);
+  TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
+
+  wait_flag_dev(FlagBase);
+  {
+    GmShape2D ws_shape(HalfC, D);
+    GmStride2D ws_stride(D);
+    GmTensor2D<ComputeT> ws_global(
+        workspace_handle + ws_ws_base + vid * HalfC * D, ws_shape,
+        ws_stride);
+    TLOAD(u_ub_half, ws_global);
+  }
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  TCVT(ws_ub, u_ub_half, pto::RoundMode::CAST_NONE);
+  TSUB(u_ub, u_ub, ws_ub);
+  TCVT(u_ub_half, u_ub, pto::RoundMode::CAST_NONE);
+
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+  const int64_t v_offset =
+      v_head_base + static_cast<int64_t>(ci) * v_chunk_stride +
+      static_cast<int64_t>(vid) * HalfC * v_stride;
+  if (valid_rows > 0) {
+    GmShape2D v_shape(valid_rows, D);
+    GmStride2D v_gm_stride(v_stride);
+    GmTensor2D<ComputeT> v_global(V_handle + v_offset, v_shape,
+                                 v_gm_stride);
+    TSTORE(v_global, u_ub_half);
+  }
+  {
+    GmShape2D k_shape(HalfC, D);
+    GmStride2D k_ws_stride(D);
+    GmTensor2D<ComputeT> k_global(
+        workspace_handle + ws_k_base + vid * HalfC * D, k_shape,
+        k_ws_stride);
+    TSTORE(k_global, k_ub_half);
+  }
+  ffts_cross_core_sync(
+      PIPE_MTE3, 1 | (2 << 4) | ((FlagBase + 1) << 8));
+
+  set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+  const float exp_g_last =
+      valid == C ? g_last_tail_ub.GetValue(ExpTailElements - 1)
+                 : g_ub.GetValue(static_cast<int32_t>(valid) - 1);
+  TMULS(state_ub, state_ub, exp_g_last);
+  set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+}
+
+template <int32_t D, int32_t C, int32_t FlagBase>
+AICORE PTO_INLINE void paired_vec_finish(
+    __gm__ ComputeT *S_handle, __gm__ ComputeT *workspace_handle,
+    __gm__ int32_t *h_o_ready_handle, int64_t head,
+    int64_t chunk_offset, int32_t ci, int32_t num_chunks, int32_t H,
+    int32_t vid, int64_t ws_s_base, int64_t ws_kv_base,
+    bool emit_precomputed_qs,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half,
+    TileUbDataND<float, C / 2, D, C / 2, D> &kv_ub,
+    TileUbDataND<int32_t, 1, 8, 1, 8> &h_o_ready_ub)
+{
+  constexpr int32_t HalfC = C / 2;
+  constexpr int32_t DD = D * D;
+  constexpr int64_t H_O_READY_STRIDE = 16;
+  wait_flag_dev(FlagBase + 2);
+  if (emit_precomputed_qs && vid == 0) {
+    const int64_t ready_offset = head * H_O_READY_STRIDE;
+    h_o_ready_ub.SetValue(0, ci + 1);
+    set_flag(PIPE_S, PIPE_MTE3, EVENT_ID1);
+    wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID1);
+    GmShape2D ready_shape(1, 8);
+    GmStride2D ready_stride(8);
+    GmTensor2D<int32_t> ready_global(h_o_ready_handle + ready_offset,
+                                     ready_shape, ready_stride);
+    TSTORE(ready_global, h_o_ready_ub);
+  }
+  {
+    GmShape2D kv_shape(HalfC, D);
+    GmStride2D kv_stride(D);
+    GmTensor2D<ComputeT> kv_global(
+        workspace_handle + ws_kv_base + vid * HalfC * D, kv_shape,
+        kv_stride);
+    TLOAD(state_half, kv_global);
+  }
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+  TCVT(kv_ub, state_half, pto::RoundMode::CAST_NONE);
+  pipe_barrier(PIPE_ALL);
+  TADD(state_ub, state_ub, kv_ub);
+  TCVT(state_half, state_ub, pto::RoundMode::CAST_NONE);
+
+  if (ci + 1 < num_chunks) {
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    {
+      GmShape2D s_shape(HalfC, D);
+      GmStride2D s_stride(D);
+      GmTensor2D<ComputeT> s_global(
+          workspace_handle + ws_s_base + vid * HalfC * D, s_shape,
+          s_stride);
+      TSTORE(s_global, state_half);
+    }
+    const int64_t s_out_offset = ((chunk_offset + ci + 1) * H + head) * DD;
+    {
+      GmShape2D s_out_shape(HalfC, D);
+      GmStride2D s_out_stride(D);
+      GmTensor2D<ComputeT> s_out_global(
+          S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
+          s_out_stride);
+      TSTORE(s_out_global, state_half);
+    }
+    ffts_cross_core_sync(
+        PIPE_MTE3, 1 | (2 << 4) | ((FlagBase + 3) << 8));
+  }
+}
+
+template <int32_t D, int32_t C, bool StoreFinalStateCache>
+AICORE PTO_INLINE void paired_vec_store_final(
+    __gm__ ComputeT *FS_handle, __gm__ float *final_state_cache,
+    __gm__ int32_t *state_indices, int64_t head, int32_t H,
+    int32_t vid, int32_t state_index_stride, int64_t state_cache_slots,
+    int64_t output_final_state,
+    TileUbDataND<float, C / 2, D, C / 2, D> &state_ub,
+    TileUbDataND<ComputeT, C / 2, D, C / 2, D> &state_half)
+{
+  if (output_final_state == 0) return;
+  constexpr int32_t HalfC = C / 2;
+  constexpr int32_t DD = D * D;
+  TCVT(state_half, state_ub, pto::RoundMode::CAST_NONE);
+  set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+  if constexpr (StoreFinalStateCache) {
+    TCVT(state_ub, state_half, pto::RoundMode::CAST_NONE);
+    pipe_barrier(PIPE_V);
+    const int32_t state_index = state_indices[0] * state_index_stride;
+    if (state_index >= 0 && state_index < state_cache_slots) {
+      const int64_t cache_offset =
+          (static_cast<int64_t>(state_index) * H + head) * DD +
+          vid * HalfC * D;
+      GmShape2D cache_shape(HalfC, D);
+      GmStride2D cache_stride(D);
+      GmTensor2D<float> cache_global(final_state_cache + cache_offset,
+                                     cache_shape, cache_stride);
+      TSTORE(cache_global, state_ub);
+    }
+  } else {
+    const int64_t fs_offset = head * DD + vid * HalfC * D;
+    GmShape2D fs_shape(HalfC, D);
+    GmStride2D fs_stride(D);
+    GmTensor2D<ComputeT> fs_global(FS_handle + fs_offset, fs_shape,
+                                  fs_stride);
+    TSTORE(fs_global, state_half);
+  }
+  set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+  wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+}
+#endif
+
 } // namespace
 
 #endif
 
-template <int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize,
+          bool StoreFinalStateCache = false,
+          bool LoadInitialStateCache = false>
 AICORE void chunk_h_kernel(
-    __gm__ DTYPE_Q *K_handle, __gm__ DTYPE_Q *W_handle, __gm__ DTYPE_Q *U_handle,
+    __gm__ ComputeT *Q_handle, __gm__ ComputeT *K_handle,
+    __gm__ ComputeT *W_handle, __gm__ ComputeT *U_handle,
     __gm__ float *G_handle,
-    __gm__ DTYPE_Q *S_handle, __gm__ DTYPE_Q *V_handle, __gm__ DTYPE_Q *FS_handle,
-    __gm__ DTYPE_Q *H0_handle,
+    __gm__ ComputeT *S_handle, __gm__ ComputeT *V_handle, __gm__ ComputeT *FS_handle,
+    __gm__ ComputeT *H0_handle,
     int64_t has_initial_state,
     int64_t output_final_state,
-    __gm__ DTYPE_Q *workspace_handle,
+    __gm__ ComputeT *workspace_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     uint32_t num_heads,
     uint32_t num_key_heads,
-    uint64_t ffts_addr)
+    uint32_t precompute_qs,
+    __gm__ int32_t *h_o_ready_handle,
+    uint64_t ffts_addr,
+    __gm__ float *initial_state_cache,
+    __gm__ int32_t *initial_state_indices,
+    __gm__ float *final_state_cache,
+    __gm__ int32_t *state_indices,
+    int32_t state_index_stride,
+    int64_t state_cache_slots)
 {
   // chunk_h advances the recurrent hidden state chunk by chunk:
   //   ws_i      = W_i @ S_i
@@ -326,7 +829,7 @@ AICORE void chunk_h_kernel(
   //   Vec does the elementwise gating/decay and carries the running state.
   auto cid = get_block_idx();
   auto block_num = get_block_num();
-  set_ffts_base_addr(ffts_addr);
+  gdn_sync::InitAddress(ffts_addr);
 
   constexpr int32_t D = HiddenSize;
   constexpr int32_t C = ChunkSize;
@@ -346,22 +849,22 @@ AICORE void chunk_h_kernel(
   constexpr int32_t SecondL0CAddr = C * D * sizeof(float);
 #endif
 
-  constexpr int32_t WS_WS = 0;
-  constexpr int32_t WS_K  = DD;
-  constexpr int32_t WS_S  = DD * 2;
-  constexpr int32_t WS_KV = DD * 3;
-  constexpr int32_t WS_PER_CORE = DD * 4;
+  static_assert(GDN_H_WORKSPACE_PAD_BYTES % sizeof(ComputeT) == 0);
+  constexpr int32_t WS_FIELD_STRIDE =
+      DD + GDN_H_WORKSPACE_PAD_BYTES / sizeof(ComputeT);
 
-  TileMatL1<DTYPE_Q, D, D, D, D> s_l1;
+  TileMatL1<ComputeT, D, D, D, D> s_l1;
   TASSIGN(s_l1, 0);
-  TileMatL1<DTYPE_Q, C, D, C, D> w_l1;
-  TASSIGN(w_l1, D * D * sizeof(DTYPE_Q));
+  TileMatL1<ComputeT, C, D, C, D> w_l1;
+  TASSIGN(w_l1, D * D * sizeof(ComputeT));
+  TileMatL1<ComputeT, C, D, C, D> q_l1;
+  TASSIGN(q_l1, D * D * sizeof(ComputeT));
   TileAcc<float, C, D, C, D> ws_l0;
   TASSIGN(ws_l0, 0);
-  TileMatL1<DTYPE_Q, D, C, D, C> k_l1;
-  TASSIGN(k_l1, (DD + C * D) * sizeof(DTYPE_Q));
-  TileMatL1<DTYPE_Q, C, D, C, D> v_l1;
-  TASSIGN(v_l1, (DD + C * D + D * C) * sizeof(DTYPE_Q));
+  TileMatL1<ComputeT, D, C, D, C> k_l1;
+  TASSIGN(k_l1, (DD + C * D) * sizeof(ComputeT));
+  TileMatL1<ComputeT, C, D, C, D> v_l1;
+  TASSIGN(v_l1, (DD + C * D + D * C) * sizeof(ComputeT));
   TileAcc<float, D, D, D, D> kv_l0;
   TASSIGN(kv_l0, SecondL0CAddr);
 
@@ -372,32 +875,38 @@ AICORE void chunk_h_kernel(
       ChunkSize * 16 * static_cast<int32_t>(sizeof(float));
   constexpr int32_t S_UB = ZERO_UB + 64 * sizeof(float);
   constexpr int32_t K_UB_HALF = S_UB + HalfC * D * sizeof(float);
-  constexpr int32_t G_UB = K_UB_HALF + HalfC * D * sizeof(DTYPE_Q);
+  constexpr int32_t G_UB = K_UB_HALF + HalfC * D * sizeof(ComputeT);
   constexpr int32_t U_UB_HALF = G_UB + C * sizeof(float);
-  constexpr int32_t K_UB = U_UB_HALF + HalfC * D * sizeof(DTYPE_Q);
+  constexpr int32_t K_UB = U_UB_HALF + HalfC * D * sizeof(ComputeT);
   constexpr int32_t G_V_UB = K_UB + HalfC * D * sizeof(float);
   constexpr int32_t COEFF_UB = G_V_UB + 64 * sizeof(float);
   constexpr int32_t U_UB = COEFF_UB + 64 * sizeof(float);
-  constexpr int32_t WS_UB = U_UB + HalfC * D * sizeof(float);
+  // k_ub is dead after k_tilde is rounded to BF16. Reuse that 32 KiB region
+  // for W@S instead of keeping a second full FP32 tile live.
+  constexpr int32_t WS_UB = K_UB;
   constexpr int32_t KV_UB = U_UB_HALF;
-  constexpr int32_t S_UB_HALF = WS_UB + HalfC * D * sizeof(float);
+  constexpr int32_t S_UB_HALF = U_UB + HalfC * D * sizeof(float);
+  constexpr int32_t S_ALT_UB =
+      S_UB_HALF + HalfC * D * sizeof(ComputeT);
 
-  TileUbDataND<float, 1, 64, 1, 64> zero_ub;
-  TASSIGN(zero_ub, ZERO_UB);
   TileUbDataND<float, HalfC, D, HalfC, D> s_ub;
   TASSIGN(s_ub, S_UB);
-  TileUbDataND<DTYPE_Q, HalfC, D, HalfC, D, pto::PadValue::Zero> k_ub_half;
+  TileUbDataND<ComputeT, HalfC, D, HalfC, D, pto::PadValue::Zero> k_ub_half;
   TASSIGN(k_ub_half, K_UB_HALF);
   TileUbDataND<float, 1, C, 1, C, pto::PadValue::Zero> g_ub;
   TASSIGN(g_ub, G_UB);
-  TileUbDataND<DTYPE_Q, HalfC, D, HalfC, D> s_ub_half;
+  TileUbDataND<ComputeT, HalfC, D, HalfC, D> s_ub_half;
   TASSIGN(s_ub_half, S_UB_HALF);
-  TileUbDataND<DTYPE_Q, HalfC, D, HalfC, D, pto::PadValue::Zero> u_ub_half;
+  TileUbDataND<ComputeT, HalfC, D, HalfC, D, pto::PadValue::Zero> u_ub_half;
   TASSIGN(u_ub_half, U_UB_HALF);
   TileUbDataND<float, HalfC, D, HalfC, D> k_ub;
   TASSIGN(k_ub, K_UB);
-  TileUbDataND<float, 1, 64, 1, 64> g_v_ub;
-  TASSIGN(g_v_ub, G_V_UB);
+  constexpr int32_t ExpTailElements = 8;
+  TileUbDataND<float, 1, ExpTailElements, 1, ExpTailElements>
+      g_last_tail_ub;
+  TASSIGN(
+      g_last_tail_ub,
+      G_UB + (C - ExpTailElements) * static_cast<int32_t>(sizeof(float)));
   TileUbDataND<float, 1, 64, 1, 64> coeff_ub;
   TASSIGN(coeff_ub, COEFF_UB);
   TileUbDataND<float, HalfC, D, HalfC, D> u_ub;
@@ -406,18 +915,187 @@ AICORE void chunk_h_kernel(
   TASSIGN(ws_ub, WS_UB);
   TileUbDataND<float, HalfC, D, HalfC, D> kv_ub;
   TASSIGN(kv_ub, KV_UB);
+  TileUbDataND<float, HalfC, D, HalfC, D> s_alt_ub;
+  TASSIGN(s_alt_ub, S_ALT_UB);
 
   auto vid = get_subblockid();
+  constexpr int64_t H_O_READY_STRIDE = 16;
+  TileUbDataND<int32_t, 1, 8, 1, 8> h_o_ready_ub;
+  TASSIGN(h_o_ready_ub, ZERO_UB);
+  AscendC::GlobalTensor<int32_t> h_o_ready_gm;
+  h_o_ready_gm.SetGlobalBuffer(h_o_ready_handle);
 
   int64_t num_seqs = batch_size;
   int64_t total_work = num_seqs * H;
+  const int64_t paired_core_count = total_work - block_num;
+  const int64_t dense_chunk_count = total_tokens / C;
+  constexpr bool use_paired_head_pipeline = false;
 
 #if defined(__DAV_C220_CUBE__)
+  if (use_paired_head_pipeline && cid < paired_core_count) {
+    const int64_t head0 = cid;
+    const int64_t head1 = block_num + cid;
+    const int64_t head_g0 = head0 / GROUP;
+    const int64_t head_g1 = head1 / GROUP;
+    const int64_t bos = static_cast<int64_t>(cu_seqlens[0]);
+    const int64_t slen = static_cast<int64_t>(cu_seqlens[1]) - bos;
+    const int32_t num_chunks = static_cast<int32_t>(slen / C);
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_slot_span = 4 * ws_field_span;
+    const int64_t ws_ws_base0 = ws_core_offset;
+    const int64_t ws_k_base0 = ws_field_span + ws_core_offset;
+    const int64_t ws_s_base0 = 2 * ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base0 = 3 * ws_field_span + ws_core_offset;
+    const int64_t ws_ws_base1 = ws_slot_span + ws_ws_base0;
+    const int64_t ws_k_base1 = ws_slot_span + ws_k_base0;
+    const int64_t ws_s_base1 = ws_slot_span + ws_s_base0;
+    const int64_t ws_kv_base1 = ws_slot_span + ws_kv_base0;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+    const int64_t v_head_base0 = head0 * static_cast<int64_t>(C) * D;
+    const int64_t v_head_base1 = head1 * static_cast<int64_t>(C) * D;
+
+    wait_flag_dev(3);
+#ifdef MEGA_STOP_AFTER_H
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 1) return;
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 10) {
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 12) {
+      const int64_t w_offset = (bos * H + head0) * D;
+      GmShape2D w_shape(C, D);
+      GmStride2D w_stride(H * D);
+      GmTensor2D<ComputeT> w_global(W_handle + w_offset, w_shape, w_stride);
+      DynMatL1<ComputeT, C, D> w_l1_load(C, D);
+      TASSIGN(w_l1_load, D * D * static_cast<int32_t>(sizeof(ComputeT)));
+      TLOAD(w_l1_load, w_global);
+      ffts_cross_core_sync(PIPE_MTE2, 1 | (2 << 4) | (0 << 8));
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 13) {
+      const int64_t w_offset = (bos * H + head0) * D;
+      GmShape2D w_shape(C, D);
+      GmStride2D w_stride(H * D);
+      GmTensor2D<ComputeT> w_global(W_handle + w_offset, w_shape, w_stride);
+      DynMatL1<ComputeT, C, D> w_l1_load(C, D);
+      TASSIGN(w_l1_load, D * D * static_cast<int32_t>(sizeof(ComputeT)));
+      TLOAD(w_l1_load, w_global);
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+
+      GmShape2D s_shape(D, D);
+      GmStride2D s_stride(D);
+      GmTensor2D<ComputeT> s_global(workspace_handle + ws_s_base0, s_shape,
+                                   s_stride);
+      DynMatL1<ComputeT, D, D> s_l1_load(D, D);
+      TASSIGN(s_l1_load, 0);
+      TLOAD(s_l1_load, s_global);
+      ffts_cross_core_sync(PIPE_MTE2, 1 | (2 << 4) | (0 << 8));
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 15) {
+      const int64_t w_offset = (bos * H + head0) * D;
+      GmShape2D w_shape(C, D);
+      GmStride2D w_stride(H * D);
+      GmTensor2D<ComputeT> w_global(W_handle + w_offset, w_shape, w_stride);
+      DynMatL1<ComputeT, C, D> w_l1_load(C, D);
+      TASSIGN(w_l1_load, D * D * static_cast<int32_t>(sizeof(ComputeT)));
+      TLOAD(w_l1_load, w_global);
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+
+      GmShape2D s_shape(D, D);
+      GmStride2D s_stride(D);
+      GmTensor2D<ComputeT> s_global(workspace_handle + ws_s_base0, s_shape,
+                                   s_stride);
+      DynMatL1<ComputeT, D, D> s_l1_load(D, D);
+      TASSIGN(s_l1_load, 0);
+      TLOAD(s_l1_load, s_global);
+      set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID2);
+
+      TileMatL0A<ComputeT, C, D, C, D> w_l0a;
+      TileMatL0B<ComputeT, D, D, D, D> s_l0b;
+      TASSIGN(w_l0a, 0);
+      TASSIGN(s_l0b, 0);
+      set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+      wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
+      ffts_cross_core_sync(PIPE_MTE2, 1 | (2 << 4) | (0 << 8));
+      return;
+    }
+#endif
+    for (int32_t ci = 0; ci < num_chunks; ++ci) {
+      const int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
+      paired_cube_ws<D, C, 0, false, true>(
+          W_handle, workspace_handle, head0, chunk_start, C, H, ws_ws_base0,
+          ws_s_base0, s_l1, w_l1, ws_l0);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 2 ||
+                    GDN_PAIR_DEBUG_STAGE == 8 ||
+                    GDN_PAIR_DEBUG_STAGE == 9 ||
+                    GDN_PAIR_DEBUG_STAGE == 11 ||
+                    GDN_PAIR_DEBUG_STAGE == 14 ||
+                    GDN_PAIR_DEBUG_STAGE == 15)
+        return;
+#endif
+      paired_cube_qs<D, C>(Q_handle, S_handle, head0, head_g0, chunk_start, 0,
+                           ci, C, H, Hg, s_l1, q_l1, ws_l0);
+
+      paired_cube_ws<D, C, 4, false, false>(
+          W_handle, workspace_handle, head1, chunk_start, C, H, ws_ws_base1,
+          ws_s_base1, s_l1, w_l1, ws_l0);
+      wait_flag_dev(1);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 3) return;
+#endif
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (4 << 8));
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 4) return;
+#endif
+      paired_cube_qs<D, C>(Q_handle, S_handle, head1, head_g1, chunk_start, 0,
+                           ci, C, H, Hg, s_l1, q_l1, ws_l0);
+
+      paired_cube_kv<D, C, 0, false, false>(
+          V_handle, workspace_handle, C, D,
+          v_head_base0 + static_cast<int64_t>(ci) * v_chunk_stride,
+          ws_k_base0, ws_kv_base0, k_l1, v_l1, kv_l0);
+      wait_flag_dev(5);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 5) return;
+#endif
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 6) return;
+#endif
+
+      paired_cube_kv<D, C, 4, false, false>(
+          V_handle, workspace_handle, C, D,
+          v_head_base1 + static_cast<int64_t>(ci) * v_chunk_stride,
+          ws_k_base1, ws_kv_base1, k_l1, v_l1, kv_l0);
+      if (ci + 1 < num_chunks) {
+        wait_flag_dev(3);
+      }
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (6 << 8));
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 7) return;
+#endif
+      if (ci + 1 < num_chunks) {
+        wait_flag_dev(7);
+      }
+    }
+#ifndef MEGA_STOP_AFTER_H
+    wait_flag_dev(7);
+#endif
+  } else {
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
 
     int64_t head = pid % H;
+    int64_t head_g = head / GROUP;
     int64_t seq_idx = pid / H;
 
     int64_t bos, slen;
@@ -437,7 +1115,28 @@ AICORE void chunk_h_kernel(
       chunk_offset = seq_idx * ((seq_len + C - 1) / C);
     }
     int64_t num_chunks = (slen + C - 1) / C;
-    int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
+    const bool emit_precomputed_qs =
+        precompute_qs != 0 && C == D && H >= 8 &&
+        cu_seqlens != nullptr;
+    const bool use_packed_v =
+        emit_precomputed_qs && batch_size == 1 && (slen % C) == 0;
+    const int32_t v_stride =
+        use_packed_v ? D : BSND_QKV_STRIDE;
+    const int64_t v_head_base =
+        use_packed_v
+            ? (chunk_offset * H + head) *
+                  static_cast<int64_t>(C) * D
+            : (bos * H + head) * static_cast<int64_t>(D);
+    const int64_t v_chunk_stride =
+        static_cast<int64_t>(H) * C * D;
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_ws_base = ws_core_offset;
+    const int64_t ws_k_base = ws_field_span + ws_core_offset;
+    const int64_t ws_s_base = 2 * ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
     // One per-core scratch region stores:
     //   WS_WS : ws = W_i @ S_i
     //   WS_K  : k_tilde
@@ -445,12 +1144,11 @@ AICORE void chunk_h_kernel(
     //   WS_KV : k_tilde^T @ v_i_new
 
     for (int32_t ci = 0; ci < num_chunks; ++ci) {
-#if defined(GDN_A5_CUBE_KERNEL)
-      GdnA5WaitMte2(3);
+#if defined(PTO_NPU_ARCH_A5)
+      gdn_sync::Wait<PIPE_MTE2>(3);
 #else
       wait_flag_dev(3);
 #endif
-
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
       if (valid > C) valid = C;
@@ -459,20 +1157,22 @@ AICORE void chunk_h_kernel(
       // Consumer-side invalidate for the Vec-published state: A5 Cube MTE2
       // loads can return clean stale lines left by a previous launch.
       for (int32_t r = 0; r < D * D; r += 16) {
-        dcci(static_cast<__gm__ void *>(workspace_handle + ws_base + WS_S + r),
+        dcci(static_cast<__gm__ void *>(workspace_handle + ws_s_base + r),
              SINGLE_CACHE_LINE);
       }
 #endif
       set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       {
+        const int64_t s_state_offset =
+            ((chunk_offset + ci) * H + head) * DD;
         GmShape2D s_shape(D, D);
         GmStride2D s_stride(D);
-        GmTensor2D<DTYPE_Q> s_global(workspace_handle + ws_base + WS_S, s_shape,
-                                  s_stride);
-        DynMatL1<DTYPE_Q, D, D> s_l1_load(D, D);
+        GmTensor2D<ComputeT> s_global(S_handle + s_state_offset, s_shape,
+                                     s_stride);
+        DynMatL1<ComputeT, D, D> s_l1_load(D, D);
         TASSIGN(s_l1_load, 0);
-        // Load the previous recurrent state S_i from per-core workspace.
+        // Load S_i before this slot is overwritten with precomputed Q_i @ S_i.
         TLOAD(s_l1_load, s_global);
       }
 
@@ -493,9 +1193,9 @@ AICORE void chunk_h_kernel(
       {
         GmShape2D w_shape(static_cast<int32_t>(valid), D);
         GmStride2D w_stride(BSND_QKV_STRIDE);
-        GmTensor2D<DTYPE_Q> w_global(W_handle + w_offset, w_shape, w_stride);
-        DynMatL1<DTYPE_Q, C, D> w_l1_load(static_cast<int32_t>(valid), D);
-        TASSIGN(w_l1_load, D * D * static_cast<int32_t>(sizeof(DTYPE_Q)));
+        GmTensor2D<ComputeT> w_global(W_handle + w_offset, w_shape, w_stride);
+        DynMatL1<ComputeT, C, D> w_l1_load(static_cast<int32_t>(valid), D);
+        TASSIGN(w_l1_load, D * D * static_cast<int32_t>(sizeof(ComputeT)));
         TLOAD(w_l1_load, w_global);
         if (valid != C) {
           TFILLPAD(w_l1_load, w_l1_load);
@@ -505,13 +1205,27 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       // Apply the carried recurrent state to every token in this chunk.
-      gemm_v0<DTYPE_Q, float, C, D, D, C, D, D, D, false, false>(
+      gemm_v0<ComputeT, float, C, D, D, C, D, D, D, false, false>(
           w_l1, s_l1, ws_l0, (bool)1);
+
+      if (emit_precomputed_qs) {
+        const int64_t q_offset = (chunk_start * Hg + head_g) * D;
+        GmShape2D q_shape(static_cast<int32_t>(valid), D);
+        GmStride2D q_stride(BSND_K_STRIDE);
+        GmTensor2D<ComputeT> q_global(Q_handle + q_offset, q_shape, q_stride);
+        DynMatL1<ComputeT, C, D> q_l1_load(static_cast<int32_t>(valid), D);
+        TASSIGN(q_l1_load,
+                D * D * static_cast<int32_t>(sizeof(ComputeT)));
+        TLOAD(q_l1_load, q_global);
+        if (valid != C) {
+          TFILLPAD(q_l1_load, q_l1_load);
+        }
+      }
 
       {
         GmShape2D ws_shape(C, D);
         GmStride2D ws_stride(D);
-        GmTensor2D<DTYPE_Q> ws_global(workspace_handle + ws_base + WS_WS,
+        GmTensor2D<ComputeT> ws_global(workspace_handle + ws_ws_base,
                                    ws_shape, ws_stride);
         DynAccTile<float, C, D> ws_store(C, D);
         TASSIGN(ws_store, 0);
@@ -520,8 +1234,24 @@ AICORE void chunk_h_kernel(
       }
       ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
 
-#if defined(GDN_A5_CUBE_KERNEL)
-      GdnA5WaitMte2(1);
+      if (emit_precomputed_qs) {
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        gemm_v0<ComputeT, float, C, D, D, C, D, D, D, false, false>(
+            q_l1, s_l1, ws_l0, (bool)1);
+
+        const int64_t qs_offset = ((chunk_offset + ci) * H + head) * DD;
+        GmShape2D qs_shape(C, D);
+        GmStride2D qs_stride(D);
+        GmTensor2D<ComputeT> qs_global(S_handle + qs_offset, qs_shape,
+                                     qs_stride);
+        DynAccTile<float, C, D> qs_store(C, D);
+        TASSIGN(qs_store, 0);
+        TSTORE(qs_global, qs_store);
+      }
+
+#if defined(PTO_NPU_ARCH_A5)
+      gdn_sync::Wait<PIPE_MTE2>(1);
 #else
       wait_flag_dev(1);
 #endif
@@ -530,23 +1260,24 @@ AICORE void chunk_h_kernel(
       // Consumer-side invalidate for the Vec-published k_tilde tile before the
       // KV GEMM; a stale line here corrupts the state update (final_state).
       for (int32_t r = 0; r < D * C; r += 16) {
-        dcci(static_cast<__gm__ void *>(workspace_handle + ws_base + WS_K + r),
+        dcci(static_cast<__gm__ void *>(workspace_handle + ws_k_base + r),
              SINGLE_CACHE_LINE);
       }
 #endif
       set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+      const int64_t v_offset =
+          v_head_base + static_cast<int64_t>(ci) * v_chunk_stride;
       {
         GmShape2D k_shape(D, C);
         GmStride2D k_stride(C);
-        GmTensor2D<DTYPE_Q> k_global(workspace_handle + ws_base + WS_K, k_shape,
+        GmTensor2D<ComputeT> k_global(workspace_handle + ws_k_base, k_shape,
                                   k_stride);
-        DynMatL1<DTYPE_Q, D, C> k_l1_load(D, C);
-        TASSIGN(k_l1_load, (DD + C * D) * static_cast<int32_t>(sizeof(DTYPE_Q)));
+        DynMatL1<ComputeT, D, C> k_l1_load(D, C);
+        TASSIGN(k_l1_load, (DD + C * D) * static_cast<int32_t>(sizeof(ComputeT)));
         TLOAD(k_l1_load, k_global);
       }
 
-      int64_t v_offset = ((chunk_start) * H + head) * D;
 #if defined(GDN_A5_KERNEL)
       // V_new is published by this stage's Vector cores earlier in the chunk
       // loop; the Cube MTE2 load can still hold a stale line from a previous
@@ -554,7 +1285,7 @@ AICORE void chunk_h_kernel(
       for (int32_t row = 0; row < valid; ++row) {
         for (int32_t r = 0; r < D; r += 16) {
           dcci(static_cast<__gm__ void *>(
-                   V_handle + v_offset + row * BSND_QKV_STRIDE + r),
+                   V_handle + v_offset + row * v_stride + r),
                SINGLE_CACHE_LINE);
         }
       }
@@ -563,11 +1294,12 @@ AICORE void chunk_h_kernel(
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       {
         GmShape2D v_shape(static_cast<int32_t>(valid), D);
-        GmStride2D v_stride(BSND_QKV_STRIDE);
-        GmTensor2D<DTYPE_Q> v_global(V_handle + v_offset, v_shape, v_stride);
-        DynMatL1<DTYPE_Q, C, D> v_l1_load(static_cast<int32_t>(valid), D);
+        GmStride2D v_gm_stride(v_stride);
+        GmTensor2D<ComputeT> v_global(
+            V_handle + v_offset, v_shape, v_gm_stride);
+        DynMatL1<ComputeT, C, D> v_l1_load(static_cast<int32_t>(valid), D);
         TASSIGN(v_l1_load,
-                (DD + C * D + D * C) * static_cast<int32_t>(sizeof(DTYPE_Q)));
+                (DD + C * D + D * C) * static_cast<int32_t>(sizeof(ComputeT)));
         TLOAD(v_l1_load, v_global);
         if (valid != C) {
           TFILLPAD(v_l1_load, v_l1_load);
@@ -577,13 +1309,13 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       // This chunk contributes the additive update K_i^T V_i to the state recurrence.
-      gemm_v0<DTYPE_Q, float, D, D, C, D, D, C, C, true, false>(
+      gemm_v0<ComputeT, float, D, D, C, D, D, C, C, true, false>(
           k_l1, v_l1, kv_l0, (bool)1);
 
       {
         GmShape2D kv_shape(D, D);
         GmStride2D kv_stride(D);
-        GmTensor2D<DTYPE_Q> kv_global(workspace_handle + ws_base + WS_KV,
+        GmTensor2D<ComputeT> kv_global(workspace_handle + ws_kv_base,
                                    kv_shape, kv_stride);
         DynAccTile<float, D, D> kv_store(D, D);
         TASSIGN(kv_store, SecondL0CAddr);
@@ -593,11 +1325,123 @@ AICORE void chunk_h_kernel(
       ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
     }
   }
+  }
 #endif
 #if defined(__DAV_C220_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
+  if (use_paired_head_pipeline && cid < paired_core_count) {
+    const int64_t head0 = cid;
+    const int64_t head1 = block_num + cid;
+    const int64_t head_g0 = head0 / GROUP;
+    const int64_t head_g1 = head1 / GROUP;
+    const int64_t bos = static_cast<int64_t>(cu_seqlens[0]);
+    const int64_t slen = static_cast<int64_t>(cu_seqlens[1]) - bos;
+    const int32_t num_chunks = static_cast<int32_t>(slen / C);
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_slot_span = 4 * ws_field_span;
+    const int64_t ws_ws_base0 = ws_core_offset;
+    const int64_t ws_k_base0 = ws_field_span + ws_core_offset;
+    const int64_t ws_s_base0 = 2 * ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base0 = 3 * ws_field_span + ws_core_offset;
+    const int64_t ws_ws_base1 = ws_slot_span + ws_ws_base0;
+    const int64_t ws_k_base1 = ws_slot_span + ws_k_base0;
+    const int64_t ws_s_base1 = ws_slot_span + ws_s_base0;
+    const int64_t ws_kv_base1 = ws_slot_span + ws_kv_base0;
+    const int64_t v_chunk_stride = static_cast<int64_t>(H) * C * D;
+    const int64_t v_head_base0 = head0 * static_cast<int64_t>(C) * D;
+    const int64_t v_head_base1 = head1 * static_cast<int64_t>(C) * D;
+
+    paired_vec_init_zero<D, C, 0, true>(
+        S_handle, workspace_handle, head0, 0, H, vid, ws_s_base0,
+        s_ub, s_ub_half);
+    paired_vec_init_zero<D, C, 0, false>(
+        S_handle, workspace_handle, head1, 0, H, vid, ws_s_base1,
+        s_alt_ub, s_ub_half);
+#ifdef MEGA_STOP_AFTER_H
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 1) return;
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 14 ||
+                  GDN_PAIR_DEBUG_STAGE == 15) {
+      wait_flag_dev(0);
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 10) {
+      wait_flag_dev(0);
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 12) {
+      wait_flag_dev(0);
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 13) {
+      wait_flag_dev(0);
+      return;
+    }
+    if constexpr (GDN_PAIR_DEBUG_STAGE == 2 ||
+                  GDN_PAIR_DEBUG_STAGE == 8 ||
+                  GDN_PAIR_DEBUG_STAGE == 9 ||
+                  GDN_PAIR_DEBUG_STAGE == 11) {
+      wait_flag_dev(0);
+      return;
+    }
+#endif
+
+    for (int32_t ci = 0; ci < num_chunks; ++ci) {
+      const int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
+      paired_vec_front<D, C, 0, G_UB, COEFF_UB, U_UB>(
+          K_handle, U_handle, G_handle, V_handle, workspace_handle, head0,
+          head_g0, chunk_start, C, ci, H, Hg, total_tokens, vid, D,
+          v_head_base0, v_chunk_stride, ws_ws_base0, ws_k_base0, s_ub,
+          k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+          u_ub, ws_ub);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 3) return;
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 4) {
+        wait_flag_dev(4);
+        return;
+      }
+#endif
+      paired_vec_front<D, C, 4, G_UB, COEFF_UB, U_UB>(
+          K_handle, U_handle, G_handle, V_handle, workspace_handle, head1,
+          head_g1, chunk_start, C, ci, H, Hg, total_tokens, vid, D,
+          v_head_base1, v_chunk_stride, ws_ws_base1, ws_k_base1, s_alt_ub,
+          k_ub_half, g_ub, u_ub_half, k_ub, g_last_tail_ub, coeff_ub,
+          u_ub, ws_ub);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 5) return;
+#endif
+      paired_vec_finish<D, C, 0>(
+          S_handle, workspace_handle, h_o_ready_handle, head0, 0, ci,
+          num_chunks, H, vid, ws_s_base0, ws_kv_base0, true, s_ub,
+          s_ub_half, kv_ub, h_o_ready_ub);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 6) return;
+#endif
+      paired_vec_finish<D, C, 4>(
+          S_handle, workspace_handle, h_o_ready_handle, head1, 0, ci,
+          num_chunks, H, vid, ws_s_base1, ws_kv_base1, true, s_alt_ub,
+          s_ub_half, kv_ub, h_o_ready_ub);
+#ifdef MEGA_STOP_AFTER_H
+      if constexpr (GDN_PAIR_DEBUG_STAGE == 7) return;
+#endif
+    }
+
+    paired_vec_store_final<D, C, StoreFinalStateCache>(
+        FS_handle, final_state_cache, state_indices, head0, H, vid,
+        state_index_stride, state_cache_slots, output_final_state, s_ub,
+        s_ub_half);
+    paired_vec_store_final<D, C, StoreFinalStateCache>(
+        FS_handle, final_state_cache, state_indices, head1, H, vid,
+        state_index_stride, state_cache_slots, output_final_state, s_alt_ub,
+        s_ub_half);
+#ifndef MEGA_STOP_AFTER_H
+    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (7 << 8));
+#endif
+  } else {
   // Vec owns the running recurrent state S_i and updates it after every chunk.
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
@@ -624,34 +1468,75 @@ AICORE void chunk_h_kernel(
       chunk_offset = seq_idx * ((seq_len + C - 1) / C);
     }
     int64_t num_chunks = (slen + C - 1) / C;
-    int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
+    const bool emit_precomputed_qs =
+        precompute_qs != 0 && C == D && H >= 8 &&
+        cu_seqlens != nullptr;
+    const bool use_packed_v =
+        emit_precomputed_qs && batch_size == 1 && (slen % C) == 0;
+    const int32_t v_stride =
+        use_packed_v ? D : BSND_QKV_STRIDE;
+    const int64_t v_head_base =
+        use_packed_v
+            ? (chunk_offset * H + head) *
+                  static_cast<int64_t>(C) * D
+            : (bos * H + head) * static_cast<int64_t>(D);
+    const int64_t v_chunk_stride =
+        static_cast<int64_t>(H) * C * D;
+    const int64_t ws_core_offset =
+        static_cast<int64_t>(cid) * WS_FIELD_STRIDE;
+    const int64_t ws_field_span =
+        static_cast<int64_t>(block_num) * WS_FIELD_STRIDE;
+    const int64_t ws_ws_base = ws_core_offset;
+    const int64_t ws_k_base = ws_field_span + ws_core_offset;
+    const int64_t ws_s_base = 2 * ws_field_span + ws_core_offset;
+    const int64_t ws_kv_base = 3 * ws_field_span + ws_core_offset;
 
-    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    TEXPANDS(zero_ub, 0.0f);
-    set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
     if (has_initial_state != 0) {
-      int64_t h0_offset = (seq_idx * H + head) * DD + vid * HalfC * D;
+      if constexpr (LoadInitialStateCache) {
+        const int32_t state_index = initial_state_indices[seq_idx];
+        if (state_index >= 0 && state_index < state_cache_slots) {
+          const int64_t cache_offset =
+              (static_cast<int64_t>(state_index) * H + head) * DD +
+              vid * HalfC * D;
+          GmShape2D cache_shape(HalfC, D);
+          GmStride2D cache_stride(D);
+          GmTensor2D<float> cache_global(initial_state_cache + cache_offset,
+                                         cache_shape, cache_stride);
+          DynVecTile<float, HalfC, D> cache_load(HalfC, D);
+          TASSIGN(cache_load, S_UB);
+          TLOAD(cache_load, cache_global);
+          set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          // Match the standalone FP32 cache -> BF16 initial-state boundary.
+          TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_RINT);
+          TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+        } else {
+          TEXPANDS(s_ub, 0.0f);
+          TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
+        }
+      } else {
+        int64_t h0_offset = (seq_idx * H + head) * DD + vid * HalfC * D;
 #if defined(GDN_A5_KERNEL)
-      // H0 GM lines may be stale in this Vector core's cache when the address
-      // was read by a previous work item or launch.
-      for (int32_t r = 0; r < HalfC * D; r += 16) {
-        dcci(static_cast<__gm__ void *>(H0_handle + h0_offset + r),
-             SINGLE_CACHE_LINE);
-      }
+        // H0 GM lines may be stale in this Vector core's cache when the address
+        // was read by a previous work item or launch.
+        for (int32_t r = 0; r < HalfC * D; r += 16) {
+          dcci(static_cast<__gm__ void *>(H0_handle + h0_offset + r),
+               SINGLE_CACHE_LINE);
+        }
 #endif
-      set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-      wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
-      GmShape2D h0_shape(HalfC, D);
-      GmStride2D h0_stride(D);
-      GmTensor2D<DTYPE_Q> h0_global(H0_handle + h0_offset, h0_shape, h0_stride);
-      DynVecTile<DTYPE_Q, HalfC, D> h0_load(HalfC, D);
-      TASSIGN(h0_load, S_UB_HALF);
-      TLOAD(h0_load, h0_global);
-      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+        set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+        GmShape2D h0_shape(HalfC, D);
+        GmStride2D h0_stride(D);
+        GmTensor2D<ComputeT> h0_global(H0_handle + h0_offset, h0_shape,
+                                     h0_stride);
+        DynVecTile<ComputeT, HalfC, D> h0_load(HalfC, D);
+        TASSIGN(h0_load, S_UB_HALF);
+        TLOAD(h0_load, h0_global);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+      }
     } else {
       // Start each sequence/head recurrence from S_0 = 0.
       TEXPANDS(s_ub, 0.0f);
@@ -660,24 +1545,13 @@ AICORE void chunk_h_kernel(
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     {
-      // `workspace_handle` is a `DTYPE_Q*`, so all offsets here are in DTYPE_Q elements.
-      GmShape2D s_shape(HalfC, D);
-      GmStride2D s_stride(D);
-      GmTensor2D<DTYPE_Q> s_global(
-          workspace_handle + ws_base + WS_S + vid * HalfC * D,
-          s_shape, s_stride);
-      DynVecTile<DTYPE_Q, HalfC, D> s_store(HalfC, D);
-      TASSIGN(s_store, S_UB_HALF);
-      TSTORE(s_global, s_store);
-    }
-    {
       int64_t s_out_offset = (chunk_offset * H + head) * DD;
       GmShape2D s_out_shape(HalfC, D);
       GmStride2D s_out_stride(D);
-      GmTensor2D<DTYPE_Q> s_out_global(
+      GmTensor2D<ComputeT> s_out_global(
           S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
           s_out_stride);
-      DynVecTile<DTYPE_Q, HalfC, D> s_out_store(HalfC, D);
+      DynVecTile<ComputeT, HalfC, D> s_out_store(HalfC, D);
       TASSIGN(s_out_store, S_UB_HALF);
       TSTORE(s_out_global, s_out_store);
     }
@@ -712,8 +1586,8 @@ AICORE void chunk_h_kernel(
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       GmShape2D k_shape(valid_rows_0, D);
       GmStride2D k_stride(BSND_K_STRIDE);
-      GmTensor2D<DTYPE_Q> k_global(K_handle + k_offset_0, k_shape, k_stride);
-      DynVecTile<DTYPE_Q, HalfC, D, pto::PadValue::Zero> k_load(valid_rows_0, D);
+      GmTensor2D<ComputeT> k_global(K_handle + k_offset_0, k_shape, k_stride);
+      DynVecTile<ComputeT, HalfC, D, pto::PadValue::Zero> k_load(valid_rows_0, D);
       TASSIGN(k_load, K_UB_HALF);
       TLOAD(k_load, k_global);
       if (valid_rows_0 != HalfC) {
@@ -773,8 +1647,8 @@ AICORE void chunk_h_kernel(
       if (valid_rows > 0) {
         GmShape2D u_shape(valid_rows, D);
         GmStride2D u_stride(BSND_QKV_STRIDE);
-        GmTensor2D<DTYPE_Q> u_global(U_handle + u_offset, u_shape, u_stride);
-        DynVecTile<DTYPE_Q, HalfC, D, pto::PadValue::Zero> u_load(valid_rows, D);
+        GmTensor2D<ComputeT> u_global(U_handle + u_offset, u_shape, u_stride);
+        DynVecTile<ComputeT, HalfC, D, pto::PadValue::Zero> u_load(valid_rows, D);
         TASSIGN(u_load, U_UB_HALF);
         TLOAD(u_load, u_global);
         if (valid_rows != HalfC) {
@@ -792,7 +1666,6 @@ AICORE void chunk_h_kernel(
 
       TileUbDataND<float, 1, 64, 1, 64> g_ub_temp;
       TASSIGN(g_ub_temp, G_UB + vid * 64 * sizeof(float));
-      TMOV(g_v_ub, g_ub_temp);
 
       set_flag(PIPE_V, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
@@ -800,22 +1673,27 @@ AICORE void chunk_h_kernel(
       // Rebase the chunk gate around g_last so the intra-chunk decay stays numerically local.
       // Torch-like:
       //   coeff = exp(g_last - g_rows_owned_by_this_subblock)
-      TADDS(coeff_ub, g_v_ub, -g_last);
+      TADDS(coeff_ub, g_ub_temp, -g_last);
       pipe_barrier(PIPE_V);
-      TSUB(coeff_ub, zero_ub, coeff_ub);
+      TNEG(coeff_ub, coeff_ub);
       pipe_barrier(PIPE_V);
       TEXP(coeff_ub, coeff_ub);
 
-      TEXP(g_ub, g_ub);
+      if (valid == C) {
+        // Only exp(g_last) is consumed below. Keep the tail path unchanged,
+        // while avoiding two full-vector EXP repeats for dense chunks.
+        TEXP(g_last_tail_ub, g_last_tail_ub);
+      } else {
+        TEXP(g_ub, g_ub);
+      }
 
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
 
       TileUbDataDN<float, HalfC, 1, HalfC, 1> coeff_col_ub;
       TASSIGN(coeff_col_ub, COEFF_UB);
       TileUbDataND<float, HalfC, D, HalfC, D> coeff_2d_ub;
-      TASSIGN(coeff_2d_ub, WS_UB);
+      TASSIGN(coeff_2d_ub, U_UB);
       // Broadcast one decay scalar per token row across the D feature columns:
       //   coeff_2d[row, :] = coeff[row]
       TROWEXPAND(coeff_2d_ub, coeff_col_ub);
@@ -823,6 +1701,8 @@ AICORE void chunk_h_kernel(
       // `k_ub` now holds k_tilde = exp(g_last - g_i) * K_i.
       TMUL(k_ub, k_ub, coeff_2d_ub);
       pipe_barrier(PIPE_V);
+      TCVT(k_ub_half, k_ub, pto::RoundMode::CAST_NONE);
+      TCVT(u_ub, u_ub_half, pto::RoundMode::CAST_NONE);
 
       wait_flag_dev(0);
 #if defined(GDN_A5_KERNEL)
@@ -831,7 +1711,7 @@ AICORE void chunk_h_kernel(
       // product rows on the consumer immediately before loading them.
       for (int32_t r = 0; r < HalfC * D; r += 16) {
         dcci(static_cast<__gm__ void *>(
-                 workspace_handle + ws_base + WS_WS + vid * HalfC * D + r),
+                 workspace_handle + ws_ws_base + vid * HalfC * D + r),
              SINGLE_CACHE_LINE);
       }
 #endif
@@ -840,10 +1720,10 @@ AICORE void chunk_h_kernel(
       {
         GmShape2D ws_shape(HalfC, D);
         GmStride2D ws_stride(D);
-        GmTensor2D<DTYPE_Q> ws_global(
-            workspace_handle + ws_base + WS_WS + vid * HalfC * D,
+        GmTensor2D<ComputeT> ws_global(
+            workspace_handle + ws_ws_base + vid * HalfC * D,
             ws_shape, ws_stride);
-        DynVecTile<DTYPE_Q, HalfC, D, pto::PadValue::Zero> ws_load(HalfC, D);
+        DynVecTile<ComputeT, HalfC, D, pto::PadValue::Zero> ws_load(HalfC, D);
         TASSIGN(ws_load, U_UB_HALF);
         TLOAD(ws_load, ws_global);
       }
@@ -855,18 +1735,36 @@ AICORE void chunk_h_kernel(
       // In PyTorch notation:
       //   u_ub = u_ub - ws_ub
       TSUB(u_ub, u_ub, ws_ub);
+      pipe_barrier(PIPE_V);
+      // W@S is formed as a full C-row Cube tile. On a ragged tail, rows
+      // outside valid_rows are not part of the sequence and must not feed
+      // the later K^T V state update, especially when S starts non-zero.
+      if (valid_rows == 0) {
+        TEXPANDS(u_ub, 0.0f);
+      } else if (valid_rows != HalfC) {
+        DynVecTile<float, HalfC, D, pto::PadValue::Zero> u_live(
+            valid_rows, D);
+        TASSIGN(u_live, U_UB);
+        TileUbDataND<float, HalfC, D, HalfC, D,
+                     pto::PadValue::Zero> u_ub_padded;
+        TASSIGN(u_ub_padded, U_UB);
+        TFILLPAD_INPLACE(u_ub_padded, u_live);
+      }
+      pipe_barrier(PIPE_V);
       TCVT(u_ub_half, u_ub, pto::RoundMode::CAST_NONE);
-      TCVT(k_ub_half, k_ub, pto::RoundMode::CAST_NONE);
 
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
 
-      int64_t v_offset = (chunk_start * H + head) * D + vid * HalfC * BSND_QKV_STRIDE;
+      const int64_t v_offset =
+          v_head_base + static_cast<int64_t>(ci) * v_chunk_stride +
+          static_cast<int64_t>(vid) * HalfC * v_stride;
       if (valid_rows > 0) {
         GmShape2D v_shape(valid_rows, D);
-        GmStride2D v_stride(BSND_QKV_STRIDE);
-        GmTensor2D<DTYPE_Q> v_global(V_handle + v_offset, v_shape, v_stride);
-        DynVecTile<DTYPE_Q, HalfC, D> v_store(valid_rows, D);
+        GmStride2D v_gm_stride(v_stride);
+        GmTensor2D<ComputeT> v_global(
+            V_handle + v_offset, v_shape, v_gm_stride);
+        DynVecTile<ComputeT, HalfC, D> v_store(valid_rows, D);
         TASSIGN(v_store, U_UB_HALF);
         TSTORE(v_global, v_store);
       }
@@ -876,10 +1774,10 @@ AICORE void chunk_h_kernel(
       {
         GmShape2D k_shape(HalfC, D);
         GmStride2D k_stride(D);
-        GmTensor2D<DTYPE_Q> k_global(
-            workspace_handle + ws_base + WS_K + vid * HalfC * D,
+        GmTensor2D<ComputeT> k_global(
+            workspace_handle + ws_k_base + vid * HalfC * D,
             k_shape, k_stride);
-        DynVecTile<DTYPE_Q, HalfC, D> k_store(HalfC, D);
+        DynVecTile<ComputeT, HalfC, D> k_store(HalfC, D);
         TASSIGN(k_store, K_UB_HALF);
         TSTORE(k_global, k_store);
       }
@@ -888,7 +1786,10 @@ AICORE void chunk_h_kernel(
 
       set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
-      float exp_g_last = g_ub.GetValue(static_cast<int32_t>(valid) - 1);
+      float exp_g_last =
+          valid == C
+              ? g_last_tail_ub.GetValue(ExpTailElements - 1)
+              : g_ub.GetValue(static_cast<int32_t>(valid) - 1);
       // Carry the recurrence across chunks: S_{i+1} = exp(g_last) * S_i + K_i^T V_i.
 #if defined(GDN_A5_KERNEL)
       for (int32_t row = 0; row < HalfC; ++row) {
@@ -902,6 +1803,7 @@ AICORE void chunk_h_kernel(
 
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
         int64_t next_start = bos + static_cast<int64_t>(ci + 1) * C;
         int64_t next_valid = slen - static_cast<int64_t>(ci + 1) * C;
@@ -928,8 +1830,8 @@ AICORE void chunk_h_kernel(
           wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
           GmShape2D k_shape(next_valid_rows, D);
           GmStride2D k_stride(BSND_K_STRIDE);
-          GmTensor2D<DTYPE_Q> k_global(K_handle + nk_off, k_shape, k_stride);
-          DynVecTile<DTYPE_Q, HalfC, D, pto::PadValue::Zero> k_load(
+          GmTensor2D<ComputeT> k_global(K_handle + nk_off, k_shape, k_stride);
+          DynVecTile<ComputeT, HalfC, D, pto::PadValue::Zero> k_load(
               next_valid_rows, D);
           TASSIGN(k_load, K_UB_HALF);
           TLOAD(k_load, k_global);
@@ -971,13 +1873,24 @@ AICORE void chunk_h_kernel(
       }
 
       wait_flag_dev(2);
+      if (emit_precomputed_qs && vid == 0) {
+        const int64_t ready_offset =
+            (seq_idx * H + head) * H_O_READY_STRIDE;
+        h_o_ready_gm.SetValue(ready_offset, static_cast<int32_t>(ci + 1));
+        __asm__ __volatile__("");
+        AscendC::DataCacheCleanAndInvalid<
+            int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+            AscendC::DcciDst::CACHELINE_ALL>(
+            h_o_ready_gm[ready_offset]);
+        __asm__ __volatile__("");
+      }
 #if defined(GDN_A5_KERNEL)
       // Same consumer-side invalidation for the k_tilde^T @ v_new product
       // published by the Cube stage; without it the recurrence can fold in a
       // stale line from a previous launch and corrupt the final state.
       for (int32_t r = 0; r < HalfC * D; r += 16) {
         dcci(static_cast<__gm__ void *>(
-                 workspace_handle + ws_base + WS_KV + vid * HalfC * D + r),
+                 workspace_handle + ws_kv_base + vid * HalfC * D + r),
              SINGLE_CACHE_LINE);
       }
 #endif
@@ -986,10 +1899,10 @@ AICORE void chunk_h_kernel(
       {
         GmShape2D kv_shape(HalfC, D);
         GmStride2D kv_stride(D);
-        GmTensor2D<DTYPE_Q> kv_global(
-            workspace_handle + ws_base + WS_KV + vid * HalfC * D,
+        GmTensor2D<ComputeT> kv_global(
+            workspace_handle + ws_kv_base + vid * HalfC * D,
             kv_shape, kv_stride);
-        DynVecTile<DTYPE_Q, HalfC, D, pto::PadValue::Zero> kv_load(HalfC, D);
+        DynVecTile<ComputeT, HalfC, D, pto::PadValue::Zero> kv_load(HalfC, D);
         TASSIGN(kv_load, S_UB_HALF);
         TLOAD(kv_load, kv_global);
       }
@@ -1003,9 +1916,9 @@ AICORE void chunk_h_kernel(
       // row so no tile row can go stale.
       for (int32_t row = 0; row < HalfC; ++row) {
         TileUbDataND<float, 1, D> kv_row_f;
-        TileUbDataND<DTYPE_Q, 1, D> kv_row_h;
+        TileUbDataND<ComputeT, 1, D> kv_row_h;
         TASSIGN(kv_row_f, KV_UB + row * D * static_cast<int32_t>(sizeof(float)));
-        TASSIGN(kv_row_h, S_UB_HALF + row * D * static_cast<int32_t>(sizeof(DTYPE_Q)));
+        TASSIGN(kv_row_h, S_UB_HALF + row * D * static_cast<int32_t>(sizeof(ComputeT)));
         TCVT(kv_row_f, kv_row_h, pto::RoundMode::CAST_NONE);
       }
 #else
@@ -1019,10 +1932,10 @@ AICORE void chunk_h_kernel(
       for (int32_t row = 0; row < HalfC; ++row) {
         TileUbDataND<float, 1, D> s_row;
         TileUbDataND<float, 1, D> kv_row;
-        TileUbDataND<DTYPE_Q, 1, D> out_row;
+        TileUbDataND<ComputeT, 1, D> out_row;
         TASSIGN(s_row, S_UB + row * D * static_cast<int32_t>(sizeof(float)));
         TASSIGN(kv_row, KV_UB + row * D * static_cast<int32_t>(sizeof(float)));
-        TASSIGN(out_row, S_UB_HALF + row * D * static_cast<int32_t>(sizeof(DTYPE_Q)));
+        TASSIGN(out_row, S_UB_HALF + row * D * static_cast<int32_t>(sizeof(ComputeT)));
         TADD(s_row, s_row, kv_row);
         TCVT(out_row, s_row, pto::RoundMode::CAST_NONE);
       }
@@ -1034,28 +1947,18 @@ AICORE void chunk_h_kernel(
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        {
-          GmShape2D s_shape(HalfC, D);
-          GmStride2D s_stride(D);
-          GmTensor2D<DTYPE_Q> s_global(
-              workspace_handle + ws_base + WS_S + vid * HalfC * D,
-              s_shape, s_stride);
-          DynVecTile<DTYPE_Q, HalfC, D> s_store(HalfC, D);
-          TASSIGN(s_store, S_UB_HALF);
-          TSTORE(s_global, s_store);
-        }
-
         // Expose the post-chunk state so the next chunk and output snapshot
         // can see S_{i+1}. Conceptually:
         //   S_handle[chunk_idx + 1, head] = S_{i+1}
-        int64_t s_out_offset = ((chunk_offset + ci + 1) * H + head) * DD;
+        int64_t s_out_offset =
+            ((chunk_offset + ci + 1) * H + head) * DD;
         {
           GmShape2D s_out_shape(HalfC, D);
           GmStride2D s_out_stride(D);
-          GmTensor2D<DTYPE_Q> s_out_global(
+          GmTensor2D<ComputeT> s_out_global(
               S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
               s_out_stride);
-          DynVecTile<DTYPE_Q, HalfC, D> s_out_store(HalfC, D);
+          DynVecTile<ComputeT, HalfC, D> s_out_store(HalfC, D);
           TASSIGN(s_out_store, S_UB_HALF);
           TSTORE(s_out_global, s_out_store);
         }
@@ -1072,12 +1975,29 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       int64_t fs_offset = (seq_idx * H + head) * DD;
-      {
+      if constexpr (StoreFinalStateCache) {
+        TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+        pipe_barrier(PIPE_V);
+        const int32_t state_index =
+            state_indices[seq_idx] * state_index_stride;
+        if (state_index >= 0 && state_index < state_cache_slots) {
+          const int64_t cache_offset =
+              (static_cast<int64_t>(state_index) * H + head) * DD +
+              vid * HalfC * D;
+          GmShape2D cache_shape(HalfC, D);
+          GmStride2D cache_stride(D);
+          GmTensor2D<float> cache_global(final_state_cache + cache_offset,
+                                        cache_shape, cache_stride);
+          DynVecTile<float, HalfC, D> cache_store(HalfC, D);
+          TASSIGN(cache_store, S_UB);
+          TSTORE(cache_global, cache_store);
+        }
+      } else {
         GmShape2D fs_shape(HalfC, D);
         GmStride2D fs_stride(D);
-        GmTensor2D<DTYPE_Q> fs_global(FS_handle + fs_offset + vid * HalfC * D,
-                                   fs_shape, fs_stride);
-        DynVecTile<DTYPE_Q, HalfC, D> fs_store(HalfC, D);
+        GmTensor2D<ComputeT> fs_global(
+            FS_handle + fs_offset + vid * HalfC * D, fs_shape, fs_stride);
+        DynVecTile<ComputeT, HalfC, D> fs_store(HalfC, D);
         TASSIGN(fs_store, S_UB_HALF);
         TSTORE(fs_global, fs_store);
       }
@@ -1092,22 +2012,35 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       // A5 MIX Vector GM writes are cached per Vector core and are not
-      // snooped by the host DMA once the kernel completes.  Every other GM
-      // store in this kernel is followed by an ffts alias that issues
-      // dsb(DSB_ALL); the final-state store ends the work item, so actively
-      // clean its lines to the coherence point and drain, or the reader can
-      // observe stale data when the framework reuses GM addresses from a
-      // previous launch.
-      for (int32_t r = 0; r < HalfC * D; r += 16) {
-        dcci(static_cast<__gm__ void *>(FS_handle + fs_offset +
-                                        vid * HalfC * D + r),
-             SINGLE_CACHE_LINE);
+      // snooped by the next kernel.  Clean the address that was actually
+      // written above.  Prefill stores directly into final_state_cache,
+      // whereas the standalone operator stores into FS_handle; cleaning
+      // FS_handle unconditionally leaves Prefill's cache slot stale.
+      if constexpr (StoreFinalStateCache) {
+        const int32_t state_index =
+            state_indices[seq_idx] * state_index_stride;
+        if (state_index >= 0 && state_index < state_cache_slots) {
+          const int64_t cache_offset =
+              (static_cast<int64_t>(state_index) * H + head) * DD +
+              vid * HalfC * D;
+          for (int32_t r = 0; r < HalfC * D; r += 16) {
+            dcci(static_cast<__gm__ void *>(final_state_cache + cache_offset + r),
+                 SINGLE_CACHE_LINE);
+          }
+        }
+      } else {
+        for (int32_t r = 0; r < HalfC * D; r += 16) {
+          dcci(static_cast<__gm__ void *>(FS_handle + fs_offset +
+                                          vid * HalfC * D + r),
+               SINGLE_CACHE_LINE);
+        }
       }
       dsb(DSB_ALL);
 #endif
       set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
     }
+  }
   }
 #endif
 }

@@ -224,14 +224,17 @@ template <typename InputT, typename TileL1AB, typename TileL0A, typename TileL0B
 AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile, TileL1AB I_neg_l1_tile,
                                     TileL1AB M_neg_l1_tile, TileL1AB Zero_l1_tile, TileL1AB Y_l1_tile,
                                     TileL0A *a_l0_tile, TileL0B *b_l0_tile, TileL0C *c_l0_tile, const uint32_t tile_id,
-                                    const bool swap_parity = false)
+                                    const bool swap_parity = false,
+                                    const bool use_precomputed_m_neg = false)
 {
     const event_t event_0 = static_cast<event_t>(tile_id);
     const event_t event_1 = static_cast<event_t>(tile_id + NumTilesPerCubeIter);
 
-    TMOV(b_l0_tile[0], Y_l1_tile);      // b_l0[0] contains M
-    TMOV(a_l0_tile[0], I_neg_l1_tile);  // a_l0[0] contains I_neg
-    set_flag(PIPE_MTE1, PIPE_M, event_0);
+    if (!use_precomputed_m_neg) {
+        TMOV(b_l0_tile[0], Y_l1_tile);      // b_l0[0] contains M
+        TMOV(a_l0_tile[0], I_neg_l1_tile);  // a_l0[0] contains I_neg
+        set_flag(PIPE_MTE1, PIPE_M, event_0);
+    }
     TMOV(a_l0_tile[1], Zero_l1_tile);
     TMOV(b_l0_tile[1], Zero_l1_tile);
     set_flag(PIPE_MTE1, PIPE_M, event_1);
@@ -242,15 +245,21 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile, Tile
     CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(Y_l1_tile, b_l0_tile[1]);  // b_l0[1] = diag_fractals(M)
     set_flag(PIPE_MTE1, PIPE_M, event_1);
 
-    /* First Matmul: event_0 */
-    wait_flag(PIPE_MTE1, PIPE_M, event_0);
-    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // c_l0[0] contains M_neg
-    set_flag(PIPE_M, PIPE_FIX, event_0);
-    set_flag(PIPE_M, PIPE_MTE1, event_0);
+    if (!use_precomputed_m_neg) {
+        /* First Matmul: event_0 */
+        wait_flag(PIPE_MTE1, PIPE_M, event_0);
+        TMATMUL(c_l0_tile[0], a_l0_tile[0],
+                b_l0_tile[0]);  // c_l0[0] contains M_neg
+        set_flag(PIPE_M, PIPE_FIX, event_0);
+        set_flag(PIPE_M, PIPE_MTE1, event_0);
 
-    wait_flag(PIPE_M, PIPE_FIX, event_0);
-    TMOV(M_neg_l1_tile, c_l0_tile[0]);  // M_neg_l1 now contains M_neg
-    set_flag(PIPE_FIX, PIPE_M, event_0);
+        wait_flag(PIPE_M, PIPE_FIX, event_0);
+        TMOV(M_neg_l1_tile, c_l0_tile[0]);
+        set_flag(PIPE_FIX, PIPE_M, event_0);
+    } else {
+        set_flag(PIPE_M, PIPE_MTE1, event_0);
+        set_flag(PIPE_FIX, PIPE_M, event_0);
+    }
 
     /* Second Matmul: event_1 */
     wait_flag(PIPE_MTE1, PIPE_M, event_1);
@@ -266,8 +275,13 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile, Tile
 
     /* Third Matmul: event_0*/
     wait_flag(PIPE_M, PIPE_MTE1, event_0);
-    TMOV(b_l0_tile[0], I_neg_l1_tile);  // b_l0[0] contains I_neg
-    TMOV(a_l0_tile[0], I_neg_l1_tile);  // a_l0[0] contains I_neg
+    if (use_precomputed_m_neg) {
+        TMOV(b_l0_tile[0], I_l1_tile);
+        TMOV(a_l0_tile[0], I_l1_tile);
+    } else {
+        TMOV(b_l0_tile[0], I_neg_l1_tile);
+        TMOV(a_l0_tile[0], I_neg_l1_tile);
+    }
     set_flag(PIPE_MTE1, PIPE_M, event_0);
 
     wait_flag(PIPE_MTE1, PIPE_M, event_0);
@@ -439,6 +453,315 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile, Tile
     wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Write c_l0[1] to X_l1
 }
 
+#if defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE) || \
+    defined(MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE)
+#define GDN_PAIR_ACQUIRE_AB()                                               \
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);                               \
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1)
+#define GDN_PAIR_COMMIT_AB()                                                \
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);                                \
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1)
+#define GDN_PAIR_MATMUL_KEEP_C()                                            \
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);                               \
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);                                \
+    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);                     \
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);                                \
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);                               \
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);                                \
+    TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);                     \
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1)
+#define GDN_PAIR_MATMUL_FINAL()                                             \
+    GDN_PAIR_MATMUL_KEEP_C();                                               \
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);                                 \
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID1)
+#define GDN_PAIR_MATMUL_ACC_FINAL()                                         \
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);                               \
+    TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);   \
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);                                \
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);                                 \
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);                               \
+    TMATMUL_ACC(c_l0_tile[1], c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);   \
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);                                \
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID1)
+#define GDN_PAIR_STORE_L1(dst0, dst1)                                       \
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);                                \
+    TMOV((dst0), c_l0_tile[0]);                                            \
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);                                 \
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);                                \
+    TMOV((dst1), c_l0_tile[1]);                                            \
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1)
+#define GDN_PAIR_WAIT_L1_STORES()                                           \
+    set_flag(PIPE_FIX, PIPE_MTE1, EVENT_ID0);                              \
+    wait_flag(PIPE_FIX, PIPE_MTE1, EVENT_ID0)
+/*
+ * An even number of independent 128x128 inverses share the two L0 buffer
+ * sets.  The arithmetic and every FP16 L1 rounding boundary match
+ * InvertSingleTile;
+ * only independent matrices are interleaved so MTE1, Cube and FixPipe can
+ * overlap.  X and Y are intentionally swapped after initialization to avoid
+ * keeping a fourth per-matrix L1 tile.
+ */
+template <typename InputT, typename OutputT, typename StoreT,
+          typename TileL1AB, typename TileL0A, typename TileL0B,
+          typename TileL0C, uint32_t MatrixSize, uint32_t FractalSize,
+          uint32_t NumInterleavedTiles>
+AICORE inline void InvertTilesInterleavedBSND(
+    __gm__ StoreT *M_inv, uint32_t num_bsnd_heads,
+    const uint32_t *bsnd_tile_offsets,
+    const uint32_t *bsnd_tile_valid_sizes, TileL1AB I_l1_tile,
+    TileL1AB I_neg_l1_tile, TileL1AB Zero_l1_tile,
+    TileL1AB *M_neg_l1_tile, TileL1AB *X_l1_tile,
+    TileL1AB *Y_l1_tile, TileL0A *a_l0_tile,
+    TileL0B *b_l0_tile, TileL0C *c_l0_tile,
+    const bool swap_parity)
+{
+    static_assert(MatrixSize == 128 && FractalSize == 16,
+                  "Interleaved Solve is specialized for 128x128 matrices.");
+    static_assert(NumInterleavedTiles >= 2 &&
+                      NumInterleavedTiles % 2 == 0,
+                  "Interleaved Solve requires complete matrix pairs.");
+    constexpr uint32_t TileLen = MatrixSize * MatrixSize;
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+
+    // M_neg = (-I) @ M.
+#pragma unroll
+    for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+        const uint32_t t0 = pair;
+        const uint32_t t1 = pair + 1;
+        GDN_PAIR_ACQUIRE_AB();
+        TMOV(a_l0_tile[0], I_neg_l1_tile);
+        TMOV(b_l0_tile[0], Y_l1_tile[t0]);
+        TMOV(a_l0_tile[1], I_neg_l1_tile);
+        TMOV(b_l0_tile[1], Y_l1_tile[t1]);
+        GDN_PAIR_COMMIT_AB();
+        GDN_PAIR_MATMUL_FINAL();
+        GDN_PAIR_STORE_L1(M_neg_l1_tile[t0], M_neg_l1_tile[t1]);
+    }
+
+    // Temporarily keep diag(M)^2 in X_l1 while Y_l1 still owns M.
+#pragma unroll
+    for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+        const uint32_t t0 = pair;
+        const uint32_t t1 = pair + 1;
+        GDN_PAIR_ACQUIRE_AB();
+        TMOV(a_l0_tile[0], Zero_l1_tile);
+        TMOV(b_l0_tile[0], Zero_l1_tile);
+        CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
+            Y_l1_tile[t0], a_l0_tile[0]);
+        CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
+            Y_l1_tile[t0], b_l0_tile[0]);
+        TMOV(a_l0_tile[1], Zero_l1_tile);
+        TMOV(b_l0_tile[1], Zero_l1_tile);
+        CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
+            Y_l1_tile[t1], a_l0_tile[1]);
+        CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
+            Y_l1_tile[t1], b_l0_tile[1]);
+        GDN_PAIR_COMMIT_AB();
+        GDN_PAIR_MATMUL_FINAL();
+        GDN_PAIR_STORE_L1(X_l1_tile[t0], X_l1_tile[t1]);
+    }
+
+    // Y_l1 becomes X = diag(M) @ (-I) + (-I) @ (-I).
+#pragma unroll
+    for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+        const uint32_t t0 = pair;
+        const uint32_t t1 = pair + 1;
+        GDN_PAIR_ACQUIRE_AB();
+        TMOV(a_l0_tile[0], Zero_l1_tile);
+        CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
+            Y_l1_tile[t0], a_l0_tile[0]);
+        TMOV(b_l0_tile[0], I_neg_l1_tile);
+        TMOV(a_l0_tile[1], Zero_l1_tile);
+        CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
+            Y_l1_tile[t1], a_l0_tile[1]);
+        TMOV(b_l0_tile[1], I_neg_l1_tile);
+        GDN_PAIR_COMMIT_AB();
+        GDN_PAIR_MATMUL_KEEP_C();
+        GDN_PAIR_ACQUIRE_AB();
+        TMOV(a_l0_tile[0], I_neg_l1_tile);
+        TMOV(b_l0_tile[0], I_neg_l1_tile);
+        TMOV(a_l0_tile[1], I_neg_l1_tile);
+        TMOV(b_l0_tile[1], I_neg_l1_tile);
+        GDN_PAIR_COMMIT_AB();
+        GDN_PAIR_MATMUL_ACC_FINAL();
+        GDN_PAIR_STORE_L1(Y_l1_tile[t0], Y_l1_tile[t1]);
+    }
+    GDN_PAIR_WAIT_L1_STORES();
+
+    // Inverse trick.  Y_l1 is X and X_l1 is Y from this point onward.
+    for (uint32_t block_size = 1; block_size < FractalSize / 2;
+         block_size *= 2) {
+#pragma unroll
+        for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+            const uint32_t t0 = pair;
+            const uint32_t t1 = pair + 1;
+            GDN_PAIR_ACQUIRE_AB();
+            TMOV(a_l0_tile[0], Y_l1_tile[t0]);
+            TMOV(b_l0_tile[0], I_l1_tile);
+            TMOV(a_l0_tile[1], Y_l1_tile[t1]);
+            TMOV(b_l0_tile[1], I_l1_tile);
+            GDN_PAIR_COMMIT_AB();
+            GDN_PAIR_MATMUL_KEEP_C();
+            GDN_PAIR_ACQUIRE_AB();
+            TMOV(a_l0_tile[0], Y_l1_tile[t0]);
+            TMOV(b_l0_tile[0], X_l1_tile[t0]);
+            TMOV(a_l0_tile[1], Y_l1_tile[t1]);
+            TMOV(b_l0_tile[1], X_l1_tile[t1]);
+            GDN_PAIR_COMMIT_AB();
+            GDN_PAIR_MATMUL_ACC_FINAL();
+            GDN_PAIR_STORE_L1(Y_l1_tile[t0], Y_l1_tile[t1]);
+        }
+        GDN_PAIR_WAIT_L1_STORES();
+
+        if (block_size < FractalSize / 4) {
+#pragma unroll
+            for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+                const uint32_t t0 = pair;
+                const uint32_t t1 = pair + 1;
+                GDN_PAIR_ACQUIRE_AB();
+                TMOV(a_l0_tile[0], X_l1_tile[t0]);
+                TMOV(b_l0_tile[0], X_l1_tile[t0]);
+                TMOV(a_l0_tile[1], X_l1_tile[t1]);
+                TMOV(b_l0_tile[1], X_l1_tile[t1]);
+                GDN_PAIR_COMMIT_AB();
+                GDN_PAIR_MATMUL_FINAL();
+                GDN_PAIR_STORE_L1(X_l1_tile[t0], X_l1_tile[t1]);
+            }
+            GDN_PAIR_WAIT_L1_STORES();
+        }
+    }
+
+    // Recursive assembly of the 16, 32 and 64-wide block inverses.
+    for (uint32_t block_size = FractalSize; block_size < MatrixSize;
+         block_size *= 2) {
+        // X_l1 is the recursion temporary Y = I + LX @ M_neg.
+#pragma unroll
+        for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+            const uint32_t t0 = pair;
+            const uint32_t t1 = pair + 1;
+            GDN_PAIR_ACQUIRE_AB();
+            TMOV(a_l0_tile[0], I_l1_tile);
+            TMOV(b_l0_tile[0], I_l1_tile);
+            TMOV(a_l0_tile[1], I_l1_tile);
+            TMOV(b_l0_tile[1], I_l1_tile);
+            GDN_PAIR_COMMIT_AB();
+            GDN_PAIR_MATMUL_KEEP_C();
+            GDN_PAIR_ACQUIRE_AB();
+            TMOV(a_l0_tile[0], Zero_l1_tile);
+            CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+                Y_l1_tile[t0], a_l0_tile[0], block_size, swap_parity);
+            TMOV(b_l0_tile[0], M_neg_l1_tile[t0]);
+            TMOV(a_l0_tile[1], Zero_l1_tile);
+            CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+                Y_l1_tile[t1], a_l0_tile[1], block_size, swap_parity);
+            TMOV(b_l0_tile[1], M_neg_l1_tile[t1]);
+            GDN_PAIR_COMMIT_AB();
+            GDN_PAIR_MATMUL_ACC_FINAL();
+            GDN_PAIR_STORE_L1(X_l1_tile[t0], X_l1_tile[t1]);
+        }
+        GDN_PAIR_WAIT_L1_STORES();
+
+#pragma unroll
+        for (uint32_t pair = 0; pair < NumInterleavedTiles; pair += 2) {
+            const uint32_t t0 = pair;
+            const uint32_t t1 = pair + 1;
+            GDN_PAIR_ACQUIRE_AB();
+            TMOV(a_l0_tile[0], Zero_l1_tile);
+            CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+                Y_l1_tile[t0], a_l0_tile[0], block_size, swap_parity);
+            TMOV(b_l0_tile[0], I_l1_tile);
+            TMOV(a_l0_tile[1], Zero_l1_tile);
+            CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+                Y_l1_tile[t1], a_l0_tile[1], block_size, swap_parity);
+            TMOV(b_l0_tile[1], I_l1_tile);
+            GDN_PAIR_COMMIT_AB();
+            GDN_PAIR_MATMUL_KEEP_C();
+            GDN_PAIR_ACQUIRE_AB();
+            TMOV(a_l0_tile[0], X_l1_tile[t0]);
+            TMOV(b_l0_tile[0], Zero_l1_tile);
+            CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+                Y_l1_tile[t0], b_l0_tile[0], block_size, swap_parity);
+            TMOV(a_l0_tile[1], X_l1_tile[t1]);
+            TMOV(b_l0_tile[1], Zero_l1_tile);
+            CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+                Y_l1_tile[t1], b_l0_tile[1], block_size, swap_parity);
+            GDN_PAIR_COMMIT_AB();
+            GDN_PAIR_MATMUL_ACC_FINAL();
+
+            if (block_size < MatrixSize / 2) {
+                GDN_PAIR_STORE_L1(Y_l1_tile[t0], Y_l1_tile[t1]);
+            } else {
+                using GlobalShape =
+                    TileShape2D<StoreT, MatrixSize, MatrixSize, Layout::ND>;
+                using GlobalStride = pto::Stride<1, 1, 1, -1, 1>;
+                using GlobalOut =
+                    GlobalTensor<StoreT, GlobalShape, GlobalStride, Layout::ND>;
+                using DynamicShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
+                using DynamicStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+                using DynamicOut = GlobalTensor<StoreT, DynamicShape,
+                                                DynamicStride, Layout::ND>;
+                using DynamicAcc = TileAcc<OutputT, MatrixSize, MatrixSize,
+                                           DYNAMIC, DYNAMIC>;
+                const int row_stride =
+                    static_cast<int>(MatrixSize * num_bsnd_heads);
+                const uint32_t valid0 = bsnd_tile_valid_sizes[t0];
+                const uint32_t valid1 = bsnd_tile_valid_sizes[t1];
+                wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+                if (valid0 < MatrixSize) {
+                    DynamicAcc out0(valid0, valid0);
+                    TASSIGN(out0, 0);
+                    DynamicOut gm0(
+                        M_inv + bsnd_tile_offsets[t0],
+                        {1, 1, 1, static_cast<int>(valid0),
+                         static_cast<int>(valid0)},
+                        {1, 1, 1, row_stride, 1});
+                    TSTORE(gm0, out0);
+                } else {
+                    GlobalOut gm0(M_inv + bsnd_tile_offsets[t0], {},
+                                  {row_stride});
+                    TSTORE(gm0, c_l0_tile[0]);
+                }
+                set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+                wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
+                if (valid1 < MatrixSize) {
+                    DynamicAcc out1(valid1, valid1);
+                    TASSIGN(out1, TileLen * sizeof(OutputT));
+                    DynamicOut gm1(
+                        M_inv + bsnd_tile_offsets[t1],
+                        {1, 1, 1, static_cast<int>(valid1),
+                         static_cast<int>(valid1)},
+                        {1, 1, 1, row_stride, 1});
+                    TSTORE(gm1, out1);
+                } else {
+                    GlobalOut gm1(M_inv + bsnd_tile_offsets[t1], {},
+                                  {row_stride});
+                    TSTORE(gm1, c_l0_tile[1]);
+                }
+                set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+            }
+        }
+        if (block_size < MatrixSize / 2) {
+            GDN_PAIR_WAIT_L1_STORES();
+        }
+    }
+
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+}
+#undef GDN_PAIR_WAIT_L1_STORES
+#undef GDN_PAIR_STORE_L1
+#undef GDN_PAIR_MATMUL_ACC_FINAL
+#undef GDN_PAIR_MATMUL_FINAL
+#undef GDN_PAIR_MATMUL_KEEP_C
+#undef GDN_PAIR_COMMIT_AB
+#undef GDN_PAIR_ACQUIRE_AB
+#endif
+
 /*
  * @brief: Runs the main kernel (inverts all matrices in the tensor)
  *
@@ -462,10 +785,12 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile, Tile
  * @param num_bsnd_heads The number of heads, only for BSND format.
  */
 template <typename InputT, typename OutputT, uint32_t MatrixSize, uint32_t NumTilesPerCubeIter, bool IsBSND,
-          typename StoreT = OutputT>
+          typename StoreT = OutputT, bool WaitForKktReady = false,
+          bool PrecomputedAuxiliary = false>
 AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M, __gm__ InputT *I_neg,
                                          uint32_t total_tiles, uint32_t num_bsnd_heads = 0,
-                                         __gm__ int32_t *cu_seqlens = nullptr, uint32_t is_lower = 0)
+                                         __gm__ int32_t *cu_seqlens = nullptr, uint32_t is_lower = 0,
+                                         bool use_precomputed_m_neg = false)
 {
     /* Initializations */
     constexpr uint32_t TileLen = MatrixSize * MatrixSize;
@@ -473,7 +798,22 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
     constexpr uint32_t NumFractalsRowWise = MatrixSize / FractalSize;
     constexpr uint32_t NumL0Buffers = 2;
 
-    if (get_block_idx() * NumTilesPerCubeIter >= total_tiles) {
+    const uint32_t core_id = get_block_idx();
+    const uint32_t core_count = get_block_num();
+    uint32_t producer_group_count = 0;
+    uint32_t producer_tile_count = 0;
+    if constexpr (WaitForKktReady) {
+        static_assert(IsBSND && (NumTilesPerCubeIter == 2 ||
+                                 NumTilesPerCubeIter == 3),
+                      "KKT-Solve pipeline requires grouped BSND Solve.");
+        const uint32_t total_groups = total_tiles / NumTilesPerCubeIter;
+        if (core_id >= total_groups) {
+            return;
+        }
+        producer_group_count = 1 + (total_groups - 1 - core_id) / core_count;
+        producer_tile_count =
+            producer_group_count * NumTilesPerCubeIter;
+    } else if (core_id * NumTilesPerCubeIter >= total_tiles) {
         return;
     }
 
@@ -506,13 +846,29 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
     using TileL0CDynamic = TileAcc<OutputT, MatrixSize, MatrixSize, DYNAMIC, DYNAMIC>;
 
     GlobalTileINeg I_neg_global_in(I_neg);
+    GlobalTileINeg I_global_in(I_neg + TileLen);
+    GlobalTileINeg Zero_global_in(I_neg + 2 * TileLen);
 
-    TileL1AB X_l1_tile;
     TileL1AB I_l1_tile;
     TileL1AB I_neg_l1_tile;
-    TileL1AB M_neg_l1_tile;
     TileL1AB Zero_l1_tile;
+#ifdef MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE
+    constexpr uint32_t NumSolveStateTiles =
+        NumTilesPerCubeIter == 4 ? 2 : NumTilesPerCubeIter;
+    TileL1AB M_neg_l1_tile[NumSolveStateTiles];
+    TileL1AB X_l1_tile[NumSolveStateTiles];
+#elif defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE)
+    TileL1AB M_neg_l1_tile[NumTilesPerCubeIter];
+    TileL1AB X_l1_tile[NumTilesPerCubeIter];
+#else
+    TileL1AB M_neg_l1_tile;
+    TileL1AB X_l1_tile;
+#endif
+#ifdef MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE
+    TileL1AB Y_l1_tile[NumSolveStateTiles];
+#else
     TileL1AB Y_l1_tile[NumTilesPerCubeIter];
+#endif
 
     TileL0A a_l0_tile[NumL0Buffers];
     TileL0B b_l0_tile[NumL0Buffers];
@@ -521,11 +877,36 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
     TASSIGN(I_l1_tile, 0x0);
     TASSIGN(I_neg_l1_tile, 0x0 + TileLen * sizeof(InputT));
     TASSIGN(Zero_l1_tile, 0x0 + 2 * TileLen * sizeof(InputT));
+#ifdef MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE
+    for (uint32_t tile_id = 0; tile_id < NumSolveStateTiles; ++tile_id) {
+        TASSIGN(M_neg_l1_tile[tile_id],
+                0x0 + (3 + tile_id) * TileLen * sizeof(InputT));
+        TASSIGN(X_l1_tile[tile_id],
+                0x0 + (3 + NumSolveStateTiles + tile_id) *
+                          TileLen * sizeof(InputT));
+        TASSIGN(Y_l1_tile[tile_id],
+                0x0 + (3 + 2 * NumSolveStateTiles + tile_id) *
+                          TileLen * sizeof(InputT));
+    }
+#elif defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE)
+    for (uint32_t tile_id = 0; tile_id < NumTilesPerCubeIter; ++tile_id) {
+        TASSIGN(M_neg_l1_tile[tile_id],
+                0x0 + (3 + tile_id) * TileLen * sizeof(InputT));
+        TASSIGN(X_l1_tile[tile_id],
+                0x0 + (3 + NumTilesPerCubeIter + tile_id) *
+                          TileLen * sizeof(InputT));
+        TASSIGN(Y_l1_tile[tile_id],
+                0x0 + (3 + 2 * NumTilesPerCubeIter + tile_id) *
+                          TileLen * sizeof(InputT));
+    }
+#else
     TASSIGN(M_neg_l1_tile, 0x0 + 3 * TileLen * sizeof(InputT));
     TASSIGN(X_l1_tile, 0x0 + 4 * TileLen * sizeof(InputT));
     for (uint32_t tile_id = 0; tile_id < NumTilesPerCubeIter; ++tile_id) {
-        TASSIGN(Y_l1_tile[tile_id], 0x0 + (5 + tile_id) * TileLen * sizeof(InputT));
+        TASSIGN(Y_l1_tile[tile_id],
+                0x0 + (5 + tile_id) * TileLen * sizeof(InputT));
     }
+#endif
 
     for (uint32_t buffer_num = 0; buffer_num < NumL0Buffers; ++buffer_num) {
         TASSIGN(a_l0_tile[buffer_num], 0x0 + buffer_num * TileLen * sizeof(InputT));
@@ -533,31 +914,249 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
         TASSIGN(c_l0_tile[buffer_num], 0x0 + buffer_num * TileLen * sizeof(OutputT));
     }
     TLOAD(I_neg_l1_tile, I_neg_global_in);
+    if constexpr (PrecomputedAuxiliary) {
+        TLOAD(I_l1_tile, I_global_in);
+        TLOAD(Zero_l1_tile, Zero_global_in);
+    }
     set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(0));
     wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(0));
 
-    PrepareAuxiliaryMatrices<TileL1AB, TileL0A, TileL0B, TileL0C>(I_neg_l1_tile, Zero_l1_tile, I_l1_tile, a_l0_tile[0],
-                                                                  b_l0_tile[0], c_l0_tile[0]);
+    if constexpr (!PrecomputedAuxiliary) {
+        PrepareAuxiliaryMatrices<TileL1AB, TileL0A, TileL0B, TileL0C>(
+            I_neg_l1_tile, Zero_l1_tile, I_l1_tile, a_l0_tile[0],
+            b_l0_tile[0], c_l0_tile[0]);
+    }
 
-    const uint32_t max_iters_per_aic = CeilDiv(total_tiles, (uint32_t)(NumTilesPerCubeIter * get_block_num()));
+    uint32_t max_iters_per_aic = 0;
+    if constexpr (WaitForKktReady) {
+        max_iters_per_aic = CeilDiv(producer_tile_count, NumTilesPerCubeIter);
+    } else {
+        max_iters_per_aic =
+            CeilDiv(total_tiles, NumTilesPerCubeIter * core_count);
+    }
 
     /* Main iteration - Compute all tiles */
     uint32_t bsnd_tile_offsets[NumTilesPerCubeIter] = {0};
     uint32_t bsnd_tile_valid_sizes[NumTilesPerCubeIter] = {0};
+    uint32_t global_tile_ids[NumTilesPerCubeIter] = {0};
+    uint32_t next_ready_wave = 0;
     uint32_t next_tile_id_that_waits_for_pipe_fix_pipe_m = 0;
     set_flag(PIPE_FIX, PIPE_M, static_cast<event_t>(next_tile_id_that_waits_for_pipe_fix_pipe_m));
     for (uint32_t tile_id = 0; tile_id < NumTilesPerCubeIter; ++tile_id) {
         set_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
     }
     for (uint32_t cube_iter = 0; cube_iter < max_iters_per_aic; ++cube_iter) {
-        const uint32_t global_index = (cube_iter * get_block_num() + get_block_idx()) * NumTilesPerCubeIter;
-        if (global_index >= total_tiles) {
-            break;
+        uint32_t tiles_this_iter = 0;
+        uint32_t global_index = 0;
+        if constexpr (WaitForKktReady) {
+            const uint32_t local_tile_base = cube_iter * NumTilesPerCubeIter;
+            const uint32_t local_remaining = producer_tile_count - local_tile_base;
+            tiles_this_iter =
+                local_remaining < NumTilesPerCubeIter
+                    ? local_remaining
+                    : NumTilesPerCubeIter;
+            const uint32_t required_wave =
+                (local_tile_base + tiles_this_iter - 1) /
+                NumTilesPerCubeIter;
+            while (next_ready_wave <= required_wave) {
+                const uint32_t solve_slot = next_ready_wave & 3;
+#if defined(PTO_NPU_ARCH_A5)
+                gdn_sync::Wait<PIPE_MTE2>(solve_slot);
+#else
+                wait_flag_dev(solve_slot);
+#endif
+                if (next_ready_wave + 4 < producer_group_count) {
+#if defined(PTO_NPU_ARCH_A5)
+                    gdn_sync::Signal<PIPE_FIX>(
+                        1 | (2 << 4) | ((4 + solve_slot) << 8));
+#else
+                    ffts_cross_core_sync(
+                        PIPE_FIX,
+                        1 | (2 << 4) | ((4 + solve_slot) << 8));
+#endif
+                }
+                ++next_ready_wave;
+            }
+            for (uint32_t tile_id = 0; tile_id < tiles_this_iter;
+                 ++tile_id) {
+                const uint32_t local_tile_id = local_tile_base + tile_id;
+                const uint32_t producer_wave =
+                    local_tile_id / NumTilesPerCubeIter;
+                const uint32_t group_lane =
+                    local_tile_id % NumTilesPerCubeIter;
+                const uint32_t group_id =
+                    producer_wave * core_count + core_id;
+                global_tile_ids[tile_id] =
+                    group_id * NumTilesPerCubeIter + group_lane;
+            }
+        } else {
+            global_index =
+                (cube_iter * core_count + core_id) * NumTilesPerCubeIter;
+            if (global_index >= total_tiles) {
+                break;
+            }
+            const uint32_t global_remaining = total_tiles - global_index;
+            tiles_this_iter =
+                global_remaining < NumTilesPerCubeIter
+                    ? global_remaining
+                    : NumTilesPerCubeIter;
+            for (uint32_t tile_id = 0; tile_id < tiles_this_iter;
+                 ++tile_id) {
+                global_tile_ids[tile_id] = global_index + tile_id;
+            }
         }
-        for (uint32_t tile_id = 0; (tile_id < NumTilesPerCubeIter) && (global_index + tile_id < total_tiles);
-             ++tile_id) {
+#ifdef MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE
+        if constexpr (IsBSND && MatrixSize == 128 &&
+                      NumTilesPerCubeIter == 4) {
+            for (uint32_t tile_id = 0; tile_id < tiles_this_iter;
+                 ++tile_id) {
+                const uint32_t global_tile_id = global_tile_ids[tile_id];
+                if (cu_seqlens != nullptr) {
+                    const BSNDVarlenTileInfo tile_info =
+                        GetBSNDVarlenTileInfoFromCuSeqlens(
+                            global_tile_id, num_bsnd_heads, MatrixSize,
+                            cu_seqlens);
+                    bsnd_tile_offsets[tile_id] = tile_info.bsnd_offset;
+                    bsnd_tile_valid_sizes[tile_id] = tile_info.valid_size;
+                } else {
+                    bsnd_tile_offsets[tile_id] = GetBSNDFixedTileOffset(
+                        global_tile_id, num_bsnd_heads, MatrixSize);
+                    bsnd_tile_valid_sizes[tile_id] = MatrixSize;
+                }
+            }
+
+            wait_flag(PIPE_FIX, PIPE_M,
+                      static_cast<event_t>(
+                          next_tile_id_that_waits_for_pipe_fix_pipe_m));
+            uint32_t pair_base = 0;
+            for (; pair_base + 1 < tiles_this_iter; pair_base += 2) {
+#pragma unroll
+                for (uint32_t lane = 0; lane < 2; ++lane) {
+                    const uint32_t tile_id = pair_base + lane;
+                    const uint32_t bsnd_offset =
+                        bsnd_tile_offsets[tile_id];
+                    const uint32_t valid_size =
+                        bsnd_tile_valid_sizes[tile_id];
+                    const int row_stride = static_cast<int>(
+                        MatrixSize * num_bsnd_heads);
+                    wait_flag(PIPE_M, PIPE_MTE2,
+                              static_cast<event_t>(tile_id));
+                    if (valid_size < MatrixSize) {
+                        TileL1ABDynamic Y_dyn_l1_tile(valid_size,
+                                                     valid_size);
+                        TASSIGN(Y_dyn_l1_tile,
+                                0x0 +
+                                    (3 + 2 * NumSolveStateTiles + lane) *
+                                        TileLen * sizeof(InputT));
+                        GlobalTileDynamicIn M_global_in_dyn(
+                            M + bsnd_offset,
+                            {1, 1, 1, static_cast<int>(valid_size),
+                             static_cast<int>(valid_size)},
+                            {1, 1, 1, row_stride, 1});
+                        TLOAD(Y_dyn_l1_tile, M_global_in_dyn);
+                        set_flag(PIPE_MTE2, PIPE_MTE1,
+                                 static_cast<event_t>(lane));
+                        wait_flag(PIPE_MTE2, PIPE_MTE1,
+                                  static_cast<event_t>(lane));
+                        TFILLPAD(Y_dyn_l1_tile, Y_dyn_l1_tile);
+                    } else {
+                        GlobalTileIn M_global_in(
+                            M + bsnd_offset, {}, {row_stride});
+                        TLOAD(Y_l1_tile[lane], M_global_in);
+                    }
+                    set_flag(PIPE_MTE2, PIPE_MTE1,
+                             static_cast<event_t>(lane));
+                }
+                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+                InvertTilesInterleavedBSND<
+                    InputT, OutputT, StoreT, TileL1AB, TileL0A,
+                    TileL0B, TileL0C, MatrixSize, FractalSize, 2>(
+                    M_inv, num_bsnd_heads,
+                    bsnd_tile_offsets + pair_base,
+                    bsnd_tile_valid_sizes + pair_base, I_l1_tile,
+                    I_neg_l1_tile, Zero_l1_tile, M_neg_l1_tile,
+                    X_l1_tile, Y_l1_tile, a_l0_tile, b_l0_tile,
+                    c_l0_tile, is_lower != 0);
+                if (pair_base + 3 < tiles_this_iter) {
+                    pipe_barrier(PIPE_ALL);
+                }
+                set_flag(PIPE_M, PIPE_MTE2,
+                         static_cast<event_t>(pair_base));
+                set_flag(PIPE_M, PIPE_MTE2,
+                         static_cast<event_t>(pair_base + 1));
+            }
+
+            if (pair_base < tiles_this_iter) {
+                const uint32_t tile_id = pair_base;
+                const uint32_t bsnd_offset =
+                    bsnd_tile_offsets[tile_id];
+                const uint32_t valid_size =
+                    bsnd_tile_valid_sizes[tile_id];
+                const int row_stride = static_cast<int>(
+                    MatrixSize * num_bsnd_heads);
+                wait_flag(PIPE_M, PIPE_MTE2,
+                          static_cast<event_t>(tile_id));
+                if (valid_size < MatrixSize) {
+                    TileL1ABDynamic Y_dyn_l1_tile(valid_size, valid_size);
+                    TASSIGN(Y_dyn_l1_tile,
+                            0x0 + (3 + 2 * NumSolveStateTiles) *
+                                      TileLen * sizeof(InputT));
+                    GlobalTileDynamicIn M_global_in_dyn(
+                        M + bsnd_offset,
+                        {1, 1, 1, static_cast<int>(valid_size),
+                         static_cast<int>(valid_size)},
+                        {1, 1, 1, row_stride, 1});
+                    TLOAD(Y_dyn_l1_tile, M_global_in_dyn);
+                    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                    TFILLPAD(Y_dyn_l1_tile, Y_dyn_l1_tile);
+                } else {
+                    GlobalTileIn M_global_in(
+                        M + bsnd_offset, {}, {row_stride});
+                    TLOAD(Y_l1_tile[0], M_global_in);
+                }
+                set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+                wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+                InvertSingleTile<InputT, TileL1AB, TileL0A, TileL0B,
+                                 TileL0C, MatrixSize, FractalSize, 2>(
+                    X_l1_tile[0], I_l1_tile, I_neg_l1_tile,
+                    M_neg_l1_tile[0], Zero_l1_tile, Y_l1_tile[0],
+                    a_l0_tile, b_l0_tile, c_l0_tile, 0,
+                    is_lower != 0);
+                constexpr uint32_t final_c_buffer_index =
+                    MatrixSize > FractalSize ? 1 : 0;
+                if (valid_size < MatrixSize) {
+                    TileL0CDynamic c_l0_tail_tile(valid_size, valid_size);
+                    TASSIGN(c_l0_tail_tile,
+                            final_c_buffer_index * TileLen *
+                                sizeof(OutputT));
+                    GlobalTileDynamicOut M_inv_global_out_dyn(
+                        M_inv + bsnd_offset,
+                        {1, 1, 1, static_cast<int>(valid_size),
+                         static_cast<int>(valid_size)},
+                        {1, 1, 1, row_stride, 1});
+                    TSTORE(M_inv_global_out_dyn, c_l0_tail_tile);
+                } else {
+                    GlobalTileOut M_inv_global_out(
+                        M_inv + bsnd_offset, {}, {row_stride});
+                    TSTORE(M_inv_global_out,
+                           c_l0_tile[final_c_buffer_index]);
+                }
+                set_flag(PIPE_M, PIPE_MTE2,
+                         static_cast<event_t>(tile_id));
+            }
+            set_flag(PIPE_FIX, PIPE_M,
+                     static_cast<event_t>(
+                         next_tile_id_that_waits_for_pipe_fix_pipe_m));
+            continue;
+        }
+#endif
+        for (uint32_t tile_id = 0; tile_id < tiles_this_iter; ++tile_id) {
             if constexpr (IsBSND) {
-                const uint32_t global_tile_id = global_index + tile_id;
+                const uint32_t global_tile_id = global_tile_ids[tile_id];
                 if (cu_seqlens != nullptr) {
                     const BSNDVarlenTileInfo tile_info =
                         GetBSNDVarlenTileInfoFromCuSeqlens(global_tile_id, num_bsnd_heads, MatrixSize, cu_seqlens);
@@ -573,7 +1172,20 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
                 wait_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
                 if (valid_size < MatrixSize) {
                     TileL1ABDynamic Y_dyn_l1_tile(valid_size, valid_size);
-                    TASSIGN(Y_dyn_l1_tile, 0x0 + (5 + tile_id) * TileLen * sizeof(InputT));
+#ifdef MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE
+                    TASSIGN(Y_dyn_l1_tile,
+                            0x0 +
+                                (3 + 2 * NumSolveStateTiles + tile_id) *
+                                    TileLen * sizeof(InputT));
+#elif defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE)
+                    TASSIGN(Y_dyn_l1_tile,
+                            0x0 +
+                                (3 + 2 * NumTilesPerCubeIter + tile_id) *
+                                    TileLen * sizeof(InputT));
+#else
+                    TASSIGN(Y_dyn_l1_tile,
+                            0x0 + (5 + tile_id) * TileLen * sizeof(InputT));
+#endif
                     GlobalTileDynamicIn M_global_in_dyn(
                         M + bsnd_offset, {1, 1, 1, static_cast<int>(valid_size), static_cast<int>(valid_size)},
                         {1, 1, 1, row_stride, 1});
@@ -586,7 +1198,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
                     TLOAD(Y_l1_tile[tile_id], M_global_in);
                 }
             } else {
-                GlobalTileIn M_global_in(M + (global_index + tile_id) * TileLen);
+                GlobalTileIn M_global_in(M + global_tile_ids[tile_id] * TileLen);
                 wait_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
                 TLOAD(Y_l1_tile[tile_id],
                       M_global_in);  // Copies NumTilesPerCubeIter tiles at once
@@ -595,16 +1207,125 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
         }
 
         constexpr uint32_t final_c_buffer_index = MatrixSize > FractalSize ? 1 : 0;
-        for (uint32_t tile_id = 0; (tile_id < NumTilesPerCubeIter) && (global_index + tile_id < total_tiles);
-             ++tile_id) {
+#ifdef MEGA_CHUNK_GDN_INTERLEAVED_SOLVE
+        bool use_interleaved_solve = false;
+        if constexpr (IsBSND && MatrixSize == 128 &&
+                      NumTilesPerCubeIter >= 2 &&
+                      NumTilesPerCubeIter % 2 == 0) {
+            use_interleaved_solve =
+                tiles_this_iter == NumTilesPerCubeIter;
+        }
+        if (use_interleaved_solve) {
+            if constexpr (IsBSND && MatrixSize == 128 &&
+                          NumTilesPerCubeIter >= 2 &&
+                          NumTilesPerCubeIter % 2 == 0) {
+                wait_flag(PIPE_FIX, PIPE_M,
+                          static_cast<event_t>(
+                              next_tile_id_that_waits_for_pipe_fix_pipe_m));
+                for (uint32_t tile_id = 0;
+                     tile_id < NumTilesPerCubeIter; ++tile_id) {
+                    wait_flag(PIPE_MTE2, PIPE_MTE1,
+                              static_cast<event_t>(tile_id));
+                }
+#pragma unroll
+                for (uint32_t pair = 0; pair < NumTilesPerCubeIter;
+                     pair += 2) {
+                    InvertTilesInterleavedBSND<
+                        InputT, OutputT, StoreT, TileL1AB, TileL0A,
+                        TileL0B, TileL0C, MatrixSize, FractalSize, 2>(
+                        M_inv, num_bsnd_heads, bsnd_tile_offsets + pair,
+                        bsnd_tile_valid_sizes + pair, I_l1_tile,
+                        I_neg_l1_tile, Zero_l1_tile,
+                        M_neg_l1_tile + pair, X_l1_tile + pair,
+                        Y_l1_tile + pair, a_l0_tile, b_l0_tile,
+                        c_l0_tile, is_lower != 0);
+                }
+                for (uint32_t tile_id = 0;
+                     tile_id < NumTilesPerCubeIter; ++tile_id) {
+                    set_flag(PIPE_M, PIPE_MTE2,
+                             static_cast<event_t>(tile_id));
+                }
+                set_flag(
+                    PIPE_FIX, PIPE_M,
+                    static_cast<event_t>(
+                        next_tile_id_that_waits_for_pipe_fix_pipe_m));
+            }
+        } else {
+#endif
+        for (uint32_t tile_id = 0; tile_id < tiles_this_iter; ++tile_id) {
             // Wait for previous cube iter to write result
             wait_flag(PIPE_FIX, PIPE_M, static_cast<event_t>(tile_id));
             // Wait for loading new matrices from GM
             wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile_id));
 
-            InvertSingleTile<InputT, TileL1AB, TileL0A, TileL0B, TileL0C, MatrixSize, FractalSize, NumTilesPerCubeIter>(
-                X_l1_tile, I_l1_tile, I_neg_l1_tile, M_neg_l1_tile, Zero_l1_tile, Y_l1_tile[tile_id], a_l0_tile,
-                b_l0_tile, c_l0_tile, tile_id, is_lower != 0);
+            if (use_precomputed_m_neg) {
+                __gm__ InputT *M_neg_precomputed = M;
+                if constexpr (IsBSND) {
+                    const uint32_t bsnd_offset =
+                        bsnd_tile_offsets[tile_id];
+                    const uint32_t valid_size =
+                        bsnd_tile_valid_sizes[tile_id];
+                    const int row_stride =
+                        static_cast<int>(MatrixSize * num_bsnd_heads);
+                    if (valid_size < MatrixSize) {
+                        TileL1ABDynamic M_neg_dyn_l1_tile(valid_size,
+                                                         valid_size);
+#if defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE) || \
+    defined(MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE)
+                        TASSIGN(M_neg_dyn_l1_tile,
+                                0x0 + (3 + tile_id) * TileLen *
+                                          sizeof(InputT));
+#else
+                        TASSIGN(M_neg_dyn_l1_tile,
+                                0x0 + 3 * TileLen * sizeof(InputT));
+#endif
+                        GlobalTileDynamicIn M_neg_global_in_dyn(
+                            M_neg_precomputed + bsnd_offset,
+                            {1, 1, 1, static_cast<int>(valid_size),
+                             static_cast<int>(valid_size)},
+                            {1, 1, 1, row_stride, 1});
+                        TLOAD(M_neg_dyn_l1_tile, M_neg_global_in_dyn);
+                    } else {
+                        GlobalTileIn M_neg_global_in(
+                            M_neg_precomputed + bsnd_offset, {},
+                            {row_stride});
+#if defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE) || \
+    defined(MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE)
+                        TLOAD(M_neg_l1_tile[tile_id], M_neg_global_in);
+#else
+                        TLOAD(M_neg_l1_tile, M_neg_global_in);
+#endif
+                    }
+                } else {
+                    GlobalTileIn M_neg_global_in(
+                        M_neg_precomputed +
+                        global_tile_ids[tile_id] * TileLen);
+#if defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE) || \
+    defined(MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE)
+                    TLOAD(M_neg_l1_tile[tile_id], M_neg_global_in);
+#else
+                    TLOAD(M_neg_l1_tile, M_neg_global_in);
+#endif
+                }
+                set_flag(PIPE_MTE2, PIPE_MTE1,
+                         static_cast<event_t>(tile_id));
+                wait_flag(PIPE_MTE2, PIPE_MTE1,
+                          static_cast<event_t>(tile_id));
+            }
+
+            InvertSingleTile<InputT, TileL1AB, TileL0A, TileL0B,
+                             TileL0C, MatrixSize, FractalSize,
+                             NumTilesPerCubeIter>(
+#if defined(MEGA_CHUNK_GDN_INTERLEAVED_SOLVE) || \
+    defined(MEGA_CHUNK_GDN_STREAMED_PAIR_SOLVE)
+                X_l1_tile[tile_id], I_l1_tile, I_neg_l1_tile,
+                M_neg_l1_tile[tile_id], Zero_l1_tile,
+#else
+                X_l1_tile, I_l1_tile, I_neg_l1_tile, M_neg_l1_tile,
+                Zero_l1_tile,
+#endif
+                Y_l1_tile[tile_id], a_l0_tile, b_l0_tile, c_l0_tile,
+                tile_id, is_lower != 0, use_precomputed_m_neg);
 
             // Allow next cube_iter to proceed for this tile_id
             set_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
@@ -626,12 +1347,16 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT *M_inv, __gm__ InputT *M,
                     TSTORE(M_inv_global_out, c_l0_tile[final_c_buffer_index]);
                 }
             } else {
-                GlobalTileOut M_inv_global_out(M_inv + (global_index + tile_id) * TileLen);
+                GlobalTileOut M_inv_global_out(
+                    M_inv + global_tile_ids[tile_id] * TileLen);
                 TSTORE(M_inv_global_out, c_l0_tile[final_c_buffer_index]);
             }
             next_tile_id_that_waits_for_pipe_fix_pipe_m = (tile_id + 1) % NumTilesPerCubeIter;
             set_flag(PIPE_FIX, PIPE_M, static_cast<event_t>(next_tile_id_that_waits_for_pipe_fix_pipe_m));
         }
+#ifdef MEGA_CHUNK_GDN_INTERLEAVED_SOLVE
+        }
+#endif
     }
     for (uint32_t tile_id = 0; tile_id < NumTilesPerCubeIter; ++tile_id) {
         wait_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
@@ -1426,11 +2151,13 @@ AICORE inline void TriInvA5UbVectorKernel(
  * @brief: Computes the inverses of the blocks of tensor M
  */
 template <typename InputT, typename OutputT, uint32_t MatrixSize, uint32_t NumTilesPerCubeIter, bool IsBSND,
-          typename StoreT = OutputT>
+          typename StoreT = OutputT, bool WaitForKktReady = false,
+          bool PrecomputedAuxiliary = false>
 AICORE void runKernelTriInvRecUnroll(__gm__ StoreT *M_inv, __gm__ InputT *M, __gm__ InputT *I_neg, uint32_t total_tiles,
                                      uint32_t num_bsnd_heads = 0, __gm__ int32_t *cu_seqlens = nullptr,
                                      uint32_t is_lower = 0,
-                                     __gm__ InputT *a5_packed_workspace = nullptr)
+                                     __gm__ InputT *a5_packed_workspace = nullptr,
+                                     bool use_precomputed_m_neg = false)
 {
 #if defined(__DAV_C310_CUBE__)
     (void)is_lower;
@@ -1445,8 +2172,11 @@ AICORE void runKernelTriInvRecUnroll(__gm__ StoreT *M_inv, __gm__ InputT *M, __g
         a5_packed_workspace);
 #elif (__CHECK_FEATURE_AT_PRECOMPILE) || (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
 
-    TriInvRecUnrollKernel<InputT, OutputT, MatrixSize, NumTilesPerCubeIter, IsBSND, StoreT>(
-        M_inv, M, I_neg, total_tiles, num_bsnd_heads, cu_seqlens, is_lower);
+    TriInvRecUnrollKernel<InputT, OutputT, MatrixSize, NumTilesPerCubeIter,
+                          IsBSND, StoreT, WaitForKktReady,
+                          PrecomputedAuxiliary>(
+        M_inv, M, I_neg, total_tiles, num_bsnd_heads, cu_seqlens, is_lower,
+        use_precomputed_m_neg);
 #else
 // Nothing to do on AIV
 #endif
@@ -1478,3 +2208,680 @@ AICORE void run_tri_inv_rec_unroll(__gm__ float *tensor_out, __gm__ InputT *tens
             break;
     }
 }
+
+#ifdef MEGA_CHUNK_GDN_BLOCKED_SOLVE
+
+template <typename T, uint32_t Size>
+using BlockedSolveL1 =
+    Tile<TileType::Mat, T, Size, Size, BLayout::ColMajor, Size, Size,
+         SLayout::RowMajor, 512, PadValue::Zero>;
+
+template <typename T, uint32_t Size>
+using BlockedSolveL1Dynamic =
+    Tile<TileType::Mat, T, Size, Size, BLayout::ColMajor, DYNAMIC, DYNAMIC,
+         SLayout::RowMajor, 512, PadValue::Zero>;
+
+template <typename T, uint32_t Size>
+using BlockedSolveNdL1 =
+    Tile<TileType::Mat, T, Size, Size, BLayout::RowMajor, Size, Size,
+         SLayout::NoneBox, 512, PadValue::Zero>;
+
+template <typename T, uint32_t Size>
+using BlockedSolveL0A = TileLeft<T, Size, Size>;
+
+template <typename T, uint32_t Size>
+using BlockedSolveL0B = TileRight<T, Size, Size>;
+
+template <uint32_t Size>
+using BlockedSolveL0C = TileAcc<float, Size, Size>;
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveLoad(
+    __gm__ T *src, int64_t base_offset, int32_t row_stride, uint32_t row,
+    uint32_t col, BlockedSolveL1<T, Size> &dst)
+{
+    using GmShape = Shape<1, 1, 1, Size, Size>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    GlobalTensor<T, GmShape, GmStride> gm(
+        src + base_offset + static_cast<int64_t>(row) * row_stride + col, {},
+        {row_stride});
+    TLOAD(dst, gm);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveStore(
+    __gm__ T *dst, int64_t base_offset, int32_t row_stride, uint32_t row,
+    uint32_t col, BlockedSolveL0C<Size> &src)
+{
+    using GmShape = Shape<1, 1, 1, Size, Size>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    GlobalTensor<T, GmShape, GmStride> gm(
+        dst + base_offset + static_cast<int64_t>(row) * row_stride + col, {},
+        {row_stride});
+    TSTORE(gm, src);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveStore(
+    __gm__ T *dst, int64_t base_offset, int32_t row_stride, uint32_t row,
+    uint32_t col, BlockedSolveNdL1<T, Size> &src)
+{
+    using GmShape = Shape<1, 1, 1, Size, Size>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    GlobalTensor<T, GmShape, GmStride> gm(
+        dst + base_offset + static_cast<int64_t>(row) * row_stride + col, {},
+        {row_stride});
+    TSTORE(gm, src);
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveLoadNd(
+    __gm__ T *src, int64_t base_offset, int32_t row_stride, uint32_t row,
+    uint32_t col, BlockedSolveNdL1<T, Size> &dst)
+{
+    using GmShape = Shape<1, 1, 1, Size, Size>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    GlobalTensor<T, GmShape, GmStride> gm(
+        src + base_offset + static_cast<int64_t>(row) * row_stride + col, {},
+        {row_stride});
+    TLOAD(dst, gm);
+    pipe_barrier(PIPE_MTE2);
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveMatmul(
+    BlockedSolveL0C<Size> &out, BlockedSolveL1<T, Size> &lhs,
+    BlockedSolveL1<T, Size> &rhs, BlockedSolveL0A<T, Size> &l0a,
+    BlockedSolveL0B<T, Size> &l0b)
+{
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+#ifndef MEGA_CHUNK_GDN_BLOCKED_SOLVE_SKIP_FIX_WAR
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+#endif
+    TMOV(l0a, lhs);
+    TMOV(l0b, rhs);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    TMATMUL(out, l0a, l0b);
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveMatmulAcc(
+    BlockedSolveL0C<Size> &out, BlockedSolveL1<T, Size> &lhs,
+    BlockedSolveL1<T, Size> &rhs, BlockedSolveL0A<T, Size> &l0a,
+    BlockedSolveL0B<T, Size> &l0b)
+{
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+#ifndef MEGA_CHUNK_GDN_BLOCKED_SOLVE_SKIP_FIX_WAR
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+#endif
+    TMOV(l0a, lhs);
+    TMOV(l0b, rhs);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    TMATMUL_ACC(out, out, l0a, l0b);
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveAccToL1(
+    BlockedSolveL1<T, Size> &dst, BlockedSolveL0C<Size> &src)
+{
+    TMOV(dst, src);
+    set_flag(PIPE_FIX, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_MTE1, EVENT_ID0);
+}
+
+template <typename T, uint32_t Size, uint32_t NumPowerSteps>
+AICORE inline void BlockedSolveInvPower(
+    BlockedSolveL1<T, Size> &m, BlockedSolveL1<T, Size> &identity,
+    BlockedSolveL1<T, Size> &minus_identity, BlockedSolveL1<T, Size> &x,
+    BlockedSolveL1<T, Size> &power, BlockedSolveL0A<T, Size> &l0a,
+    BlockedSolveL0B<T, Size> &l0b, BlockedSolveL0C<Size> &l0c)
+{
+    BlockedSolveMatmul<T, Size>(l0c, minus_identity, m, l0a, l0b);
+    BlockedSolveMatmulAcc<T, Size>(
+        l0c, minus_identity, minus_identity, l0a, l0b);
+    BlockedSolveAccToL1<T, Size>(x, l0c);
+
+    BlockedSolveMatmul<T, Size>(l0c, m, m, l0a, l0b);
+    BlockedSolveAccToL1<T, Size>(power, l0c);
+    for (uint32_t step = 0; step < NumPowerSteps; ++step) {
+        BlockedSolveMatmul<T, Size>(l0c, x, identity, l0a, l0b);
+        BlockedSolveMatmulAcc<T, Size>(l0c, x, power, l0a, l0b);
+        BlockedSolveAccToL1<T, Size>(x, l0c);
+        if (step + 1 < NumPowerSteps) {
+            BlockedSolveMatmul<T, Size>(l0c, power, power, l0a, l0b);
+            BlockedSolveAccToL1<T, Size>(power, l0c);
+        }
+    }
+}
+
+template <typename T, uint32_t Size>
+AICORE inline void BlockedSolveCombine(
+    __gm__ T *out, __gm__ T *in, int64_t base_offset, int32_t row_stride,
+    uint32_t block_start, BlockedSolveL1<T, Size> &minus_identity,
+    uint32_t scratch_addr)
+{
+    BlockedSolveL1<T, Size> a_inv;
+    BlockedSolveL1<T, Size> d_inv;
+    BlockedSolveL1<T, Size> cross;
+    BlockedSolveL1<T, Size> tmp;
+    TASSIGN(a_inv, scratch_addr);
+    TASSIGN(d_inv, scratch_addr + Size * Size * sizeof(T));
+    TASSIGN(cross, scratch_addr + 2 * Size * Size * sizeof(T));
+    TASSIGN(tmp, scratch_addr + 3 * Size * Size * sizeof(T));
+
+    BlockedSolveL0A<T, Size> l0a;
+    BlockedSolveL0B<T, Size> l0b;
+    BlockedSolveL0C<Size> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+
+    BlockedSolveLoad<T, Size>(
+        out, base_offset, row_stride, block_start, block_start, a_inv);
+    BlockedSolveLoad<T, Size>(
+        out, base_offset, row_stride, block_start + Size,
+        block_start + Size, d_inv);
+    BlockedSolveLoad<T, Size>(
+        in, base_offset, row_stride, block_start + Size, block_start, cross);
+
+    BlockedSolveMatmul<T, Size>(
+        l0c, minus_identity, cross, l0a, l0b);
+    BlockedSolveAccToL1<T, Size>(tmp, l0c);
+    BlockedSolveMatmul<T, Size>(l0c, d_inv, tmp, l0a, l0b);
+    BlockedSolveAccToL1<T, Size>(tmp, l0c);
+    BlockedSolveMatmul<T, Size>(l0c, tmp, a_inv, l0a, l0b);
+    BlockedSolveStore<T, Size>(
+        out, base_offset, row_stride, block_start + Size, block_start, l0c);
+}
+
+template <typename T>
+AICORE inline void BlockedSolveFullMatrix16(
+    __gm__ T *out, __gm__ T *in, int64_t base_offset, int32_t row_stride,
+    BlockedSolveL1<T, 16> &identity16,
+    BlockedSolveL1<T, 16> &minus_identity16,
+    BlockedSolveNdL1<T, 16> &zero16,
+    BlockedSolveL1<T, 32> &minus_identity32,
+    BlockedSolveNdL1<T, 32> &zero32,
+    BlockedSolveL1<T, 64> &minus_identity64,
+    BlockedSolveNdL1<T, 64> &zero64)
+{
+    constexpr uint32_t ScratchAddr = 32768;
+
+    BlockedSolveStore<T, 64>(
+        out, base_offset, row_stride, 0, 64, zero64);
+    BlockedSolveStore<T, 32>(
+        out, base_offset, row_stride, 0, 32, zero32);
+    BlockedSolveStore<T, 32>(
+        out, base_offset, row_stride, 64, 96, zero32);
+    for (uint32_t block = 0; block < 128; block += 32) {
+        BlockedSolveStore<T, 16>(
+            out, base_offset, row_stride, block, block + 16, zero16);
+    }
+    pipe_barrier(PIPE_MTE3);
+
+    BlockedSolveL1<T, 16> m;
+    BlockedSolveL1<T, 16> x;
+    BlockedSolveL1<T, 16> power;
+    TASSIGN(m, ScratchAddr);
+    TASSIGN(x, ScratchAddr + 16 * 16 * sizeof(T));
+    TASSIGN(power, ScratchAddr + 2 * 16 * 16 * sizeof(T));
+    BlockedSolveL0A<T, 16> l0a;
+    BlockedSolveL0B<T, 16> l0b;
+    BlockedSolveL0C<16> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+
+    for (uint32_t block = 0; block < 128; block += 16) {
+        BlockedSolveLoad<T, 16>(
+            in, base_offset, row_stride, block, block, m);
+        BlockedSolveInvPower<T, 16, 3>(
+            m, identity16, minus_identity16, x, power, l0a, l0b, l0c);
+        BlockedSolveStore<T, 16>(
+            out, base_offset, row_stride, block, block, l0c);
+    }
+    for (uint32_t block = 0; block < 128; block += 32) {
+        BlockedSolveCombine<T, 16>(
+            out, in, base_offset, row_stride, block, minus_identity16,
+            ScratchAddr);
+    }
+    for (uint32_t block = 0; block < 128; block += 64) {
+        BlockedSolveCombine<T, 32>(
+            out, in, base_offset, row_stride, block, minus_identity32,
+            ScratchAddr);
+    }
+    BlockedSolveCombine<T, 64>(
+        out, in, base_offset, row_stride, 0, minus_identity64,
+        ScratchAddr);
+}
+
+template <typename T>
+AICORE inline void BlockedSolveFullMatrix64ResidentInplace(
+    __gm__ T *matrix_gm, int64_t base_offset, int32_t row_stride,
+    BlockedSolveL1<T, 64> &identity64,
+    BlockedSolveL1<T, 64> &minus_identity64)
+{
+    constexpr uint32_t TileBytes = 64 * 64 * sizeof(T);
+    constexpr uint32_t MatrixAddr = 3 * TileBytes;
+    constexpr uint32_t AInvAddr = 4 * TileBytes;
+    constexpr uint32_t DInvAddr = 5 * TileBytes;
+    constexpr uint32_t PowerAddr = 6 * TileBytes;
+    constexpr uint32_t CrossAddr = 7 * TileBytes;
+    constexpr uint32_t TmpAddr = 8 * TileBytes;
+
+    BlockedSolveL1<T, 64> matrix;
+    BlockedSolveL1<T, 64> a_inv;
+    BlockedSolveL1<T, 64> d_inv;
+    BlockedSolveL1<T, 64> power;
+    BlockedSolveL1<T, 64> cross;
+    BlockedSolveL1<T, 64> tmp;
+    TASSIGN(matrix, MatrixAddr);
+    TASSIGN(a_inv, AInvAddr);
+    TASSIGN(d_inv, DInvAddr);
+    TASSIGN(power, PowerAddr);
+    TASSIGN(cross, CrossAddr);
+    TASSIGN(tmp, TmpAddr);
+
+    BlockedSolveL0A<T, 64> l0a;
+    BlockedSolveL0B<T, 64> l0b;
+    BlockedSolveL0C<64> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+
+    BlockedSolveLoad<T, 64>(
+        matrix_gm, base_offset, row_stride, 0, 0, matrix);
+    BlockedSolveInvPower<T, 64, 5>(
+        matrix, identity64, minus_identity64, a_inv, power, l0a, l0b, l0c);
+    BlockedSolveStore<T, 64>(
+        matrix_gm, base_offset, row_stride, 0, 0, l0c);
+
+    BlockedSolveLoad<T, 64>(
+        matrix_gm, base_offset, row_stride, 64, 64, matrix);
+    BlockedSolveInvPower<T, 64, 5>(
+        matrix, identity64, minus_identity64, d_inv, power, l0a, l0b, l0c);
+    BlockedSolveStore<T, 64>(
+        matrix_gm, base_offset, row_stride, 64, 64, l0c);
+
+    BlockedSolveLoad<T, 64>(
+        matrix_gm, base_offset, row_stride, 64, 0, cross);
+    BlockedSolveMatmul<T, 64>(
+        l0c, minus_identity64, cross, l0a, l0b);
+    BlockedSolveAccToL1<T, 64>(tmp, l0c);
+    BlockedSolveMatmul<T, 64>(l0c, d_inv, tmp, l0a, l0b);
+    BlockedSolveAccToL1<T, 64>(tmp, l0c);
+    BlockedSolveMatmul<T, 64>(l0c, tmp, a_inv, l0a, l0b);
+    BlockedSolveStore<T, 64>(
+        matrix_gm, base_offset, row_stride, 64, 0, l0c);
+}
+
+template <typename T>
+AICORE inline void BlockedSolveTail64ResidentInplace(
+    __gm__ T *matrix_gm, int64_t base_offset, int32_t row_stride,
+    uint32_t valid_size, BlockedSolveL1<T, 64> &identity64,
+    BlockedSolveL1<T, 64> &minus_identity64)
+{
+    constexpr uint32_t TileBytes = 64 * 64 * sizeof(T);
+    constexpr uint32_t MatrixAddr = 3 * TileBytes;
+    constexpr uint32_t XAddr = 4 * TileBytes;
+    constexpr uint32_t PowerAddr = 5 * TileBytes;
+
+    BlockedSolveL1Dynamic<T, 64> dynamic_matrix(valid_size, valid_size);
+    TASSIGN(dynamic_matrix, MatrixAddr);
+    using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    GlobalTensor<T, GmShape, GmStride> gm_in(
+        matrix_gm + base_offset,
+        {1, 1, 1, static_cast<int>(valid_size),
+         static_cast<int>(valid_size)},
+        {1, 1, 1, row_stride, 1});
+    TLOAD(dynamic_matrix, gm_in);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    TFILLPAD(dynamic_matrix, dynamic_matrix);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+    BlockedSolveL1<T, 64> matrix;
+    BlockedSolveL1<T, 64> x;
+    BlockedSolveL1<T, 64> power;
+    TASSIGN(matrix, MatrixAddr);
+    TASSIGN(x, XAddr);
+    TASSIGN(power, PowerAddr);
+    BlockedSolveL0A<T, 64> l0a;
+    BlockedSolveL0B<T, 64> l0b;
+    BlockedSolveL0C<64> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+    BlockedSolveInvPower<T, 64, 5>(
+        matrix, identity64, minus_identity64, x, power, l0a, l0b,
+        l0c);
+
+    TileAcc<float, 64, 64, DYNAMIC, DYNAMIC> dynamic_out(
+        valid_size, valid_size);
+    TASSIGN(dynamic_out, 0);
+    GlobalTensor<T, GmShape, GmStride> gm_out(
+        matrix_gm + base_offset,
+        {1, 1, 1, static_cast<int>(valid_size),
+         static_cast<int>(valid_size)},
+        {1, 1, 1, row_stride, 1});
+    TSTORE(gm_out, dynamic_out);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+}
+
+template <typename T>
+AICORE inline void BlockedSolveDynamic128ResidentInplace(
+    __gm__ T *matrix_gm, int64_t base_offset, int32_t row_stride,
+    uint32_t valid_size, BlockedSolveL1<T, 64> &identity64,
+    BlockedSolveL1<T, 64> &minus_identity64)
+{
+    constexpr uint32_t TileBytes = 64 * 64 * sizeof(T);
+    constexpr uint32_t MatrixAddr = 3 * TileBytes;
+    constexpr uint32_t AInvAddr = 4 * TileBytes;
+    constexpr uint32_t DInvAddr = 5 * TileBytes;
+    constexpr uint32_t PowerAddr = 6 * TileBytes;
+    constexpr uint32_t CrossAddr = 7 * TileBytes;
+    constexpr uint32_t TmpAddr = 8 * TileBytes;
+    const uint32_t bottom_size = valid_size - 64;
+
+    BlockedSolveL1<T, 64> matrix;
+    BlockedSolveL1<T, 64> a_inv;
+    BlockedSolveL1<T, 64> d_inv;
+    BlockedSolveL1<T, 64> power;
+    BlockedSolveL1<T, 64> cross;
+    BlockedSolveL1<T, 64> tmp;
+    TASSIGN(matrix, MatrixAddr);
+    TASSIGN(a_inv, AInvAddr);
+    TASSIGN(d_inv, DInvAddr);
+    TASSIGN(power, PowerAddr);
+    TASSIGN(cross, CrossAddr);
+    TASSIGN(tmp, TmpAddr);
+
+    BlockedSolveL0A<T, 64> l0a;
+    BlockedSolveL0B<T, 64> l0b;
+    BlockedSolveL0C<64> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+
+    BlockedSolveLoad<T, 64>(
+        matrix_gm, base_offset, row_stride, 0, 0, matrix);
+    BlockedSolveInvPower<T, 64, 5>(
+        matrix, identity64, minus_identity64, a_inv, power, l0a, l0b,
+        l0c);
+    BlockedSolveStore<T, 64>(
+        matrix_gm, base_offset, row_stride, 0, 0, l0c);
+
+    using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    {
+        BlockedSolveL1Dynamic<T, 64> dynamic_matrix(
+            bottom_size, bottom_size);
+        TASSIGN(dynamic_matrix, MatrixAddr);
+        GlobalTensor<T, GmShape, GmStride> gm(
+            matrix_gm + base_offset + static_cast<int64_t>(64) * row_stride + 64,
+            {1, 1, 1, static_cast<int>(bottom_size),
+             static_cast<int>(bottom_size)},
+            {1, 1, 1, row_stride, 1});
+        TLOAD(dynamic_matrix, gm);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        TFILLPAD(dynamic_matrix, dynamic_matrix);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    }
+    BlockedSolveInvPower<T, 64, 5>(
+        matrix, identity64, minus_identity64, d_inv, power, l0a, l0b,
+        l0c);
+    {
+        TileAcc<float, 64, 64, DYNAMIC, DYNAMIC> dynamic_out(
+            bottom_size, bottom_size);
+        TASSIGN(dynamic_out, 0);
+        GlobalTensor<T, GmShape, GmStride> gm(
+            matrix_gm + base_offset + static_cast<int64_t>(64) * row_stride + 64,
+            {1, 1, 1, static_cast<int>(bottom_size),
+             static_cast<int>(bottom_size)},
+            {1, 1, 1, row_stride, 1});
+        TSTORE(gm, dynamic_out);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    }
+
+    {
+        BlockedSolveL1Dynamic<T, 64> dynamic_cross(bottom_size, 64);
+        TASSIGN(dynamic_cross, CrossAddr);
+        GlobalTensor<T, GmShape, GmStride> gm(
+            matrix_gm + base_offset + static_cast<int64_t>(64) * row_stride,
+            {1, 1, 1, static_cast<int>(bottom_size), 64},
+            {1, 1, 1, row_stride, 1});
+        TLOAD(dynamic_cross, gm);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        TFILLPAD(dynamic_cross, dynamic_cross);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    }
+    BlockedSolveMatmul<T, 64>(
+        l0c, minus_identity64, cross, l0a, l0b);
+    BlockedSolveAccToL1<T, 64>(tmp, l0c);
+    BlockedSolveMatmul<T, 64>(l0c, d_inv, tmp, l0a, l0b);
+    BlockedSolveAccToL1<T, 64>(tmp, l0c);
+    BlockedSolveMatmul<T, 64>(l0c, tmp, a_inv, l0a, l0b);
+    {
+        TileAcc<float, 64, 64, DYNAMIC, DYNAMIC> dynamic_out(
+            bottom_size, 64);
+        TASSIGN(dynamic_out, 0);
+        GlobalTensor<T, GmShape, GmStride> gm(
+            matrix_gm + base_offset + static_cast<int64_t>(64) * row_stride,
+            {1, 1, 1, static_cast<int>(bottom_size), 64},
+            {1, 1, 1, row_stride, 1});
+        TSTORE(gm, dynamic_out);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    }
+}
+
+template <typename T>
+AICORE inline void BlockedSolveTail16(
+    __gm__ T *out, __gm__ T *in, int64_t base_offset,
+    int32_t row_stride, uint32_t valid_size,
+    BlockedSolveL1<T, 16> &identity16,
+    BlockedSolveL1<T, 16> &minus_identity16)
+{
+    constexpr uint32_t ScratchAddr = 32768;
+    BlockedSolveL1Dynamic<T, 16> dynamic_m(valid_size, valid_size);
+    TASSIGN(dynamic_m, ScratchAddr);
+    using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
+    using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+    GlobalTensor<T, GmShape, GmStride> gm_in(
+        in + base_offset,
+        {1, 1, 1, static_cast<int>(valid_size),
+         static_cast<int>(valid_size)},
+        {1, 1, 1, row_stride, 1});
+    TLOAD(dynamic_m, gm_in);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    TFILLPAD(dynamic_m, dynamic_m);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+    BlockedSolveL1<T, 16> m;
+    BlockedSolveL1<T, 16> x;
+    BlockedSolveL1<T, 16> power;
+    TASSIGN(m, ScratchAddr);
+    TASSIGN(x, ScratchAddr + 16 * 16 * sizeof(T));
+    TASSIGN(power, ScratchAddr + 2 * 16 * 16 * sizeof(T));
+    BlockedSolveL0A<T, 16> l0a;
+    BlockedSolveL0B<T, 16> l0b;
+    BlockedSolveL0C<16> l0c;
+    TASSIGN(l0a, 0);
+    TASSIGN(l0b, 0);
+    TASSIGN(l0c, 0);
+    BlockedSolveInvPower<T, 16, 3>(
+        m, identity16, minus_identity16, x, power, l0a, l0b, l0c);
+
+    TileAcc<float, 16, 16, DYNAMIC, DYNAMIC> dynamic_out(
+        valid_size, valid_size);
+    TASSIGN(dynamic_out, 0);
+    GlobalTensor<T, GmShape, GmStride> gm_out(
+        out + base_offset,
+        {1, 1, 1, static_cast<int>(valid_size),
+         static_cast<int>(valid_size)},
+        {1, 1, 1, row_stride, 1});
+    TSTORE(gm_out, dynamic_out);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+}
+
+template <typename T>
+AICORE inline void runKernelTriInvBlocked16BSND(
+    __gm__ T *out, __gm__ T *in, __gm__ T *minus_identity,
+    uint32_t total_matrices, uint32_t num_heads, int64_t total_tokens)
+{
+#if (__CHECK_FEATURE_AT_PRECOMPILE) || \
+    (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
+    if (num_heads == 0 || total_tokens <= 0) return;
+
+    constexpr uint32_t Identity16Addr = 0;
+    constexpr uint32_t MinusIdentity16Addr = 512;
+    constexpr uint32_t Zero16Addr = 1024;
+    constexpr uint32_t MinusIdentity32Addr = 1536;
+    constexpr uint32_t Zero32Addr = 3584;
+    constexpr uint32_t MinusIdentity64Addr = 5632;
+    constexpr uint32_t Zero64Addr = 13824;
+
+    BlockedSolveL1<T, 16> identity16;
+    BlockedSolveL1<T, 16> minus_identity16;
+    BlockedSolveNdL1<T, 16> zero16;
+    BlockedSolveL1<T, 32> minus_identity32;
+    BlockedSolveNdL1<T, 32> zero32;
+    BlockedSolveL1<T, 64> minus_identity64;
+    BlockedSolveNdL1<T, 64> zero64;
+    TASSIGN(identity16, Identity16Addr);
+    TASSIGN(minus_identity16, MinusIdentity16Addr);
+    TASSIGN(zero16, Zero16Addr);
+    TASSIGN(minus_identity32, MinusIdentity32Addr);
+    TASSIGN(zero32, Zero32Addr);
+    TASSIGN(minus_identity64, MinusIdentity64Addr);
+    TASSIGN(zero64, Zero64Addr);
+
+    constexpr int32_t ConstStride = 128;
+    BlockedSolveLoad<T, 16>(
+        minus_identity, 0, ConstStride, 0, 0, minus_identity16);
+    BlockedSolveLoadNd<T, 16>(
+        minus_identity, 0, ConstStride, 0, 16, zero16);
+    BlockedSolveLoad<T, 32>(
+        minus_identity, 0, ConstStride, 0, 0, minus_identity32);
+    BlockedSolveLoadNd<T, 32>(
+        minus_identity, 0, ConstStride, 0, 32, zero32);
+    BlockedSolveLoad<T, 64>(
+        minus_identity, 0, ConstStride, 0, 0, minus_identity64);
+    BlockedSolveLoadNd<T, 64>(
+        minus_identity, 0, ConstStride, 0, 64, zero64);
+
+    BlockedSolveL0A<T, 16> identity_l0a;
+    BlockedSolveL0B<T, 16> identity_l0b;
+    BlockedSolveL0C<16> identity_l0c;
+    TASSIGN(identity_l0a, 0);
+    TASSIGN(identity_l0b, 0);
+    TASSIGN(identity_l0c, 0);
+    BlockedSolveMatmul<T, 16>(
+        identity_l0c, minus_identity16, minus_identity16,
+        identity_l0a, identity_l0b);
+    BlockedSolveAccToL1<T, 16>(identity16, identity_l0c);
+
+    const int32_t row_stride =
+        static_cast<int32_t>(num_heads * 128u);
+    const uint32_t full_chunks =
+        static_cast<uint32_t>(total_tokens / 128);
+    const uint32_t tail_size =
+        static_cast<uint32_t>(total_tokens % 128);
+    const uint32_t block_num = get_block_num();
+    for (uint32_t matrix_id = get_block_idx();
+         matrix_id < total_matrices; matrix_id += block_num) {
+        const uint32_t chunk = matrix_id / num_heads;
+        const uint32_t head = matrix_id - chunk * num_heads;
+        const int64_t base_offset =
+            static_cast<int64_t>(chunk) * 128 * row_stride +
+            static_cast<int64_t>(head) * 128;
+        if (chunk < full_chunks) {
+            BlockedSolveFullMatrix16<T>(
+                out, in, base_offset, row_stride, identity16,
+                minus_identity16, zero16, minus_identity32, zero32,
+                minus_identity64, zero64);
+        } else if (tail_size != 0 && tail_size <= 16) {
+            BlockedSolveTail16<T>(
+                out, in, base_offset, row_stride, tail_size, identity16,
+                minus_identity16);
+        }
+    }
+#endif
+}
+
+template <typename T>
+AICORE inline void runKernelTriInvBlocked64ResidentInplaceBSND(
+    __gm__ T *matrix_gm, __gm__ T *minus_identity,
+    uint32_t total_matrices, uint32_t num_heads,
+    __gm__ int32_t *cu_seqlens)
+{
+#if (__CHECK_FEATURE_AT_PRECOMPILE) || \
+    (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
+    if (num_heads == 0 || total_matrices == 0 || cu_seqlens == nullptr) return;
+
+    constexpr uint32_t Tile64Bytes = 64 * 64 * sizeof(T);
+    constexpr uint32_t Identity64Addr = 0;
+    constexpr uint32_t MinusIdentity64Addr = Tile64Bytes;
+    constexpr int32_t ConstStride = 128;
+
+    BlockedSolveL1<T, 64> identity64;
+    BlockedSolveL1<T, 64> minus_identity64;
+    TASSIGN(identity64, Identity64Addr);
+    TASSIGN(minus_identity64, MinusIdentity64Addr);
+    BlockedSolveLoad<T, 64>(
+        minus_identity, 0, ConstStride, 0, 0, minus_identity64);
+    BlockedSolveLoad<T, 64>(
+        minus_identity, 128 * 128, ConstStride, 0, 0, identity64);
+
+    const uint32_t block_idx = get_block_idx();
+    const uint32_t block_num = get_block_num();
+    const int32_t row_stride =
+        static_cast<int32_t>(num_heads * 128u);
+    for (uint32_t matrix_id = block_idx; matrix_id < total_matrices;
+         matrix_id += block_num) {
+        const BSNDVarlenTileInfo tile_info =
+            GetBSNDVarlenTileInfoFromCuSeqlens(
+                matrix_id, num_heads, 128, cu_seqlens);
+        if (tile_info.valid_size <= 64) {
+            BlockedSolveTail64ResidentInplace<T>(
+                matrix_gm, tile_info.bsnd_offset, row_stride,
+                tile_info.valid_size, identity64, minus_identity64);
+        } else if (tile_info.valid_size < 128) {
+            BlockedSolveDynamic128ResidentInplace<T>(
+                matrix_gm, tile_info.bsnd_offset, row_stride,
+                tile_info.valid_size, identity64, minus_identity64);
+        } else {
+            BlockedSolveFullMatrix64ResidentInplace<T>(
+                matrix_gm, tile_info.bsnd_offset, row_stride, identity64,
+                minus_identity64);
+        }
+    }
+#endif
+}
+
+#endif

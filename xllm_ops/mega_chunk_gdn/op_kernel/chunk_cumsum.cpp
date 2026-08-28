@@ -50,7 +50,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
+#include "gdn_sync.h"
 using namespace pto;
 
 // GDN_C: Compile-time chunk size injected by the build system.
@@ -191,7 +191,7 @@ AICORE void cumsum_kernel(
   // set_ffts_base_addr(ffts_addr): Configure the base address for FFTS
   // (Fast Fine-grained Task Synchronization) — the cross-core signaling mechanism.
   // Required before any cross-core sync (ffts_cross_core_sync / wait_flag_dev).
-  set_ffts_base_addr(ffts_addr);
+  gdn_sync::InitAddress(ffts_addr);
 
 // #if defined(__DAV_C220_VEC__): This block only compiles for the Vec core pass.
 // The bisheng compiler makes 3 passes over the same source file:
@@ -322,9 +322,6 @@ AICORE void cumsum_kernel(
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
       // ── Vec compute: prefix sum over rows (all H heads in parallel) ───
-#if defined(GDN_A5_KERNEL)
-      GdnA5ParallelPrefixScan<ChunkSize, HTC, GUbAddr, SUbAddr>();
-#else
       // Row 0: acc[h] = g[0,h];  g_sum[0,h] = acc[h]
       UbND<float, 1, HTC> g_row_0;
       TASSIGN(g_row_0, GUbAddr);
@@ -371,8 +368,6 @@ AICORE void cumsum_kernel(
         TMOV(s_row_i, acc_ub);
         pipe_barrier(PIPE_V);
       }
-#endif
-
       // ── DMA: store g_sum from UB → GM (MTE3 pipe) ────────────────────
       // ── Synchronization: Vec → MTE3 ───────────────────────────────────
       // Vec signals MTE3 that computation is done and UB data is ready to store.
@@ -443,9 +438,6 @@ AICORE void cumsum_kernel(
           set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-#if defined(GDN_A5_KERNEL)
-          GdnA5ParallelPrefixScan<ChunkSize, HTC, GUbAddr, SUbAddr>();
-#else
           // Prefix sum: acc = g[0]; g_sum[0] = acc
           UbND<float, 1, HTC> g_row_0;
           TASSIGN(g_row_0, GUbAddr);
@@ -486,8 +478,6 @@ AICORE void cumsum_kernel(
             TMOV(s_row_i, acc_ub);
             pipe_barrier(PIPE_V);
           }
-#endif
-
           // Store g_sum to GM
           set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
           wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
