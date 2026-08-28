@@ -66,6 +66,7 @@ def to_paged(kv, B, S2, KV_N, D, block_size):
 CASES = [
     # (B, S1, S2, N1, KV_N, D, block_size, win_left, win_right, dtype_str)
     (1, 4, 16, 64, 1, 512, 16, 127, 0, "fp16"),
+    (1, 108, 108, 16, 1, 512, 128, 127, 0, "fp16"),
 ]
 
 
