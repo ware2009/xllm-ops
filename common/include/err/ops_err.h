@@ -18,9 +18,17 @@
 
 #include "log/log.h"
 
+#ifndef XLLM_OP_MODULE_ID
+#if defined(OP)
+#define XLLM_OP_MODULE_ID OP
+#else
+#define XLLM_OP_MODULE_ID OP_MODULE_ID
+#endif
+#endif
+
 #define OPS_INNER_ERR_STUB(ERR_CODE_STR, OPS_DESC, FMT, ...)                                                           \
     do {                                                                                                               \
-        OpLogSub(OP, DLOG_ERROR, OPS_DESC, FMT, ##__VA_ARGS__);                                                    \
+        OpLogSub(XLLM_OP_MODULE_ID, DLOG_ERROR, OPS_DESC, FMT, ##__VA_ARGS__);                                                    \
         REPORT_INNER_ERR_MSG(ERR_CODE_STR, FMT, ##__VA_ARGS__);                                                        \
     } while (0)
 
