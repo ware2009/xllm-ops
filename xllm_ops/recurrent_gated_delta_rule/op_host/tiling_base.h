@@ -25,7 +25,11 @@
 #if defined(OP)
 #define XLLM_OP_MODULE_ID OP
 #else
+#ifdef CANN_GTE_91
+#define XLLM_OP_MODULE_ID 63
+#else
 #define XLLM_OP_MODULE_ID OP_MODULE_ID
+#endif
 #endif
 #endif
 
