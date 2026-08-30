@@ -163,7 +163,7 @@ constexpr uint64_t CONST_128 = 128;
 constexpr uint32_t EMBED_SPLIT = 256;
 constexpr uint32_t ROUND_EMBED_SPLIT = 256;
 
-#elif __DAV_C220_VEC__
+#elif defined(__DAV_C220_VEC__)
 constexpr uint32_t HALF_VECTOR_SIZE = 128;
 constexpr uint32_t UB_ALIGN_BYTE = 32;
 constexpr int64_t UB_UINT8_BLOCK_SIZE_MLA = 16384;      // 96 * 128 * 2B // prefill/decoder diff

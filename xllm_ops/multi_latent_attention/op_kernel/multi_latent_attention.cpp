@@ -19,10 +19,14 @@ limitations under the License.
 // Map them here so the existing V220 code paths compile and execute on 3510.
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
   #if defined(__DAV_CUBE__) && !defined(__DAV_C220_CUBE__)
-    #define __DAV_C220_CUBE__
+    // NOTE: must define with value 1 (not an empty macro). The header uses
+    // `#elif __DAV_C220_VEC__` / expression-eval form, which expands to an
+    // empty expression and fails with "expected value in expression" if the
+    // macro is defined empty.
+    #define __DAV_C220_CUBE__ 1
   #endif
   #if defined(__DAV_VEC__) && !defined(__DAV_C220_VEC__)
-    #define __DAV_C220_VEC__
+    #define __DAV_C220_VEC__ 1
   #endif
 #endif
 
