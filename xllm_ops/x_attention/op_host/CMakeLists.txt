@@ -31,7 +31,7 @@ if(_XA_SOC_LOWER MATCHES "ascend950" OR _XA_SOC_LOWER MATCHES "ascend310p5"
     set(CATLASS_ARCH_DEF "-DCATLASS_ARCH=3510")
     set(_XA_IS_A5 TRUE)
 else()
-    set(CATLASS_ARCH_DEF "")
+    set(CATLASS_ARCH_DEF "-DCATLASS_ARCH=2201")
     set(_XA_IS_A5 FALSE)
 endif()
 
