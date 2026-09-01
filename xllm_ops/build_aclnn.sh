@@ -293,7 +293,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
 
         #  ### JD's in-house operators ####
         "beam_search_group"
-        #"x_attention"   # A5 kernel not adapted
+        "x_attention"
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
