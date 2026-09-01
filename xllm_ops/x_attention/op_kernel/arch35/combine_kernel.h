@@ -70,9 +70,6 @@ public:
         int32_t attnOffsetPerCore;
         int32_t gmglOffsetPerCore;
 
-        // AscendC::printf("rowNum %d rowNumPerLoop %d formerCoreNum %d formerTaskNum %d tailTaskNum %d usedCoreNum %d tailCoreNum %d\n", rowNum, 
-        // rowNumPerLoop, formerCoreNum, formerTaskNum, tailTaskNum, usedCoreNum, tailCoreNum);
-
         if (coreIdx < formerCoreNum) {
             coreTaskNum = formerTaskNum;
             mainTaskRowNum = rowNumPerLoop;
@@ -101,24 +98,9 @@ public:
         gUnsharedOut.SetGlobalBuffer((__gm__ ElementInput *)params.unsharedO + attnOffsetPerCore);
         AscendC::GlobalTensor<ElementOutput> gFinalOut;
         gFinalOut.SetGlobalBuffer((__gm__ ElementOutput *)params.o + attnOffsetPerCore);
-        
-        // if (coreIdx == 0) {
-        //     for (int i = 68; i < 69; i++) {
-        //         AscendC::printf("token %d sharedOut\n", i);
-        //         AscendC::DumpTensor(gSharedOut[i * headDim], 1, 8);
-        //         AscendC::printf("token %d sharedMax %f\n", i, gSharedGm.GetValue(i));
-        //         AscendC::printf("token %d sharedSum %f\n", i, gSharedGl.GetValue(i));
-        //         AscendC::printf("token %d unsharedOut\n", i);
-        //         AscendC::DumpTensor(gUnsharedOut[i * headDim], 3, 8);
-        //         AscendC::printf("token %d unsharedMax %f\n", i, gUnsharedGm.GetValue(i));
-        //         AscendC::printf("token %d unsharedSum %f\n", i, gUnsharedGl.GetValue(i));
-        //     }
-        // }
-
 
         int8_t taskId = 0;
         for (int i = 0; i < coreTaskNum; i++) {
-            // int32_t realRowNum = (i == coreTaskNum - 1) ? tailTaskRowNum : mainTaskRowNum;
             int64_t gmglTaskOffset = i * rowNumPerLoop;
             int64_t globalRowStart = gmglOffsetPerCore + gmglTaskOffset;
             int32_t remainingRows = rowNum - globalRowStart;
