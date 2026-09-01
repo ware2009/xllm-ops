@@ -285,7 +285,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "hc_post"
         "rms_norm_dynamic_quant"
         "inplace_partial_rotary_mul"
-       # "dispatch_ffn_combine"   # A5中使用moe_megn算子替换
+       # "dispatch_ffn_combine"   # A5中使用moe_mega算子替换
         "dequant_swiglu_quant"  ## 已在 CANN 中内置，删除后会有精度问题，CANN内置见 aarch64-linux/include/aclnnop/aclnn_dequant_swiglu_quant.h
         "scatter_nd_update_v2"
 
