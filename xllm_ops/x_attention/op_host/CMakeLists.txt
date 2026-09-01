@@ -15,11 +15,21 @@ if (BUILD_OPEN_PROJECT)
     )
 endif()
 
+string(TOLOWER "${SOC_VERSION}" _XA_SOC_LOWER)
+string(TOLOWER "${ASCEND_COMPUTE_UNIT}" _XA_UNIT_LOWER)
+if(_XA_SOC_LOWER MATCHES "ascend950" OR _XA_SOC_LOWER MATCHES "ascend310p5"
+   OR _XA_UNIT_LOWER MATCHES "ascend950" OR _XA_UNIT_LOWER MATCHES "ascend310p5")
+    set(XA_CATLASS_ARCH_DEF "-DCATLASS_ARCH=3510")
+else()
+    set(XA_CATLASS_ARCH_DEF "-DCATLASS_ARCH=2201")
+endif()
+
 add_ops_compile_options(
     OP_NAME XAttention
     OPTIONS --cce-auto-sync=on
             -Wno-deprecated-declarations
             -Werror
+            ${XA_CATLASS_ARCH_DEF}
             -I${CANN_3RD_LIB_PATH}/catlass/include
             -I${CMAKE_CURRENT_LIST_DIR}/../../../
 )
