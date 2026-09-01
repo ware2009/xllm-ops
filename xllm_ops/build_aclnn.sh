@@ -285,13 +285,13 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "hc_post"
         "rms_norm_dynamic_quant"
         "inplace_partial_rotary_mul"
-        "dispatch_ffn_combine"
+       # "dispatch_ffn_combine"   # A5中使用moe_megn算子替换
         "dequant_swiglu_quant"  ## 已在 CANN 中内置，删除后会有精度问题，CANN内置见 aarch64-linux/include/aclnnop/aclnn_dequant_swiglu_quant.h
         "scatter_nd_update_v2"
 
         #  ### JD's in-house operators ####
         "beam_search_group"
-        "x_attention"
+        #"x_attention"   # A5 kernel not adapted
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
@@ -311,7 +311,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "reshape_and_cache_a5"
         "select_unshared_kv"
         # "x_attention_tl"  # A5 kernel not adapted
-        "x_flash_attention_infer"
+        #"x_flash_attention_infer"   # A5 kernel not adapted
         "onerec_final_beam_select"
         "rec_constrained_top_k"
          "multi_latent_attention"
