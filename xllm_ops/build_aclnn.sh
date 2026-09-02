@@ -313,7 +313,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "reshape_and_cache_a5"
         "select_unshared_kv"
         # "x_attention_tl"  # A5 kernel not adapted
-        #"x_flash_attention_infer"   # A5 kernel not adapted
+        "x_flash_attention_infer"
         "onerec_final_beam_select"
         "rec_constrained_top_k"
          "multi_latent_attention"
