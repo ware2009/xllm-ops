@@ -3,6 +3,7 @@ import random
 import numpy as np
 import pytest
 import torch
+import os
 
 
 torch_npu = pytest.importorskip("torch_npu")
@@ -11,7 +12,7 @@ custom_ops = pytest.importorskip("custom_ops")
 torch.manual_seed(1)
 random.seed(1)
 
-device_id = 5
+device_id = int(os.getenv("NPU_DEVICE_ID", os.getenv("ASCEND_DEVICE_ID", "0")))
 torch_npu.npu.set_device(device_id)
 
 def compare_tnd_outputs(cpu_out, npu_out, atol, rtol, max_bad_tokens=10):
