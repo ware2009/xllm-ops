@@ -189,26 +189,26 @@ public:
         // Read runtime actual kv length from the actualSeqLengthsKV tensor so that the
         // causal mask can shield the padding tail when actual_kv_len < paged-cache capacity.
         // The tiling-provided constInfo.kvSeqlen is the paged-cache capacity (maxBlockNumPerBatch
-        // * blockSize), NOT the real kv length, so relying on it makes decode attend to padded kv
-        // (aligns with the A3 path which reads gActualKvseqlen.GetValue(BIdx)).
-        int64_t actualKvSeqlen = kvSeqlen;
+        // * blockSize), NOT the real kv length, so relying on it makes decode attend to padded kv.
+        // actual_kv_lens is a PER-BATCH tensor (the A3 path reads gActualKvseqlen.GetValue(BIdx)
+        // inside its batch loop), so the mask boundary must be evaluated per batch with the
+        // batch index of the task being processed. A single GetValue(0) hoisted out of the
+        // loop makes every batch share batch 0's boundary and corrupts every batch whose
+        // actual kv length differs from batch 0 (padded tail leaks in, or valid kv is masked).
+        AscendC::GlobalTensor<int32_t> gActualKvseqlen;
+        bool hasActualKvLen = false;
         if (params.actualKvSeqlen != nullptr) {
-            AscendC::GlobalTensor<int32_t> gActualKvseqlen;
             gActualKvseqlen.SetGlobalBuffer((__gm__ int32_t*)params.actualKvSeqlen);
-            int64_t rtKv = static_cast<int64_t>(gActualKvseqlen.GetValue(0));
-            if (rtKv > 0) {
-                actualKvSeqlen = rtKv;
-            }
+            hasActualKvLen = true;
         }
-        int64_t kvSeqlenMask = actualKvSeqlen;
         // causal mask uses a shared [MASK_DIM, MASK_DIM] triu template (row = query
         // absolute logical position, col = kv absolute position), aligned with the A3
         // path which hardcodes LayoutMask(2048, 2048). diffS shifts single-token decode
         // query to the causal bottom so it can attend to all valid kv. diffS MUST use the
-        // actual kv length (not the paged-cache capacity), otherwise the causal mask fails
-        // to shield the padded tail (e.g. actual_kv=64 within a 128-slot block).
+        // actual kv length of the CURRENT batch (not the paged-cache capacity, and not
+        // another batch's length), otherwise the causal mask fails to shield the padded
+        // tail (e.g. actual_kv=64 within a 128-slot block).
         constexpr int64_t MASK_DIM = 2048;
-        int64_t diffS = actualKvSeqlen - qSeqlen;
         if constexpr (PAGED_CACHE_FLAG) {
             kvSeqlen = RoundUp(kvSeqlen, blockSize);
         }
@@ -397,7 +397,21 @@ public:
                             // mask is a shared [MASK_DIM, MASK_DIM] triu template: row = query
                             // absolute logical position within the sequence (NOT batch-offset,
                             // the template is shared across batches like the A3 path). diffS aligns
-                            // the query row to the causal bottom so decode (qSeqlen=1) attends to all kv.
+                            // the query row to the causal bottom so decode (qSeqlen=1) attends to
+                            // all valid kv. The AIV stage lags the loop head inside the CV
+                            // pipeline, so the batch of the task being processed is
+                            // runInfo3.batchOuterIdx (NOT the loop-head runParam): read THAT
+                            // batch's actual kv length here, falling back to the paged-cache
+                            // capacity when the tensor is absent or the value is non-positive.
+                            int64_t taskActualKvSeqlen = kvSeqlen;
+                            if (hasActualKvLen) {
+                                int64_t rtKv = static_cast<int64_t>(
+                                    gActualKvseqlen.GetValue(runInfo3.batchOuterIdx));
+                                if (rtKv > 0) {
+                                    taskActualKvSeqlen = rtKv;
+                                }
+                            }
+                            int64_t diffS = taskActualKvSeqlen - qSeqlen;
                             int64_t qSeqOffset = runInfo3.qSeqOuterAxisIdx * qSeqlenTemplateType +
                                              runInfo3.firstHalfQSeqRealSize * constInfo.subBlockIdx;
                             int64_t kvSeqOffset = runInfo3.kvSeqLoopCount * kvSeqlenTemplateType;
