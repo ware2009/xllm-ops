@@ -4,6 +4,7 @@
 
 struct MegaGdnPrefillOpKernelTilingData {
     uint32_t block_dim;
+    uint32_t vector_task_count;
     uint32_t target_arch;
     uint32_t num_matrices;
     uint32_t batch_size;
@@ -29,11 +30,143 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define MEGA_CHUNK_GDN_HELPERS_ONLY
 #define MEGA_CHUNK_GDN_HELPER_NAMESPACE qwen35_e2e_pto
 #define MEGA_GDN_BUILD_REV 2026082515
+
+// A5 solve experiments.  The default remains the validated fp32 hybrid.
+// Override this definition for candidate builds only:
+//   0: Cube diagonals + fp32 AIV off-diagonal recurrence (baseline)
+//   1: Cube diagonals with fp16 recurrent state + fp32 AIV off-diagonal
+//   2: blocked Cube sums with fp16 Cube/AIV block handoffs
+//   3: resident full-Cube solve with one final fp16 handoff
+//   4: full-matrix Cube-resident Neumann solve with one final packed handoff
+//   5: megagdn-pto recursive Cube solve with direct final GM store
+//   6: megagdn-pto recursive Cube solve with packed AIV layout conversion
+//   7: variant 6 with a true fp32 final Cube-to-AIV handoff
+//   8: variant 7 identity-publication diagnostic
+//   9: variant 8 with an AIV BSND-scatter bypass diagnostic
+//  10: direct recursive Cube solve with a fused MIX completion handoff
+//  11: direct BSND recursive Cube solve with fp32 final handoff
+//  12: variant 11 with the solve buffer copied to the public output
+//  13: variant 11 compatibility alias (Newton refinement removed)
+//  14: variant 13 with the final BSND scatter striped across both AIVs
+//  15: variant 14 with A5 vector/cache optimizations
+//  16: variant 15 with head-major packed W/U/V_new internal data flow
+//  17: variant 16 with A5 multi-batch group-QK reuse
+//  18: variant 17 with directed A5 group-QK intra-block synchronization
+//  19: variant 18 without redundant per-chunk H-to-O ready counters
+//  20: variant 19 with one-round A5 group-QK double-mailbox lookahead
+//  21: variant 16 with A5 per-chunk H/O producer-consumer overlap
+//  22: variant 16 with a full-chunk 2x64 recursive solve
+#ifndef MEGA_GDN_A5_SOLVE_VARIANT
+#define MEGA_GDN_A5_SOLVE_VARIANT 16
+#endif
+
 #if defined(GDN_PREFILL_ARCH_A5)
 #define MEGA_CHUNK_GDN_A5_DUAL_AIV_SOLVE
+// Qwen GQA shares one K head across several value heads.  Build each K*K^T
+// tile once per key head for packed multi-sequence prefill instead of
+// repeating the identical Cube GEMM for every value head.
+#define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
+#if MEGA_GDN_A5_SOLVE_VARIANT != 4 && MEGA_GDN_A5_SOLVE_VARIANT != 5 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 6 && MEGA_GDN_A5_SOLVE_VARIANT != 7 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 8 && MEGA_GDN_A5_SOLVE_VARIANT != 9 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 10 && MEGA_GDN_A5_SOLVE_VARIANT != 11 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 12 && MEGA_GDN_A5_SOLVE_VARIANT != 13 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 14 && MEGA_GDN_A5_SOLVE_VARIANT != 15 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 16 && MEGA_GDN_A5_SOLVE_VARIANT != 17 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 18 && MEGA_GDN_A5_SOLVE_VARIANT != 19 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 20 && MEGA_GDN_A5_SOLVE_VARIANT != 21 && \
+    MEGA_GDN_A5_SOLVE_VARIANT != 22
 #define MEGA_CHUNK_GDN_A5_BLOCKED_CUBE_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT < 2
 #define MEGA_CHUNK_GDN_A5_CUBE_DIAG_AIV_OFFDIAG
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 1
+#define MEGA_CHUNK_GDN_A5_FP16_INTERMEDIATE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 0
 #define MEGA_CHUNK_GDN_A5_CUBE_FP32_HANDOFF
+#define MEGA_CHUNK_GDN_A5_SKIP_DIAGONAL_REFINEMENT
+#define MEGA_CHUNK_GDN_A5_VECTOR_OFFDIAG
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 3
+#define MEGA_CHUNK_GDN_A5_RESIDENT_FULL_CUBE_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 4
+#define MEGA_CHUNK_GDN_A5_FULL_MATRIX_CUBE_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 5
+#define MEGA_CHUNK_GDN_A5_REFERENCE_RECURSIVE_CUBE_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 10
+#define MEGA_CHUNK_GDN_A5_REFERENCE_RECURSIVE_CUBE_SYNC_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 11 || MEGA_GDN_A5_SOLVE_VARIANT == 12 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 13 || MEGA_GDN_A5_SOLVE_VARIANT == 14 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 15 || MEGA_GDN_A5_SOLVE_VARIANT == 16 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 17 || MEGA_GDN_A5_SOLVE_VARIANT == 18 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 21 || MEGA_GDN_A5_SOLVE_VARIANT == 22
+#define MEGA_CHUNK_GDN_A5_DIRECT_RECURSIVE_CUBE_FP32_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 14 || MEGA_GDN_A5_SOLVE_VARIANT == 15 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 16 || MEGA_GDN_A5_SOLVE_VARIANT == 17 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 18 || MEGA_GDN_A5_SOLVE_VARIANT == 19 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 20 || MEGA_GDN_A5_SOLVE_VARIANT == 21 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 22
+#define MEGA_CHUNK_GDN_A5_DUAL_FP32_SCATTER
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 15 || MEGA_GDN_A5_SOLVE_VARIANT == 16 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 17 || MEGA_GDN_A5_SOLVE_VARIANT == 18 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 21 || MEGA_GDN_A5_SOLVE_VARIANT == 22
+#define MEGA_CHUNK_GDN_A5_SINGLE_POST_SOLVE_SYNC
+#define MEGA_CHUNK_GDN_A5_DUAL_AIV_WY
+#define MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 16 || MEGA_GDN_A5_SOLVE_VARIANT == 17 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 18 || MEGA_GDN_A5_SOLVE_VARIANT == 19 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 20 || MEGA_GDN_A5_SOLVE_VARIANT == 21 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 22
+#define MEGA_CHUNK_GDN_A5_PACKED_WUV
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 22
+#define MEGA_CHUNK_GDN_A5_SPLIT64_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 17 || MEGA_GDN_A5_SOLVE_VARIANT == 18 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20
+#define MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE
+#define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 18 || MEGA_GDN_A5_SOLVE_VARIANT == 19 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 20
+#define MEGA_CHUNK_GDN_A5_GROUP_QK_DIRECTED_SYNC
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20
+#define MEGA_CHUNK_GDN_A5_GROUP_QK_SKIP_HO_READY
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 20
+#define MEGA_CHUNK_GDN_A5_GROUP_QK_DOUBLE_MAILBOX
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 21
+#define MEGA_CHUNK_GDN_A5_HO_OVERLAP
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 12
+#define MEGA_CHUNK_GDN_A5_DUMP_SOLVE_OUTPUT
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 6
+#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_CUBE_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 7 || MEGA_GDN_A5_SOLVE_VARIANT == 8 || \
+    MEGA_GDN_A5_SOLVE_VARIANT == 9
+#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_CUBE_FP32_SOLVE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 8 || MEGA_GDN_A5_SOLVE_VARIANT == 9
+#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_IDENTITY_PROBE
+#endif
+#if MEGA_GDN_A5_SOLVE_VARIANT == 9
+#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_BSND_SCATTER_PROBE
+#endif
 #endif
 #if defined(GDN_PREFILL_ARCH_A2A3)
 #define MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
@@ -51,11 +184,38 @@ struct MegaGdnPrefillOpKernelTilingData {
 #undef MEGA_CHUNK_GDN_HELPER_NAMESPACE
 #undef MEGA_CHUNK_GDN_HELPERS_ONLY
 #if defined(GDN_PREFILL_ARCH_A5)
+#undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
+#undef MEGA_CHUNK_GDN_A5_SPLIT64_SOLVE
+#undef MEGA_CHUNK_GDN_A5_HO_OVERLAP
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_DOUBLE_MAILBOX
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_SKIP_HO_READY
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_DIRECTED_SYNC
+#undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE
+#undef MEGA_CHUNK_GDN_A5_PACKED_WUV
+#undef MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI
+#undef MEGA_CHUNK_GDN_A5_DUAL_AIV_WY
+#undef MEGA_CHUNK_GDN_A5_SINGLE_POST_SOLVE_SYNC
+#undef MEGA_CHUNK_GDN_A5_DUAL_FP32_SCATTER
+#undef MEGA_CHUNK_GDN_A5_DUMP_SOLVE_OUTPUT
+#undef MEGA_CHUNK_GDN_A5_DIRECT_RECURSIVE_CUBE_FP32_SOLVE
+#undef MEGA_CHUNK_GDN_A5_REFERENCE_RECURSIVE_CUBE_SYNC_SOLVE
+#undef MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_BSND_SCATTER_PROBE
+#undef MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_IDENTITY_PROBE
+#undef MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_CUBE_FP32_SOLVE
+#undef MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_CUBE_SOLVE
+#undef MEGA_CHUNK_GDN_A5_REFERENCE_RECURSIVE_CUBE_SOLVE
+#undef MEGA_CHUNK_GDN_A5_FULL_MATRIX_CUBE_SOLVE
+#undef MEGA_CHUNK_GDN_A5_RESIDENT_FULL_CUBE_SOLVE
+#undef MEGA_CHUNK_GDN_A5_SKIP_DIAGONAL_REFINEMENT
+#undef MEGA_CHUNK_GDN_A5_VECTOR_OFFDIAG
+#undef MEGA_CHUNK_GDN_A5_FP16_INTERMEDIATE
 #undef MEGA_CHUNK_GDN_A5_CUBE_FP32_HANDOFF
 #undef MEGA_CHUNK_GDN_A5_CUBE_DIAG_AIV_OFFDIAG
 #undef MEGA_CHUNK_GDN_A5_BLOCKED_CUBE_SOLVE
 #undef MEGA_CHUNK_GDN_A5_DUAL_AIV_SOLVE
 #endif
+#undef MEGA_GDN_A5_SOLVE_VARIANT
 #undef GDN_PUBLIC_DTYPE
 #undef GDN_COMPUTE_DTYPE
 
@@ -207,7 +367,9 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
 #endif
     gdn_prefill_frontend::PrepareGate<GDN_PREFILL_COMPUTE_DTYPE>(
         a_ptr, b_ptr, a_log_ptr, dt_bias_ptr, g_ptr, beta_compute_ptr,
-        total_tokens, static_cast<int32_t>(num_heads), round_g_to_bf16);
+        total_tokens, static_cast<int32_t>(num_heads),
+        static_cast<int32_t>(tiling_data.vector_task_count),
+        round_g_to_bf16);
     qwen35_e2e_pto::mega_prepare_solve_constants<
         bfloat16_t, GDN_PREFILL_COMPUTE_DTYPE>(
         reinterpret_cast<__gm__ bfloat16_t *>(minus_identity_ptr),
