@@ -69,7 +69,12 @@ class BeamSearchGroup : public OpDef {
     this->Attr("top_k").Int(0);
     this->AICore().AddConfig("ascend910b");
     this->AICore().AddConfig("ascend910_93");
-    this->AICore().AddConfig("ascend950");
+    OpAICoreConfig regbaseCfg;  // Ascend950 dedicated kernel route
+    regbaseCfg.DynamicCompileStaticFlag(true)
+        .DynamicRankSupportFlag(true)
+        .DynamicShapeSupportFlag(true)
+        .ExtendCfgInfo("opFile.value", "beam_search_group_apt");
+    this->AICore().AddConfig("ascend950", regbaseCfg);
   }
 };
 

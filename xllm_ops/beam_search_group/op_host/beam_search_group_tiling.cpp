@@ -16,6 +16,7 @@ limitations under the License.
 #include "beam_search_group_tiling.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "tiling_base/tiling_util.h"  // Ascend950 regbase route helpers
 
 #define OP_LOGE(nodeName, fmt, ...) \
   printf(fmt, ##__VA_ARGS__);       \
@@ -133,6 +134,14 @@ int32_t block_size2 = (2 * align_top_k + 31)/32*32;
                                 max_size,
                                 min_size1);
   min_size_ = static_cast<int32_t>(std::max(min_size0, min_size1));
+  if (Ops::Xllm::OpTiling::IsRegbaseSocVersion(tiling_context_)) {
+    // Ascend950 regbase route: D1 fix - full-round TopK min was overwritten by tail-round call; recompute, max all three.
+    uint32_t min_size_full = 0;
+    AscendC::GetTopKMaxMinTmpSize(platform_info, block_size, 1, false, false,
+        AscendC::TopKMode::TOPK_NORMAL, true, dtype_size, max_size, min_size_full);
+    min_size_ = static_cast<int32_t>(std::max(
+        std::max(min_size_full, min_size0), min_size1));
+  }
   sync_workspace_size_ =
       static_cast<size_t>(platform_info.GetLibApiWorkSpaceSize());
   return ge::GRAPH_SUCCESS;
@@ -157,6 +166,13 @@ ge::graphStatus TilingBeamSearchGroupFunc::RunKernelTiling() {
   SetTilingKey();
   FillTilingData();
   size_t userWorkspaceSize = 0;
+  if (Ops::Xllm::OpTiling::IsRegbaseSocVersion(tiling_context_)) {
+    // Ascend950 regbase route: cross-core candidate pool [core_num][AlignUp(top_k,8)] x2 (fp32 probs + int32 index), CeilAlign 512.
+    const uint32_t alignTopK = (top_k_ + 7U) / 8U * 8U;
+    userWorkspaceSize = 2UL * static_cast<size_t>(core_num_) *
+                        static_cast<size_t>(alignTopK) * sizeof(float);
+    userWorkspaceSize = Ops::Xllm::CeilAlign(userWorkspaceSize, 512UL);
+  }
   size_t* currentWorkspace = tiling_context_->GetWorkspaceSizes(1);
   currentWorkspace[0] = userWorkspaceSize + sync_workspace_size_;
   tiling_data_.SaveToBuffer(tiling_context_->GetRawTilingData()->GetData(),
