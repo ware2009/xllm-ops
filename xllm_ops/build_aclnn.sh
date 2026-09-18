@@ -280,10 +280,10 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "lightning_indexer_quant" 
         "lightning_indexer_quant_metadata"
         "compressor"
-        "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
-        "quant_lightning_indexer_metadata"
-        "sparse_attn_sharedkv"
-        "sparse_attn_sharedkv_metadata"
+        "quant_lightning_indexer"  ## xllm_ops内置的版本与A3支持的数据类型有差异，xllm_ops内置的只支持fp8数据类型，若用其他数据类型，A5建议使用CANN9.2的版本中quant_lightning_indexer_v2。
+        "quant_lightning_indexer_metadata" ## 如果使用CANN9.2中的quant_lightning_indexer_v2，则使用CANN9.2的版本中quant_lightning_indexer_metadata_v2。
+        "sparse_attn_sharedkv"  ## A5建议使用CANN中的SparseFlashMla算子替换，xllm_ops中版本与A3存在差异，某些SHape不支持；
+        "sparse_attn_sharedkv_metadata" ## A5建议使用CANN中的SparseFlashMlaMetadata算子替换，xllm_ops中版本与A3存在差异，某些SHape不支持；
         "hc_pre_sinkhorn"
         "hc_pre_inv_rms"
         "hc_post"
