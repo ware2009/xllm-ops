@@ -134,7 +134,9 @@ ssm_write_index = write_slot * R
 Prefill writes only the final state of each sequence at
 `ssm_state_write_indices[b]`; all other checkpoints remain unchanged. A
 negative read index selects a zero state. Every write index must be valid and
-unique within an invocation.
+unique among valid requests.
+
+ACL Graph padding may share a valid reserved slot, such as slot 0. This slot must always be used only for padding: normal requests must never read it, write it, or use it as cached state. This applies to Conv state, SSM state. All padding outputs and state must be discarded; other inputs must still satisfy the operator requirements. For example, two normal requests followed by two padding requests may use `write slots = [1, 2, 0, 0]`. Padding requests overwrite each other's state in slot 0, so its contents must not be used. If the slot cannot remain reserved, assign a separate slot to each padding request.
 
 ## Data-type contract
 
@@ -173,7 +175,8 @@ workspace formula.
 ## Constraints
 
 - `cu_seqlens` must be monotonic, start at zero, and end at T;
-- read indices may repeat, but write indices must be unique;
+- read indices may repeat, but valid requests must have unique write indices;
+  padding must satisfy the isolation constraints above;
 - a negative read index means no initial state; a negative write index is
   invalid;
 - `conv_state.shape[1]` must equal `ssm_cache.shape[0]/N + 2`;

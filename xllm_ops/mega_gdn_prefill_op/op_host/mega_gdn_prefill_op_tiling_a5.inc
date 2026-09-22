@@ -1,15 +1,6 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved. */
-
-#include "mega_gdn_prefill_op_tiling.h"
-
-#include <algorithm>
-#include <cstdint>
-#include <limits>
-
-#include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
-
-#include "mega_gdn_prefill_op_tiling_a5.inc"
+// A5-only host implementation; included after the upstream headers.
+namespace gdn_a5_backend {
+using namespace ::optiling;
 
 namespace {
 constexpr uint64_t kAlignBytes = 512;
@@ -21,6 +12,13 @@ constexpr uint64_t kFloatBytes = 4;
 constexpr uint64_t kHWorkspacePadBytes = 8192;
 constexpr uint64_t kHWorkspaceAlignmentBytes = 16 * 1024 * 1024;
 constexpr uint64_t kHWorkspaceMaxPhaseBytes = 8 * 1024 * 1024;
+constexpr uint64_t kSolveWyReadyStride = 16;
+constexpr uint64_t kWyHFreeStride = 16;
+constexpr uint64_t kHoReadyStride = 16;
+constexpr uint32_t kSolveWyMinChunks = 8;
+// KKT(2) + H(8) + primary O mailboxes(3) + independent O ping
+// mailboxes(4). WY contributes two dynamically sized slot groups below.
+constexpr uint64_t kFixedWorkspaceTileCount = 17;
 constexpr uint32_t kPreferredBaseDim = 3072;
 constexpr uint32_t kPackedHeadDim = 128;
 
@@ -93,10 +91,8 @@ ConvChannelTiling ResolveConvChannelTiling(uint32_t conv_dim,
         return {base_dim, CeilDiv(conv_dim, base_dim)};
     }
 
-    // Select the smallest factor of the schedulable AIV count that keeps a
-    // channel tile within the causal-conv UB limit. This preserves a complete
-    // AIV grid on different core-count SKUs, while packed-head alignment keeps
-    // Q/K head-normalization boundaries intact.
+    // Keep the A5 channel grid complete for every physical-core SKU while
+    // preserving packed-head boundaries and the causal-conv UB limit.
     for (uint32_t channel_count = 1;
          channel_count <= vector_task_count; ++channel_count) {
         if (vector_task_count % channel_count != 0) {
@@ -111,9 +107,6 @@ ConvChannelTiling ResolveConvChannelTiling(uint32_t conv_dim,
         return {base_dim, channel_count};
     }
 
-    // Shape validation currently caps the packed QKV width below the range
-    // that reaches this fallback. Keep a complete, correctness-first tiling
-    // for future larger shapes instead of returning a partial AIV grid.
     const uint32_t base_dim =
         std::min<uint32_t>(conv_dim, kPreferredBaseDim);
     return {base_dim, CeilDiv(conv_dim, base_dim)};
@@ -122,6 +115,28 @@ ConvChannelTiling ResolveConvChannelTiling(uint32_t conv_dim,
 uint64_t AlignWorkspace(uint64_t bytes)
 {
     return (bytes + kAlignBytes - 1) / kAlignBytes * kAlignBytes;
+}
+
+uint64_t CalcSolveWyWorkspaceSlots(uint32_t block_dim, uint32_t matrices,
+                                   uint32_t batch_size, uint32_t tokens,
+                                   uint32_t heads, uint32_t key_heads,
+                                   GdnTargetArch target)
+{
+    if (target != GdnTargetArch::A2A3 || block_dim == 0 || batch_size != 1 ||
+        tokens < kSolveWyMinChunks * kChunkSize ||
+        tokens % kChunkSize != 0 || key_heads == 0 ||
+        heads % key_heads != 0 ||
+        matrices != tokens / kChunkSize * heads) {
+        return 1;
+    }
+    const uint64_t group_size = heads / key_heads;
+    if (group_size < 1 || group_size > 4) {
+        return 1;
+    }
+    const uint64_t group_count = matrices / group_size;
+    const uint64_t producer_waves =
+        (group_count + block_dim - 1) / block_dim;
+    return std::max<uint64_t>(producer_waves * group_size, 1);
 }
 
 bool IsSupportedHeadCount(uint32_t heads)
@@ -167,8 +182,9 @@ bool HasShape(const gert::StorageShape *storage_shape,
 
 uint64_t CalcUserWorkspaceBytes(uint32_t block_dim, uint32_t matrices,
                                 uint32_t batch_size, uint32_t tokens,
-                                uint32_t heads, uint32_t conv_dim,
-                                uint32_t conv_state_len)
+                                uint32_t heads, uint32_t key_heads,
+                                uint32_t conv_dim, uint32_t conv_state_len,
+                                GdnTargetArch target)
 {
     uint64_t bytes = 0;
     bytes += AlignWorkspace(static_cast<uint64_t>(batch_size) *
@@ -197,8 +213,22 @@ uint64_t CalcUserWorkspaceBytes(uint32_t block_dim, uint32_t matrices,
     bytes += AlignWorkspace(static_cast<uint64_t>(tokens) * heads *
                             kHeadDim * kDtypeBytes);
     const uint64_t tile_bytes = kChunkSize * kChunkSize * kDtypeBytes;
+    const uint64_t solve_wy_workspace_slots =
+        CalcSolveWyWorkspaceSlots(block_dim, matrices, batch_size, tokens,
+                                  heads, key_heads, target);
     bytes += static_cast<uint64_t>(block_dim) *
-             (15 * tile_bytes + 8 * kHWorkspacePadBytes);
+             ((kFixedWorkspaceTileCount + 2 * solve_wy_workspace_slots) *
+                  tile_bytes +
+              8 * kHWorkspacePadBytes);
+    bytes += AlignWorkspace(
+        static_cast<uint64_t>(block_dim) * 2 * kSolveWyReadyStride *
+        sizeof(int32_t));
+    bytes += AlignWorkspace(
+        static_cast<uint64_t>(block_dim) * kWyHFreeStride *
+        sizeof(int32_t));
+    bytes += AlignWorkspace(
+        static_cast<uint64_t>(batch_size) * heads * kHoReadyStride *
+        sizeof(int32_t));
     bytes += kHWorkspaceAlignmentBytes + kHWorkspaceMaxPhaseBytes;
     return bytes;
 }
@@ -207,11 +237,6 @@ uint64_t CalcUserWorkspaceBytes(uint32_t block_dim, uint32_t matrices,
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
-    if (platform_ascendc::PlatformAscendC(context->GetPlatformInfo()).GetSocVersion() ==
-        platform_ascendc::SocVersion::ASCEND950) {
-        return gdn_a5_backend::optiling::TilingFunc(context);
-    }
-
     auto platform =
         platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     GdnArchPolicy arch_policy{};
@@ -224,8 +249,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
     const uint32_t block_dim = aic_core_count;
-    // AscendC::GetBlockIdx() is already flattened on the AIV side of a MIX
-    // kernel, so every platform AIV is an independently schedulable task.
+    // Both A5 vector siblings participate in the isolated Ascend950 backend.
+    // Match its flattened task IDs; the A2/A3 task count remains unchanged.
     const uint32_t vector_task_count = aiv_core_count;
     if (vector_task_count == 0) {
         return ge::GRAPH_FAILED;
@@ -351,8 +376,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     const uint32_t base_dim = conv_channel_tiling.base_dim;
     const uint32_t base_dim_count = conv_channel_tiling.base_dim_count;
     const uint32_t token_core_budget =
-        std::max<uint32_t>(
-            vector_task_count / base_dim_count, 1);
+        std::max<uint32_t>(vector_task_count / base_dim_count, 1);
     const uint32_t token_block_size =
         CeilDiv(tokens, token_core_budget);
     const uint32_t token_block_count =
@@ -414,8 +438,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     }
     const uint64_t user_workspace_bytes =
         CalcUserWorkspaceBytes(block_dim, num_matrices, batch_size, tokens,
-                               heads, conv_dim,
-                               static_cast<uint32_t>(conv_state.GetDim(1)));
+                               heads, key_heads, conv_dim,
+                               static_cast<uint32_t>(conv_state.GetDim(1)),
+                               arch_policy.target);
     workspace_sizes[0] =
         user_workspace_bytes + platform.GetLibApiWorkSpaceSize();
     return ge::GRAPH_SUCCESS;
@@ -429,7 +454,6 @@ static ge::graphStatus TilingParse(gert::TilingParseContext *context)
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(MegaGdnPrefillOp)
-    .Tiling(TilingFunc)
-    .TilingParse<MegaGdnPrefillOpCompileInfo>(TilingParse);
 }  // namespace optiling
+
+} // namespace gdn_a5_backend

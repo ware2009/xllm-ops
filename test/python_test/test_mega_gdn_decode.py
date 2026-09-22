@@ -174,6 +174,8 @@ def test_all_qwen35_local_head_shapes(num_k_heads, num_v_heads):
         (8, 16, 2),
         (8, 24, 3),
         (8, 24, 4),
+        (16, 16, 4),
+        (16, 48, 4),
         (8, 24, 32),
         (16, 64, 2),
     ],
@@ -184,7 +186,14 @@ def test_representative_batch_shapes(num_k_heads, num_v_heads, batch_size):
 
 @pytest.mark.parametrize(
     ("num_k_heads", "num_v_heads", "batch_size"),
-    [(1, 2, 1), (2, 4, 2)],
+    [
+        (1, 2, 1),
+        (2, 4, 2),
+        # A5 B4 serving buckets: Qwen3.5-2B TP1, 27B TP1, and 27B TP2.
+        (16, 16, 4),
+        (16, 48, 4),
+        (8, 24, 4),
+    ],
 )
 @pytest.mark.parametrize("prefix_fork", [False, True])
 @pytest.mark.parametrize("fla_ssm_state_layout", [True, False])
@@ -219,8 +228,9 @@ def test_nonzero_inputs_match_reference(
             2, 2 + batch_size, dtype=torch.int32
         )
     else:
+        state_index_values = [1, 0] + list(range(2, batch_size))
         read_state_indices = torch.tensor(
-            [1, 0][:batch_size], dtype=torch.int32
+            state_index_values[:batch_size], dtype=torch.int32
         )
         write_state_indices = read_state_indices
     norm_weight = 1 + randn((HEAD_DIM,), 0.05)

@@ -107,7 +107,8 @@ sequence produces no output and does not write Conv or SSM state.
   `writeStateIndices[b]`;
 - read and write slots may be equal; a prefix fork may read a shared slot and
   write a private slot;
-- write slots must be unique within an invocation.
+- write slots must be unique among valid requests.
+  ACL Graph padding may share a valid reserved slot, such as slot 0. This slot must always be used only for padding: normal requests must never read it, write it, or use it as cached state. This applies to Conv state, SSM state. All padding outputs and state must be discarded; other inputs must still satisfy the operator requirements. For example, two normal requests followed by two padding requests may use `write slots = [1, 2, 0, 0]`. Padding requests overwrite each other's state in slot 0, so its contents must not be used. If the slot cannot remain reserved, assign a separate slot to each padding request.
 
 Conv state always stores the three most recent original `qkv` inputs, not
 `convOut`. The SSM state remains in UB for all packed tokens of a sequence and
@@ -158,8 +159,8 @@ and it does not require a change to the public ABI of the Python test helper.
   future host and device validation;
 - when input and output state buffers differ, the caller must preserve slots
   not written by the invocation;
-- a zero-length padding sequence currently writes no state; write slots of all
-  non-empty sequences must be unique;
+- a zero-length padding sequence currently writes no state; valid requests must
+  have unique write slots; non-empty padding must satisfy the isolation constraints above;
 - Draft and Verify operators must not write the same state slot concurrently.
 
 ## Invocation and build layout

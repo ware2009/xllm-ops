@@ -1,7 +1,3 @@
-// Preserve upstream main for non-A5 targets.
-#if defined(GDN_PREFILL_TARGET_A5) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510) || (defined(__CCE_AICORE__) && __CCE_AICORE__ == 310)
-#include "arch35/mega_gdn_decode_pto_kernel.h"
-#else
 /* Copyright 2026 The xLLM Authors. All Rights Reserved. */
 
 #pragma once
@@ -654,10 +650,590 @@ AICORE PTO_INLINE void ComputeAndStoreConvBatch(
     set_flag(PIPE_MTE3, PIPE_MTE2, ReuseEvent);
 }
 
+#if defined(PTO_NPU_ARCH_A5)
+namespace a5_b4_deferred {
+
+AICORE PTO_INLINE void NormVectorBarrier()
+{
+    // Deferred Norm only has vector-to-vector dependencies until its final
+    // output store.  Ascend950 does not accept a single-pipe PIPE_V barrier,
+    // so fence the vector queue through the scalar pipe instead.  This keeps
+    // MTE3 running while the last FP32 state store overlaps this tail; the
+    // final V->MTE3 event and state-publish barrier still order and drain both
+    // stores.
+    PtoSetWaitFlag<PIPE_V, PIPE_S>(EVENT_ID0, EVENT_ID0);
+    PtoSetWaitFlag<PIPE_S, PIPE_V>(EVENT_ID0, EVENT_ID0);
+}
+
+// Reuse the ordinary decode UB layout.  The two 64-KiB state regions alternate
+// between current state and recurrent scratch.  Cached BF16 readout/Z rows live
+// above the scalar caches and survive until the batched Norm tail.
+constexpr int32_t kUbQHalf = 8704;
+constexpr int32_t kUbKHalf = 8960;
+constexpr int32_t kUbQ = 9280;
+constexpr int32_t kUbK = 9792;
+constexpr int32_t kUbNormSquare = 10368;
+constexpr int32_t kUbNormValue = 10880;
+constexpr int32_t kUbReduceTmp = 10912;
+constexpr int32_t kUbScalarTmp = 19104;
+constexpr int32_t kUbVHalf = 19200;
+constexpr int32_t kUbState0 = 19456;
+constexpr int32_t kUbV = 84992;
+constexpr int32_t kUbState1 = 85504;
+constexpr int32_t kUbPrediction = 151040;
+constexpr int32_t kUbDelta = 151552;
+constexpr int32_t kUbNormWeightHalf = 152832;
+constexpr int32_t kUbNormWeight = 154112;
+constexpr int32_t kUbColumnSumTmp = 156672;
+constexpr int32_t kUbACache = 173312;
+constexpr int32_t kUbBCache = 173568;
+constexpr int32_t kUbCachedReadoutHalf = 174592;
+constexpr int32_t kUbCachedZHalf =
+    kUbCachedReadoutHalf + 4 * kHeadDim * sizeof(bfloat16_t);
+constexpr int32_t kUbCachedRowsEnd =
+    kUbCachedZHalf + 4 * kHeadDim * sizeof(bfloat16_t);
+
+static_assert(kUbState0 + kSsmHeadElements * sizeof(float) == kUbV);
+static_assert(kUbState1 + kSsmHeadElements * sizeof(float) == kUbPrediction);
+static_assert(kUbCachedRowsEnd <= static_cast<int32_t>(pto::TMP_UB_OFFSET));
+
+template <int32_t Rows>
+AICORE PTO_INLINE void LoadBf16Rows(__gm__ bfloat16_t *handle,
+                                    int32_t ub_address,
+                                    int32_t row_stride)
+{
+    using RowShape = pto::Shape<1, 1, 1, Rows, kHeadDim>;
+    using RowStride = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+    RowShape shape;
+    RowStride stride(row_stride);
+    pto::GlobalTensor<bfloat16_t, RowShape, RowStride> tensor(
+        handle, shape, stride);
+    TileUbDataND<bfloat16_t, Rows, kHeadDim> tile;
+    TASSIGN(tile, ub_address);
+    TLOAD(tile, tensor);
+}
+
+template <int32_t Rows>
+AICORE PTO_INLINE void StoreBf16Rows(__gm__ bfloat16_t *handle,
+                                     int32_t ub_address,
+                                     int32_t row_stride)
+{
+    using RowShape = pto::Shape<1, 1, 1, Rows, kHeadDim>;
+    using RowStride = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+    RowShape shape;
+    RowStride stride(row_stride);
+    pto::GlobalTensor<bfloat16_t, RowShape, RowStride> tensor(
+        handle, shape, stride);
+    TileUbDataND<bfloat16_t, Rows, kHeadDim> tile;
+    TASSIGN(tile, ub_address);
+    TSTORE(tensor, tile);
+}
+
+template <int32_t Rows, int32_t WorkBase>
+class NormLayout final {
+ public:
+    static constexpr int32_t kInput = WorkBase;
+    static constexpr int32_t kZ =
+        kInput + Rows * kHeadDim * sizeof(float);
+    static constexpr int32_t kSquare =
+        kZ + Rows * kHeadDim * sizeof(float);
+    static constexpr int32_t kReduceTmp =
+        kSquare + Rows * kHeadDim * sizeof(float);
+    static constexpr int32_t kRms =
+        kReduceTmp + Rows * 64 * sizeof(float);
+    static constexpr int32_t kRmsSqrt = kRms + 16 * sizeof(float);
+    static constexpr int32_t kFinalHalf =
+        kRmsSqrt + 16 * sizeof(float);
+    static constexpr int32_t kWorkEnd =
+        kFinalHalf + Rows * kHeadDim * sizeof(bfloat16_t);
+
+    static_assert(Rows >= 1 && Rows <= 4);
+    static_assert(kWorkEnd <= WorkBase + kSsmHeadElements * sizeof(float));
+};
+
+// Ascend950-only row-streaming recurrent primitives.  Each vector register
+// owns one 64-value half of the V dimension while rows stream through the
+// registers in K order.  The state layout is [K, V].  Separate Mul/Add keeps
+// the FP32 update rounding aligned with the existing PTO implementation.
+AICORE PTO_INLINE void StateVectorProductRegBase128(
+    TileUbDataND<float, 1, 128> &dst,
+    TileUbDataND<float, 128, 128> &state,
+    TileUbDataND<float, 1, 128> &vector)
+{
+    __ubuf__ float *dst_addr =
+        reinterpret_cast<__ubuf__ float *>(dst.data());
+    __ubuf__ float *state_addr =
+        reinterpret_cast<__ubuf__ float *>(state.data());
+    __ubuf__ float *vector_addr =
+        reinterpret_cast<__ubuf__ float *>(vector.data());
+
+    __VEC_SCOPE__
+    {
+        AscendC::MicroAPI::RegTensor<float> accum_low;
+        AscendC::MicroAPI::RegTensor<float> accum_high;
+        AscendC::MicroAPI::RegTensor<float> state_low;
+        AscendC::MicroAPI::RegTensor<float> state_high;
+        AscendC::MicroAPI::RegTensor<float> vector_broadcast;
+        AscendC::MicroAPI::RegTensor<float> product_low;
+        AscendC::MicroAPI::RegTensor<float> product_high;
+        AscendC::MicroAPI::MaskReg full_mask =
+            AscendC::MicroAPI::CreateMask<
+                float, AscendC::MicroAPI::MaskPattern::ALL>();
+
+        AscendC::MicroAPI::Duplicate(accum_low, 0.0f, full_mask);
+        AscendC::MicroAPI::Duplicate(accum_high, 0.0f, full_mask);
+        for (uint16_t row = 0; row < 128; ++row) {
+            AscendC::MicroAPI::DataCopy(
+                state_low, state_addr + row * 128);
+            AscendC::MicroAPI::DataCopy(
+                state_high, state_addr + row * 128 + 64);
+            AscendC::MicroAPI::DataCopy<
+                float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(
+                vector_broadcast, vector_addr + row);
+            AscendC::MicroAPI::Mul(
+                product_low, state_low, vector_broadcast, full_mask);
+            AscendC::MicroAPI::Mul(
+                product_high, state_high, vector_broadcast, full_mask);
+            AscendC::MicroAPI::Add(
+                accum_low, accum_low, product_low, full_mask);
+            AscendC::MicroAPI::Add(
+                accum_high, accum_high, product_high, full_mask);
+        }
+        AscendC::MicroAPI::DataCopy(dst_addr, accum_low, full_mask);
+        AscendC::MicroAPI::DataCopy(dst_addr + 64, accum_high, full_mask);
+    }
+}
+
+AICORE PTO_INLINE void StateRankOneUpdateAndProductRegBase128(
+    TileUbDataND<float, 1, 128> &dst,
+    TileUbDataND<float, 128, 128> &state,
+    TileUbDataND<float, 1, 128> &key,
+    TileUbDataND<float, 1, 128> &delta,
+    TileUbDataND<float, 1, 128> &query)
+{
+    __ubuf__ float *dst_addr =
+        reinterpret_cast<__ubuf__ float *>(dst.data());
+    __ubuf__ float *state_addr =
+        reinterpret_cast<__ubuf__ float *>(state.data());
+    __ubuf__ float *key_addr =
+        reinterpret_cast<__ubuf__ float *>(key.data());
+    __ubuf__ float *delta_addr =
+        reinterpret_cast<__ubuf__ float *>(delta.data());
+    __ubuf__ float *query_addr =
+        reinterpret_cast<__ubuf__ float *>(query.data());
+
+    __VEC_SCOPE__
+    {
+        AscendC::MicroAPI::RegTensor<float> delta_low;
+        AscendC::MicroAPI::RegTensor<float> delta_high;
+        AscendC::MicroAPI::RegTensor<float> accum_low;
+        AscendC::MicroAPI::RegTensor<float> accum_high;
+        AscendC::MicroAPI::RegTensor<float> state_low;
+        AscendC::MicroAPI::RegTensor<float> state_high;
+        AscendC::MicroAPI::RegTensor<float> key_broadcast;
+        AscendC::MicroAPI::RegTensor<float> query_broadcast;
+        AscendC::MicroAPI::RegTensor<float> product_low;
+        AscendC::MicroAPI::RegTensor<float> product_high;
+        AscendC::MicroAPI::MaskReg full_mask =
+            AscendC::MicroAPI::CreateMask<
+                float, AscendC::MicroAPI::MaskPattern::ALL>();
+
+        AscendC::MicroAPI::DataCopy(delta_low, delta_addr);
+        AscendC::MicroAPI::DataCopy(delta_high, delta_addr + 64);
+        AscendC::MicroAPI::Duplicate(accum_low, 0.0f, full_mask);
+        AscendC::MicroAPI::Duplicate(accum_high, 0.0f, full_mask);
+        for (uint16_t row = 0; row < 128; ++row) {
+            AscendC::MicroAPI::DataCopy(
+                state_low, state_addr + row * 128);
+            AscendC::MicroAPI::DataCopy(
+                state_high, state_addr + row * 128 + 64);
+            AscendC::MicroAPI::DataCopy<
+                float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(
+                key_broadcast, key_addr + row);
+            AscendC::MicroAPI::Mul(
+                product_low, delta_low, key_broadcast, full_mask);
+            AscendC::MicroAPI::Mul(
+                product_high, delta_high, key_broadcast, full_mask);
+            AscendC::MicroAPI::Add(
+                state_low, state_low, product_low, full_mask);
+            AscendC::MicroAPI::Add(
+                state_high, state_high, product_high, full_mask);
+            AscendC::MicroAPI::DataCopy(
+                state_addr + row * 128, state_low, full_mask);
+            AscendC::MicroAPI::DataCopy(
+                state_addr + row * 128 + 64, state_high, full_mask);
+
+            AscendC::MicroAPI::DataCopy<
+                float, AscendC::MicroAPI::LoadDist::DIST_BRC_B32>(
+                query_broadcast, query_addr + row);
+            AscendC::MicroAPI::Mul(
+                product_low, state_low, query_broadcast, full_mask);
+            AscendC::MicroAPI::Mul(
+                product_high, state_high, query_broadcast, full_mask);
+            AscendC::MicroAPI::Add(
+                accum_low, accum_low, product_low, full_mask);
+            AscendC::MicroAPI::Add(
+                accum_high, accum_high, product_high, full_mask);
+        }
+        AscendC::MicroAPI::DataCopy(dst_addr, accum_low, full_mask);
+        AscendC::MicroAPI::DataCopy(dst_addr + 64, accum_high, full_mask);
+    }
+}
+
+template <bool FlaSsmStateLayout, bool UseRegBase = false>
+AICORE PTO_INLINE void RunRecurrentHead(
+    TileUbDataND<float, 128, 128> &state,
+    TileUbDataND<float, 128, 128> &compute,
+    TileUbDataND<float, 1, 128> &q,
+    TileUbDataND<float, 1, 128> &k,
+    TileUbDataND<float, 1, 128> &v,
+    TileUbDataND<float, 1, 128> &prediction,
+    TileUbDataND<float, 1, 128> &delta,
+    TileUbDataND<float, 32, 128> &colsum_tmp,
+    float decay, float beta_gate, int32_t cached_readout_address)
+{
+    TMULS(state, state, decay);
+    if constexpr (UseRegBase) {
+        static_assert(FlaSsmStateLayout);
+        NormVectorBarrier();
+        StateVectorProductRegBase128(prediction, state, k);
+        NormVectorBarrier();
+    } else {
+        VectorBarrier();
+        StateVectorProduct128<FlaSsmStateLayout>(
+            prediction, state, k, compute, colsum_tmp);
+    }
+    TSUB(delta, v, prediction);
+    if constexpr (UseRegBase) {
+        NormVectorBarrier();
+    } else {
+        VectorBarrier();
+    }
+    TMULS(delta, delta, beta_gate);
+    if constexpr (UseRegBase) {
+        NormVectorBarrier();
+        StateRankOneUpdateAndProductRegBase128(
+            prediction, state, k, delta, q);
+        NormVectorBarrier();
+    } else {
+        VectorBarrier();
+        StateRankOneUpdate128<FlaSsmStateLayout>(state, k, delta, compute);
+        StateVectorProduct128<FlaSsmStateLayout>(
+            prediction, state, q, compute, colsum_tmp);
+    }
+    TileUbDataND<bfloat16_t, 1, kHeadDim> cached_readout;
+    TASSIGN(cached_readout, cached_readout_address);
+    // Preserve the public BF16 recurrent-to-Norm hand-off exactly.
+    TCVT(cached_readout, prediction, RoundMode::CAST_RINT);
+    VectorBarrier();
+}
+
+template <int32_t Rows, int32_t WorkBase>
+AICORE PTO_INLINE void RunDeferredNorm(
+    __gm__ bfloat16_t *out_handle, int32_t first_head_index)
+{
+    using Layout = NormLayout<Rows, WorkBase>;
+    TileUbDataND<bfloat16_t, Rows, kHeadDim> cached_readout_batch;
+    TASSIGN(cached_readout_batch, kUbCachedReadoutHalf);
+    TileUbDataND<bfloat16_t, Rows, kHeadDim> cached_z_batch;
+    TASSIGN(cached_z_batch, kUbCachedZHalf);
+    TileUbDataND<float, Rows, kHeadDim> input_batch;
+    TASSIGN(input_batch, Layout::kInput);
+    TileUbDataND<float, Rows, kHeadDim> z_batch;
+    TASSIGN(z_batch, Layout::kZ);
+    TileUbDataND<float, Rows, kHeadDim> square_batch;
+    TASSIGN(square_batch, Layout::kSquare);
+    TileUbDataND<float, Rows, 64> reduce_tmp_batch;
+    TASSIGN(reduce_tmp_batch, Layout::kReduceTmp);
+    TileUbDataDN<float, 16, 1, Rows, 1> rms_batch_dn;
+    TASSIGN(rms_batch_dn, Layout::kRms);
+    TileUbDataND<float, 1, 16, 1, Rows> rms_batch;
+    TASSIGN(rms_batch, Layout::kRms);
+    TileUbDataND<float, 1, 16, 1, Rows> rms_sqrt_batch;
+    TASSIGN(rms_sqrt_batch, Layout::kRmsSqrt);
+    TileUbDataND<bfloat16_t, Rows, kHeadDim> final_half_batch;
+    TASSIGN(final_half_batch, Layout::kFinalHalf);
+    TileUbDataND<float, 1, kHeadDim> norm_weight;
+    TASSIGN(norm_weight, kUbNormWeight);
+
+    for (int32_t row = 0; row < Rows; ++row) {
+        TileUbDataND<bfloat16_t, 1, kHeadDim> cached_readout;
+        TASSIGN(cached_readout,
+                kUbCachedReadoutHalf +
+                    row * kHeadDim * sizeof(bfloat16_t));
+        TileUbDataND<bfloat16_t, 1, kHeadDim> cached_z;
+        TASSIGN(cached_z,
+                kUbCachedZHalf + row * kHeadDim * sizeof(bfloat16_t));
+        TileUbDataND<float, 1, kHeadDim> input;
+        TASSIGN(input,
+                Layout::kInput + row * kHeadDim * sizeof(float));
+        TileUbDataND<float, 1, kHeadDim> z;
+        TASSIGN(z, Layout::kZ + row * kHeadDim * sizeof(float));
+        TCVT(input, cached_readout, RoundMode::CAST_NONE);
+        TCVT(z, cached_z, RoundMode::CAST_NONE);
+    }
+    NormVectorBarrier();
+    TMUL(square_batch, input_batch, input_batch);
+    NormVectorBarrier();
+    for (int32_t row = 0; row < Rows; ++row) {
+        TileUbDataND<float, 1, 64> square_low;
+        TASSIGN(square_low,
+                Layout::kSquare + row * kHeadDim * sizeof(float));
+        TileUbDataND<float, 1, 64> square_high;
+        TASSIGN(square_high,
+                Layout::kSquare +
+                    (row * kHeadDim + 64) * sizeof(float));
+        TileUbDataND<float, 1, 64> reduced;
+        TASSIGN(reduced,
+                Layout::kReduceTmp + row * 64 * sizeof(float));
+        TADD(reduced, square_low, square_high);
+    }
+    NormVectorBarrier();
+    TROWSUM(rms_batch_dn, reduce_tmp_batch, square_batch);
+    NormVectorBarrier();
+    TMULS(rms_batch, rms_batch, 1.0f / 128.0f);
+    NormVectorBarrier();
+    TADDS(rms_batch, rms_batch, 1.0e-6f);
+    NormVectorBarrier();
+    TSQRT(rms_sqrt_batch, rms_batch);
+    NormVectorBarrier();
+    TMULS(rms_batch, rms_batch, 0.0f);
+    NormVectorBarrier();
+    TADDS(rms_batch, rms_batch, 1.0f);
+    NormVectorBarrier();
+    TDIV(rms_batch, rms_batch, rms_sqrt_batch);
+    NormVectorBarrier();
+    TROWEXPANDMUL(input_batch, input_batch, rms_batch_dn);
+    NormVectorBarrier();
+    for (int32_t row = 0; row < Rows; ++row) {
+        TileUbDataND<float, 1, kHeadDim> input;
+        TASSIGN(input,
+                Layout::kInput + row * kHeadDim * sizeof(float));
+        TMUL(input, input, norm_weight);
+    }
+    NormVectorBarrier();
+    // Preserve layer_norm_fwd's (value * z) / (1 + exp(-z)) order.
+    TMUL(input_batch, input_batch, z_batch);
+    NormVectorBarrier();
+    TMULS(z_batch, z_batch, -1.0f);
+    NormVectorBarrier();
+    TEXP(z_batch, z_batch);
+    NormVectorBarrier();
+    TADDS(z_batch, z_batch, 1.0f);
+    NormVectorBarrier();
+    TDIV(input_batch, input_batch, z_batch);
+    NormVectorBarrier();
+    TCVT(final_half_batch, input_batch, RoundMode::CAST_ROUND);
+    NormVectorBarrier();
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID5);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID5);
+    StoreBf16Rows<Rows>(
+        out_handle + static_cast<int64_t>(first_head_index) * kHeadDim,
+        Layout::kFinalHalf, kHeadDim);
+}
+
+template <int32_t Rows, bool FlaSsmStateLayout, bool UseRegBase = false>
+AICORE PTO_INLINE void RunHeads(
+    __gm__ bfloat16_t *z_handle, __gm__ bfloat16_t *conv_out_handle,
+    __gm__ float *ssm_state_handle,
+    __gm__ int *read_state_indices_handle,
+    __gm__ int *write_state_indices_handle,
+    __gm__ bfloat16_t *norm_weight_handle,
+    __gm__ float *ssm_state_out_handle, __gm__ bfloat16_t *out_handle,
+    int32_t num_k_heads, int32_t num_v_heads, int32_t first_head_index)
+{
+    static_assert(Rows >= 1 && Rows <= 4);
+    const int32_t conv_dim =
+        (2 * num_k_heads + num_v_heads) * kHeadDim;
+    const int32_t v_heads_per_k = num_v_heads / num_k_heads;
+    const int32_t ssm_state_stride = num_v_heads * kSsmHeadElements;
+
+    TileUbDataND<bfloat16_t, 1, kHeadDim> q_half;
+    TASSIGN(q_half, kUbQHalf);
+    TileUbDataND<bfloat16_t, 1, kHeadDim> k_half;
+    TASSIGN(k_half, kUbKHalf);
+    TileUbDataND<float, 1, kHeadDim> q;
+    TASSIGN(q, kUbQ);
+    TileUbDataND<float, 1, kHeadDim> k;
+    TASSIGN(k, kUbK);
+    TileUbDataND<float, 1, kHeadDim> norm_square;
+    TASSIGN(norm_square, kUbNormSquare);
+    TileUbDataND<float, 1, 8, 1, 1> norm_value;
+    TASSIGN(norm_value, kUbNormValue);
+    TileUbDataND<uint8_t, 128, 64> reduce_tmp;
+    TASSIGN(reduce_tmp, kUbReduceTmp);
+    TileUbDataND<float, 1, 8, 1, 1> scalar_tmp;
+    TASSIGN(scalar_tmp, kUbScalarTmp);
+    TileUbDataND<bfloat16_t, 1, kHeadDim> v_half;
+    TASSIGN(v_half, kUbVHalf);
+    TileUbDataND<float, 1, kHeadDim> v;
+    TASSIGN(v, kUbV);
+    TileUbDataND<float, 128, 128> state0;
+    TASSIGN(state0, kUbState0);
+    TileUbDataND<float, 128, 128> state1;
+    TASSIGN(state1, kUbState1);
+    TileUbDataND<float, 1, kHeadDim> prediction;
+    TASSIGN(prediction, kUbPrediction);
+    TileUbDataND<float, 1, kHeadDim> delta;
+    TASSIGN(delta, kUbDelta);
+    TileUbDataND<float, 32, kHeadDim> colsum_tmp;
+    TASSIGN(colsum_tmp, kUbColumnSumTmp);
+    TileUbDataND<float, 1, 64> a_cache;
+    TASSIGN(a_cache, kUbACache);
+    TileUbDataND<float, 1, 64> b_cache;
+    TASSIGN(b_cache, kUbBCache);
+    TileUbDataND<bfloat16_t, 1, kHeadDim> norm_weight_half;
+    TASSIGN(norm_weight_half, kUbNormWeightHalf);
+    TileUbDataND<float, 1, kHeadDim> norm_weight;
+    TASSIGN(norm_weight, kUbNormWeight);
+
+    pipe_barrier(PIPE_ALL);
+    const int32_t first_batch_idx = first_head_index / num_v_heads;
+    const int32_t first_head_idx = first_head_index % num_v_heads;
+    const int32_t first_read_state_idx =
+        *(read_state_indices_handle + first_batch_idx);
+    CopyGmToUb<
+        float, float, 1, 1, 1, 128, 128, kMaxSsmStateElements,
+        kMaxNumVHeads * kSsmHeadElements, kSsmHeadElements,
+        128, 1, 128, 128, pto::PadValue::Zero>(
+            ssm_state_handle + first_read_state_idx * ssm_state_stride +
+                first_head_idx * kSsmHeadElements,
+            kUbState0, 0, 128, 128);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+
+    int32_t cached_qk_group = -1;
+    for (int32_t task_idx = 0; task_idx < Rows; ++task_idx) {
+        const int32_t head_index = first_head_index + task_idx;
+        const int32_t batch_idx = head_index / num_v_heads;
+        const int32_t head_idx = head_index % num_v_heads;
+        const int32_t qk_head_idx = head_idx / v_heads_per_k;
+        const int32_t qk_group = batch_idx * num_k_heads + qk_head_idx;
+        const bool load_qk = qk_group != cached_qk_group;
+        if (load_qk) {
+            CopyGmToUb<
+                bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+                kMaxBatchSize * kMaxConvDim, 1, 1, 128,
+                pto::PadValue::Zero>(
+                    conv_out_handle + batch_idx * conv_dim +
+                        qk_head_idx * kHeadDim,
+                    kUbQHalf, 0, 1, 128);
+            CopyGmToUb<
+                bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+                kMaxBatchSize * kMaxConvDim, 1, 1, 128,
+                pto::PadValue::Zero>(
+                    conv_out_handle + batch_idx * conv_dim +
+                        num_k_heads * kHeadDim + qk_head_idx * kHeadDim,
+                    kUbKHalf, 0, 1, 128);
+        }
+        CopyGmToUb<
+            bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+            kMaxBatchSize * kMaxConvDim, 1, 1, 128,
+            pto::PadValue::Zero>(
+                conv_out_handle + batch_idx * conv_dim +
+                    2 * num_k_heads * kHeadDim + head_idx * kHeadDim,
+                kUbVHalf, 0, 1, 128);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+        if (load_qk) {
+            TCVT(q, q_half, RoundMode::CAST_NONE);
+            TCVT(k, k_half, RoundMode::CAST_NONE);
+        }
+        TCVT(v, v_half, RoundMode::CAST_NONE);
+        VectorBarrier();
+        if (load_qk) {
+            NormalizeQk128<true>(
+                q, norm_square, norm_value, reduce_tmp, scalar_tmp);
+            NormalizeQk128<false>(
+                k, norm_square, norm_value, reduce_tmp, scalar_tmp);
+            cached_qk_group = qk_group;
+        }
+
+        if (task_idx == 0) {
+            LoadBf16Rows<Rows>(
+                z_handle + static_cast<int64_t>(first_head_index) * kHeadDim,
+                kUbCachedZHalf, kHeadDim);
+            CopyGmToUb<
+                bfloat16_t, bfloat16_t, 1, 1, 1, 1, 128, 1, 1, 1,
+                128, 1, 1, 128, pto::PadValue::Zero>(
+                    norm_weight_handle, kUbNormWeightHalf, 0, 1, 128);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID4);
+        }
+
+        const float decay = a_cache.GetValue(task_idx);
+        const float beta_gate = b_cache.GetValue(task_idx);
+        const int32_t cached_readout_address =
+            kUbCachedReadoutHalf +
+            task_idx * kHeadDim * sizeof(bfloat16_t);
+        if ((task_idx & 1) == 0) {
+            RunRecurrentHead<FlaSsmStateLayout, UseRegBase>(
+                state0, state1, q, k, v, prediction, delta, colsum_tmp,
+                decay, beta_gate, cached_readout_address);
+        } else {
+            RunRecurrentHead<FlaSsmStateLayout, UseRegBase>(
+                state1, state0, q, k, v, prediction, delta, colsum_tmp,
+                decay, beta_gate, cached_readout_address);
+        }
+
+        if (task_idx == 0) {
+            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID4);
+            TCVT(norm_weight, norm_weight_half, RoundMode::CAST_NONE);
+            VectorBarrier();
+        }
+
+        const int32_t write_state_idx =
+            *(write_state_indices_handle + batch_idx);
+        const int32_t state_address =
+            (task_idx & 1) == 0 ? kUbState0 : kUbState1;
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
+        CopyUbToGm<
+            float, float, 1, 1, 1, 128, 128, kMaxSsmStateElements,
+            kMaxNumVHeads * kSsmHeadElements, kSsmHeadElements,
+            128, 1, 128, 128>(
+                ssm_state_out_handle + write_state_idx * ssm_state_stride +
+                    head_idx * kSsmHeadElements,
+                state_address, 0, 128, 128);
+
+        if (task_idx + 1 < Rows) {
+            const int32_t next_head_index = head_index + 1;
+            const int32_t next_batch_idx = next_head_index / num_v_heads;
+            const int32_t next_head_idx = next_head_index % num_v_heads;
+            const int32_t next_read_state_idx =
+                *(read_state_indices_handle + next_batch_idx);
+            const int32_t next_state_address =
+                (task_idx & 1) == 0 ? kUbState1 : kUbState0;
+            CopyGmToUb<
+                float, float, 1, 1, 1, 128, 128, kMaxSsmStateElements,
+                kMaxNumVHeads * kSsmHeadElements, kSsmHeadElements,
+                128, 1, 128, 128, pto::PadValue::Zero>(
+                    ssm_state_handle +
+                        next_read_state_idx * ssm_state_stride +
+                        next_head_idx * kSsmHeadElements,
+                    next_state_address, 0, 128, 128);
+            // The current MTE3 state store and next MTE2 state load target
+            // disjoint UB/GM ranges and therefore run concurrently.  Drain
+            // both before swapping their state/scratch roles.
+            pipe_barrier(PIPE_ALL);
+        }
+    }
+
+    if constexpr ((Rows & 1) == 0) {
+        RunDeferredNorm<Rows, kUbState0>(out_handle, first_head_index);
+    } else {
+        RunDeferredNorm<Rows, kUbState1>(out_handle, first_head_index);
+    }
+}
+
+}  // namespace a5_b4_deferred
+#endif
+
 // The generated PTO kernel body follows. The tile shape stays fixed while
 // model-dependent tensor strides and loop bounds come from host tiling data.
 
-template <bool IsBatchOne, bool FlaSsmStateLayout>
+template <bool IsBatchOne, bool FlaSsmStateLayout,
+          bool UseA5B4DeferredNorm = false,
+          bool UseA5B4RegBase = false>
 AICORE PTO_INLINE void Run(
     __gm__ bfloat16_t *qkv_handle, __gm__ bfloat16_t *z_handle,
     __gm__ bfloat16_t *b_handle, __gm__ bfloat16_t *a_handle,
@@ -1097,6 +1673,12 @@ AICORE PTO_INLINE void Run(
 
   const int32_t total_ssm_heads = batch_size * num_v_heads;
   const bool reuse_qk = !IsBatchOne && v_heads_per_k > 1;
+  // Deferred-Norm owners require contiguous rows even when ratio=1.  That
+  // makes their cached rows and alternating state buffers describe the same
+  // heads that RunHeads processes; Q/K is still reloaded whenever the group
+  // changes, so ratio=1 never reuses a different head's Q/K.
+  const bool use_contiguous_head_schedule =
+      reuse_qk || UseA5B4DeferredNorm;
   const int32_t heads_per_core = total_ssm_heads / vector_core_count;
   const int32_t extra_head_cores = total_ssm_heads % vector_core_count;
   const int32_t contiguous_head_start =
@@ -1107,16 +1689,18 @@ AICORE PTO_INLINE void Run(
   const int32_t contiguous_head_count =
       heads_per_core + (vector_core_idx < extra_head_cores ? 1 : 0);
   const int32_t first_head_index =
-      reuse_qk ? contiguous_head_start : vector_core_idx;
+      use_contiguous_head_schedule ? contiguous_head_start : vector_core_idx;
   const int32_t head_index_end =
-      reuse_qk ? contiguous_head_start + contiguous_head_count
-               : total_ssm_heads;
-  const int32_t head_index_step = reuse_qk ? 1 : vector_core_count;
+      use_contiguous_head_schedule
+          ? contiguous_head_start + contiguous_head_count
+          : total_ssm_heads;
+  const int32_t head_index_step =
+      use_contiguous_head_schedule ? 1 : vector_core_count;
   int32_t cached_qk_group = -1;
   const bool cache_head_scalars =
-      reuse_qk && contiguous_head_count > 0;
+      use_contiguous_head_schedule && contiguous_head_count > 0;
 
-  // Phase 3: precompute per-head recurrent scalars for the reusable-QK path.
+  // Phase 3: precompute per-head recurrent scalars for contiguous owners.
   if (cache_head_scalars) {
     const int32_t head_phase =
         contiguous_head_start % num_v_heads;
@@ -1260,6 +1844,37 @@ AICORE PTO_INLINE void Run(
     wait_flag(PIPE_V, PIPE_S, EVENT_ID6);
   }
 
+#if defined(PTO_NPU_ARCH_A5)
+  if constexpr (UseA5B4DeferredNorm) {
+    static_assert(!IsBatchOne && FlaSsmStateLayout);
+    static_assert(!UseA5B4RegBase || UseA5B4DeferredNorm);
+    if (contiguous_head_count == 4) {
+      a5_b4_deferred::RunHeads<4, FlaSsmStateLayout, UseA5B4RegBase>(
+          z_handle, conv_out_handle, ssm_state_handle,
+          read_state_indices_handle, write_state_indices_handle,
+          norm_weight_handle, ssm_state_out_handle, out_handle,
+          num_k_heads, num_v_heads, contiguous_head_start);
+    } else if (contiguous_head_count == 3) {
+      a5_b4_deferred::RunHeads<3, FlaSsmStateLayout, UseA5B4RegBase>(
+          z_handle, conv_out_handle, ssm_state_handle,
+          read_state_indices_handle, write_state_indices_handle,
+          norm_weight_handle, ssm_state_out_handle, out_handle,
+          num_k_heads, num_v_heads, contiguous_head_start);
+    } else if (contiguous_head_count == 2) {
+      a5_b4_deferred::RunHeads<2, FlaSsmStateLayout, UseA5B4RegBase>(
+          z_handle, conv_out_handle, ssm_state_handle,
+          read_state_indices_handle, write_state_indices_handle,
+          norm_weight_handle, ssm_state_out_handle, out_handle,
+          num_k_heads, num_v_heads, contiguous_head_start);
+    } else if (contiguous_head_count == 1) {
+      a5_b4_deferred::RunHeads<1, FlaSsmStateLayout, UseA5B4RegBase>(
+          z_handle, conv_out_handle, ssm_state_handle,
+          read_state_indices_handle, write_state_indices_handle,
+          norm_weight_handle, ssm_state_out_handle, out_handle,
+          num_k_heads, num_v_heads, contiguous_head_start);
+    }
+  } else {
+#endif
   // Phase 4: recurrent GDN update, RMSNorm, gate, and final output.
   for (int32_t head_index = first_head_index;
        head_index < head_index_end;
@@ -1277,8 +1892,15 @@ AICORE PTO_INLINE void Run(
     const int32_t qk_head_idx = head_idx / v_heads_per_k;
     const int32_t qk_group = batch_idx * num_k_heads + qk_head_idx;
     const bool load_qk = !reuse_qk || qk_group != cached_qk_group;
+#if defined(PTO_NPU_ARCH_A5)
+    // norm_weight is shared by every batch item and value head.  Its UB
+    // regions are not reused by the recurrent loop, so one load/conversion per
+    // owner is sufficient even when Q/K itself cannot be reused (NV == NK).
+    const bool load_norm_weight = head_index == first_head_index;
+#else
     const bool load_norm_weight =
         !reuse_qk || head_index == first_head_index;
+#endif
     const int32_t read_state_idx = IsBatchOne
         ? batch_one_read_state_idx
         : *(read_state_indices_handle + batch_idx);
@@ -1578,13 +2200,26 @@ AICORE PTO_INLINE void Run(
         kMaxBatchSize * kMaxNumVHeads * kHeadDim, 1, 1, 128>(
             out_handle + batch_idx * v_width + head_idx * kHeadDim,
             kUbFinalHalf, 0, 1, 128);
+#if defined(PTO_NPU_ARCH_A5)
+    // B>1 already enters the next head through the PIPE_ALL barrier at the
+    // top of this loop.  The final iteration is drained by
+    // SyncAllAivStatePublish(), which also starts with PIPE_ALL.  Keep the
+    // tail barrier for B=1 because a core can still own a second head when
+    // NV exceeds the physical AIV count, and that path has no head-entry
+    // barrier.
+    if constexpr (IsBatchOne) {
+      pipe_barrier(PIPE_ALL);
+    }
+#else
     pipe_barrier(PIPE_ALL);
-#if !defined(PTO_NPU_ARCH_A5)
     if constexpr (!IsBatchOne) {
       pipe_barrier(PIPE_ALL);
     }
 #endif
   }
+#if defined(PTO_NPU_ARCH_A5)
+  }
+#endif
   // Publish all output and persistent-state stores before the next decode
   // invocation can consume the in-place Conv/SSM caches.
   mega_gdn_decode_pto::SyncAllAivStatePublish();
@@ -1592,5 +2227,3 @@ AICORE PTO_INLINE void Run(
 }
 
 }  // namespace mega_gdn_decode_pto
-
-#endif

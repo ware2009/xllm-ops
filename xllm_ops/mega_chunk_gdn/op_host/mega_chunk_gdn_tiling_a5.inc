@@ -1,30 +1,6 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    https://github.com/jd-opensource/xllm/blob/main/LICENSE
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-
-#include "mega_chunk_gdn_tiling.h"
-
-#include <algorithm>
-#include <cstdint>
-#include <iostream>
-#include <limits>
-#include <sstream>
-
-#include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
-
-#include "mega_chunk_gdn_tiling_a5.inc"
+// A5-only host implementation; included after the upstream headers.
+namespace gdn_a5_backend {
+using namespace ::optiling;
 
 namespace {
 constexpr uint32_t kHeadDim = 128;
@@ -67,7 +43,9 @@ uint32_t CeilDiv(uint32_t value, uint32_t divisor)
 uint64_t CalcUserWorkspaceBytes(uint32_t blockDim)
 {
     const uint64_t tileBytes = static_cast<uint64_t>(kChunkSize) * kChunkSize * kHalfBytes;
-    constexpr uint64_t kWorkspaceTileCount = 11;
+    // KKT/WY(4) + H(4) + primary O mailboxes(3) + independent O ping
+    // mailboxes(4). Keeping O separate preserves async producer lifetimes.
+    constexpr uint64_t kWorkspaceTileCount = 15;
     return static_cast<uint64_t>(blockDim) *
                (kWorkspaceTileCount * tileBytes +
                 4 * kHWorkspacePadBytes) +
@@ -98,11 +76,6 @@ ge::graphStatus FailTiling(const std::string &reason)
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
-    if (platform_ascendc::PlatformAscendC(context->GetPlatformInfo()).GetSocVersion() ==
-        platform_ascendc::SocVersion::ASCEND950) {
-        return gdn_a5_backend::optiling::TilingFunc(context);
-    }
-
     auto platformInfo = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     const bool isAscend950 = platformInfo.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950;
     uint32_t blockDim = platformInfo.GetCoreNumAic();
@@ -204,7 +177,6 @@ static ge::graphStatus TilingParseForMegaChunkGdn(gert::TilingParseContext *cont
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(MegaChunkGdn)
-    .Tiling(TilingFunc)
-    .TilingParse<MegaChunkGdnCompileInfo>(TilingParseForMegaChunkGdn);
 }  // namespace optiling
+
+} // namespace gdn_a5_backend

@@ -1,10 +1,6 @@
-// A5 implementation is isolated; the non-A5 branch is upstream main fee3816.
-#if defined(GDN_PREFILL_TARGET_A5) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510) || (defined(__CCE_AICORE__) && __CCE_AICORE__ == 310)
-#include "arch35/mega_gdn_prefill_op.cpp"
-#else
 // Qwen3.5 prefill Conv-to-gated-RMSNorm single-launch PTO kernel.
 
-#include "gdn_prefill_arch.h"
+#include "../gdn_prefill_arch.h"
 
 struct MegaGdnPrefillOpKernelTilingData {
     uint32_t block_dim;
@@ -35,151 +31,52 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define MEGA_CHUNK_GDN_HELPER_NAMESPACE qwen35_e2e_pto
 #define MEGA_GDN_BUILD_REV 2026082515
 
-// A5 solve experiments.  The default remains the validated fp32 hybrid.
-// Override this definition for candidate builds only:
-//   0: Cube diagonals + fp32 AIV off-diagonal recurrence (baseline)
-//   1: Cube diagonals with fp16 recurrent state + fp32 AIV off-diagonal
-//   2: blocked Cube sums with fp16 Cube/AIV block handoffs
-//   3: resident full-Cube solve with one final fp16 handoff
-//   4: full-matrix Cube-resident Neumann solve with one final packed handoff
-//   5: megagdn-pto recursive Cube solve with direct final GM store
-//   6: megagdn-pto recursive Cube solve with packed AIV layout conversion
-//   7: variant 6 with a true fp32 final Cube-to-AIV handoff
-//   8: variant 7 identity-publication diagnostic
-//   9: variant 8 with an AIV BSND-scatter bypass diagnostic
-//  10: direct recursive Cube solve with a fused MIX completion handoff
-//  11: direct BSND recursive Cube solve with fp32 final handoff
-//  12: variant 11 with the solve buffer copied to the public output
-//  13: variant 11 compatibility alias (Newton refinement removed)
-//  14: variant 13 with the final BSND scatter striped across both AIVs
-//  15: variant 14 with A5 vector/cache optimizations
-//  16: variant 15 with head-major packed W/U/V_new internal data flow
-//  17: variant 16 with A5 multi-batch group-QK reuse
-//  18: variant 17 with directed A5 group-QK intra-block synchronization
-//  19: variant 18 without redundant per-chunk H-to-O ready counters
-//  20: variant 19 with one-round A5 group-QK double-mailbox lookahead
-//  21: variant 16 with A5 per-chunk H/O producer-consumer overlap
-//  22: variant 16 with a full-chunk 2x64 recursive solve
-#ifndef MEGA_GDN_A5_SOLVE_VARIANT
-#define MEGA_GDN_A5_SOLVE_VARIANT 16
+// Production A5 preset (formerly variant 84).
+// Keep architecture-specific scheduling here; A2/A3 uses the parent entry.
+#if defined(MEGA_GDN_A5_SOLVE_VARIANT) && MEGA_GDN_A5_SOLVE_VARIANT != 84
+#error "Historical A5 variants have been retired; use the production preset."
 #endif
-
-#if defined(GDN_PREFILL_ARCH_A5)
-#define MEGA_CHUNK_GDN_A5_DUAL_AIV_SOLVE
-// Qwen GQA shares one K head across several value heads.  Build each K*K^T
-// tile once per key head for packed multi-sequence prefill instead of
-// repeating the identical Cube GEMM for every value head.
-#define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
-#if MEGA_GDN_A5_SOLVE_VARIANT != 4 && MEGA_GDN_A5_SOLVE_VARIANT != 5 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 6 && MEGA_GDN_A5_SOLVE_VARIANT != 7 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 8 && MEGA_GDN_A5_SOLVE_VARIANT != 9 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 10 && MEGA_GDN_A5_SOLVE_VARIANT != 11 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 12 && MEGA_GDN_A5_SOLVE_VARIANT != 13 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 14 && MEGA_GDN_A5_SOLVE_VARIANT != 15 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 16 && MEGA_GDN_A5_SOLVE_VARIANT != 17 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 18 && MEGA_GDN_A5_SOLVE_VARIANT != 19 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 20 && MEGA_GDN_A5_SOLVE_VARIANT != 21 && \
-    MEGA_GDN_A5_SOLVE_VARIANT != 22
-#define MEGA_CHUNK_GDN_A5_BLOCKED_CUBE_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT < 2
-#define MEGA_CHUNK_GDN_A5_CUBE_DIAG_AIV_OFFDIAG
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 1
-#define MEGA_CHUNK_GDN_A5_FP16_INTERMEDIATE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 0
-#define MEGA_CHUNK_GDN_A5_CUBE_FP32_HANDOFF
-#define MEGA_CHUNK_GDN_A5_SKIP_DIAGONAL_REFINEMENT
-#define MEGA_CHUNK_GDN_A5_VECTOR_OFFDIAG
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 3
-#define MEGA_CHUNK_GDN_A5_RESIDENT_FULL_CUBE_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 4
-#define MEGA_CHUNK_GDN_A5_FULL_MATRIX_CUBE_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 5
-#define MEGA_CHUNK_GDN_A5_REFERENCE_RECURSIVE_CUBE_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 10
-#define MEGA_CHUNK_GDN_A5_REFERENCE_RECURSIVE_CUBE_SYNC_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 11 || MEGA_GDN_A5_SOLVE_VARIANT == 12 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 13 || MEGA_GDN_A5_SOLVE_VARIANT == 14 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 15 || MEGA_GDN_A5_SOLVE_VARIANT == 16 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 17 || MEGA_GDN_A5_SOLVE_VARIANT == 18 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 21 || MEGA_GDN_A5_SOLVE_VARIANT == 22
+#define MEGA_CHUNK_GDN_A5_BLOCK_LOCAL_EARLY_RECURSION
 #define MEGA_CHUNK_GDN_A5_DIRECT_RECURSIVE_CUBE_FP32_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 14 || MEGA_GDN_A5_SOLVE_VARIANT == 15 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 16 || MEGA_GDN_A5_SOLVE_VARIANT == 17 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 18 || MEGA_GDN_A5_SOLVE_VARIANT == 19 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 20 || MEGA_GDN_A5_SOLVE_VARIANT == 21 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 22
-#define MEGA_CHUNK_GDN_A5_DUAL_FP32_SCATTER
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 15 || MEGA_GDN_A5_SOLVE_VARIANT == 16 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 17 || MEGA_GDN_A5_SOLVE_VARIANT == 18 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 21 || MEGA_GDN_A5_SOLVE_VARIANT == 22
-#define MEGA_CHUNK_GDN_A5_SINGLE_POST_SOLVE_SYNC
+#define MEGA_CHUNK_GDN_A5_DUAL_AIV_SOLVE
 #define MEGA_CHUNK_GDN_A5_DUAL_AIV_WY
+#define MEGA_CHUNK_GDN_A5_DUAL_FP32_SCATTER
 #define MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 16 || MEGA_GDN_A5_SOLVE_VARIANT == 17 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 18 || MEGA_GDN_A5_SOLVE_VARIANT == 19 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 20 || MEGA_GDN_A5_SOLVE_VARIANT == 21 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 22
-#define MEGA_CHUNK_GDN_A5_PACKED_WUV
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 22
-#define MEGA_CHUNK_GDN_A5_SPLIT64_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 17 || MEGA_GDN_A5_SOLVE_VARIANT == 18 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20
+#define MEGA_CHUNK_GDN_A5_GENERIC_V_PREFETCH
+#define MEGA_CHUNK_GDN_A5_GROUP_QKV_DIRECT_HANDOFF
+#define MEGA_CHUNK_GDN_A5_GROUP_QK_DIRECT_HANDOFF
+#define MEGA_CHUNK_GDN_A5_GROUP_QK_PERSISTENT_RAW
 #define MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE
-#define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 18 || MEGA_GDN_A5_SOLVE_VARIANT == 19 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 20
-#define MEGA_CHUNK_GDN_A5_GROUP_QK_DIRECTED_SYNC
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 19 || MEGA_GDN_A5_SOLVE_VARIANT == 20
-#define MEGA_CHUNK_GDN_A5_GROUP_QK_SKIP_HO_READY
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 20
-#define MEGA_CHUNK_GDN_A5_GROUP_QK_DOUBLE_MAILBOX
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 21
-#define MEGA_CHUNK_GDN_A5_HO_OVERLAP
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 12
-#define MEGA_CHUNK_GDN_A5_DUMP_SOLVE_OUTPUT
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 6
-#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_CUBE_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 7 || MEGA_GDN_A5_SOLVE_VARIANT == 8 || \
-    MEGA_GDN_A5_SOLVE_VARIANT == 9
-#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_CUBE_FP32_SOLVE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 8 || MEGA_GDN_A5_SOLVE_VARIANT == 9
-#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_IDENTITY_PROBE
-#endif
-#if MEGA_GDN_A5_SOLVE_VARIANT == 9
-#define MEGA_CHUNK_GDN_A5_PACKED_RECURSIVE_BSND_SCATTER_PROBE
-#endif
-#endif
-#if defined(GDN_PREFILL_ARCH_A2A3)
-#define MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
+#define MEGA_CHUNK_GDN_A5_H_STATE_REGBASE
+#define MEGA_CHUNK_GDN_A5_H_STATE_REGBASE4
+#define MEGA_CHUNK_GDN_A5_O_BOUNDARY_REGBASE
+#define MEGA_CHUNK_GDN_A5_O_COMBINE_BOUNDARY_REGBASE
+#define MEGA_CHUNK_GDN_A5_O_RMS_DIRECT_ONE
+#define MEGA_CHUNK_GDN_A5_O_RMS_FINAL_REGBASE
+#define MEGA_CHUNK_GDN_A5_PACKED_WUV
+#define MEGA_CHUNK_GDN_A5_PRECOMPUTED_M_NEG
+#define MEGA_CHUNK_GDN_A5_PUBLISH_INPUTS_BEFORE_WY
+#define MEGA_CHUNK_GDN_A5_QS_SCALE_REGBASE
+#define MEGA_CHUNK_GDN_A5_SINGLE_POST_SOLVE_SYNC
+#define MEGA_CHUNK_GDN_A5_SOLVE_FP32_DIRECT_HANDOFF
+#define MEGA_CHUNK_GDN_A5_THREE_GEMM_FINAL_RECURSION
+#define MEGA_CHUNK_GDN_A5_WY_DIRECT_INPUT_K_L1
+#define MEGA_CHUNK_GDN_A5_WY_DIRECT_INPUT_V_L1
+#define MEGA_CHUNK_GDN_A5_WY_FUSED_A1_A2_PREP
+#define MEGA_CHUNK_GDN_A5_WY_GROUP_K_REUSE
+#define MEGA_CHUNK_GDN_A5_WY_SINGLE_A_READ
+#define MEGA_CHUNK_GDN_A5_WY_SLIDING_PIPELINE
+#define MEGA_CHUNK_GDN_A5_WY_STAGGERED_MAILBOX
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #define MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
+#define MEGA_GDN_PREFILL_A5_CONV_REGBASE_C1
+#define MEGA_GDN_PREFILL_A5_PACKED_NORM_REGBASE_C2
+#if defined(MEGA_GDN_PREFILL_DUMP_SOLVE_BUILD)
+#define MEGA_CHUNK_GDN_A5_DUMP_SOLVE_OUTPUT
 #endif
 // The included helpers keep the public BF16 boundary and cast into FP16 on
 // A2/A3.
-#include "../../mega_chunk_gdn/op_kernel/mega_chunk_gdn.cpp"
+#include "../../../mega_chunk_gdn/op_kernel/mega_chunk_gdn.cpp"
 #if defined(GDN_PREFILL_ARCH_A2A3)
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
@@ -188,6 +85,37 @@ struct MegaGdnPrefillOpKernelTilingData {
 #undef MEGA_CHUNK_GDN_HELPER_NAMESPACE
 #undef MEGA_CHUNK_GDN_HELPERS_ONLY
 #if defined(GDN_PREFILL_ARCH_A5)
+#undef MEGA_CHUNK_GDN_A5_O_COMBINE_BOUNDARY_REGBASE
+#undef MEGA_CHUNK_GDN_A5_O_BOUNDARY_REGBASE
+#undef MEGA_CHUNK_GDN_A5_GENERIC_V_PREFETCH
+#undef MEGA_CHUNK_GDN_A5_GENERIC_L0C2UB_PINGPONG
+#undef MEGA_CHUNK_GDN_A5_GENERIC_QK_L0C2UB
+#undef MEGA_CHUNK_GDN_A5_THREE_GEMM_FINAL_RECURSION
+#undef MEGA_CHUNK_GDN_A5_BLOCK_LOCAL_EARLY_RECURSION
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_DIRECT_HANDOFF
+#undef MEGA_CHUNK_GDN_A5_GROUP_QKV_DIRECT_HANDOFF
+#undef MEGA_CHUNK_GDN_A5_WY_DIRECT_INPUT_V_L1
+#undef MEGA_CHUNK_GDN_A5_WY_DIRECT_INPUT_K_L1
+#undef MEGA_CHUNK_GDN_A5_PUBLISH_INPUTS_BEFORE_WY
+#undef MEGA_CHUNK_GDN_A5_WY_FUSED_A1_A2_PREP
+#undef MEGA_CHUNK_GDN_A5_WY_STAGGERED_MAILBOX
+#undef MEGA_CHUNK_GDN_A5_O_RMS_DIRECT_ONE
+#undef MEGA_CHUNK_GDN_A5_H_STATE_REGBASE4
+#undef MEGA_CHUNK_GDN_A5_PRECOMPUTED_M_NEG
+#undef MEGA_CHUNK_GDN_A5_SOLVE_WY_PACKED_HANDOFF
+#undef MEGA_CHUNK_GDN_A5_GROUP_QS_CROSS_PREFETCH
+#undef MEGA_CHUNK_GDN_A5_GROUP_QS_PREFETCH
+#undef MEGA_CHUNK_GDN_A5_QS_SCALE_REGBASE
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_MIN_H48
+#undef MEGA_CHUNK_GDN_A5_GROUP_QK_PERSISTENT_RAW
+#undef MEGA_CHUNK_GDN_A5_GATE_COEFF_REGBASE
+#undef MEGA_CHUNK_GDN_A5_O_RMS_FINAL_REGBASE
+#undef MEGA_CHUNK_GDN_A5_O_FINAL_REGBASE
+#undef MEGA_CHUNK_GDN_A5_H_STATE_REGBASE
+#undef MEGA_CHUNK_GDN_A5_O_ORDERED_TWO_BANK
+#undef MEGA_CHUNK_GDN_A5_SOLVE_FP32_DIRECT_HANDOFF
+#undef MEGA_CHUNK_GDN_A5_WY_SLIDING_PIPELINE
+#undef MEGA_CHUNK_GDN_A5_CUMSUM_GROUP_KK_OVERLAP
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_KK
 #undef MEGA_CHUNK_GDN_A5_SPLIT64_SOLVE
 #undef MEGA_CHUNK_GDN_A5_HO_OVERLAP
@@ -196,6 +124,8 @@ struct MegaGdnPrefillOpKernelTilingData {
 #undef MEGA_CHUNK_GDN_A5_GROUP_QK_DIRECTED_SYNC
 #undef MEGA_CHUNK_GDN_MULTI_BATCH_GROUP_QK
 #undef MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE
+#undef MEGA_CHUNK_GDN_A5_WY_GROUP_K_REUSE
+#undef MEGA_CHUNK_GDN_A5_WY_SINGLE_A_READ
 #undef MEGA_CHUNK_GDN_A5_PACKED_WUV
 #undef MEGA_CHUNK_GDN_A5_ENTIRE_CACHE_DCCI
 #undef MEGA_CHUNK_GDN_A5_DUAL_AIV_WY
@@ -226,6 +156,8 @@ struct MegaGdnPrefillOpKernelTilingData {
 #define GDN_PREFILL_PACKED_QKV_DTYPE GDN_PREFILL_COMPUTE_DTYPE
 #include "gdn_prefill_frontend.h"
 #undef GDN_PREFILL_PACKED_QKV_DTYPE
+#undef MEGA_GDN_PREFILL_A5_PACKED_NORM_REGBASE_C2
+#undef MEGA_GDN_PREFILL_A5_CONV_REGBASE_C1
 
 namespace {
 constexpr uint64_t kAlignBytes = 512;
@@ -359,7 +291,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
 #endif
 
 #ifdef E2E_STOP_AFTER_CONV
-    pipe_barrier(PIPE_ALL);
+    qwen35_e2e_pto::SyncAllImpl<false>();
     return;
 #endif
 
@@ -400,9 +332,7 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
     // is still live can deadlock at 16 chunks. A5 uses the existing full
     // stage rendezvous instead of the pipelined slot protocol.
 #endif
-    // The A2/A3 H/O pipeline can publish a chunk before all of its payload
-    // stores are visible to the O consumer. Use the stage-synchronized path.
-    qwen35_e2e_pto::mega_kernel_impl<true, true, false, true, true, true>(
+    qwen35_e2e_pto::mega_kernel_impl<true, true, true, true, true, true>(
         q_ptr, k_ptr, v_ptr, g_ptr, beta_compute_ptr, mask_lower_ptr,
         mask_full_ptr, minus_identity_compute_ptr, cu_seqlens_ptr,
         norm_output_ptr, g_sum_ptr,
@@ -429,5 +359,3 @@ extern "C" __global__ __aicore__ void GDN_KERNEL_NAME(
 }
 
 #undef GDN_PREFILL_COMPUTE_DTYPE
-
-#endif

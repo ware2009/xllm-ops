@@ -98,7 +98,8 @@ Conv/SSM state。
 - `true`：从 `readStateIndices[b]` 加载两类 state；
 - 非空序列结束后，将最终 state 写入 `writeStateIndices[b]`；
 - read/write slot 可以相同；prefix fork 可以读 shared slot、写 private slot；
-- 同一调用中的 write slot 必须唯一。
+- 同一调用中有效请求的 write slot 必须唯一。
+  ACL Graph padding 可以共用专门预留的合法 slot，例如 slot 0。这个 slot 必须始终只给 padding 使用，正常请求不能读写它或把它当作缓存；Conv state、SSM state 都要遵守这一点。padding 的输出和状态必须全部丢弃，其他输入仍须满足算子要求。例如两个正常请求加两个 padding，可以使用 `write slots = [1, 2, 0, 0]`。多个 padding 会互相覆盖 slot 0，不能使用其中的结果；若无法保证 slot 0 始终专用，就给每个 padding 分配不同的 slot。
 
 Conv state 始终保存最近三个原始 `qkv` 输入，而不是 `convOut`。SSM state 在一条
 序列的所有 packed token 间保留于 UB，只在序列结束时写回，不生成中间
@@ -144,7 +145,7 @@ workspace，不是额外输入 tensor，也不要求修改 Python test helper �
 - read/write index 必须位于 `[0,N)`；validity 为 false 时 read 值仍应提供合法
   占位，避免未来 host/device 校验差异；
 - 输入和输出 state buffer 分离时，调用侧负责保留未写 slot；
-- 长度为 0 的 padding 序列当前不写 state；所有非空序列的 write slot 必须唯一；
+- 长度为 0 的 padding 序列当前不写 state；有效请求的 write slot 必须唯一，非空 padding 须满足上述隔离约束；
 - 不允许 Draft 和 Verify 两个算子并发写同一 state slot。
 
 ## 调用与构建

@@ -1,7 +1,3 @@
-// A5 implementation is isolated; the non-A5 branch is upstream main fee3816.
-#if defined(GDN_PREFILL_TARGET_A5) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510) || (defined(__CCE_AICORE__) && __CCE_AICORE__ == 310)
-#include "arch35/mega_chunk_gdn.cpp"
-#else
 // mega_kernel.cpp — GDN Mega-Kernel (group-value / GQA): all PTO stages in one launch
 //
 // Same pipeline as pto_mega_kernel, but H/Hg are runtime values.
@@ -49,7 +45,7 @@
 #include "acl/acl.h"
 #include "kernel_operator.h"
 #include <pto/pto-inst.hpp>
-#include "gdn_sync.h"
+#include "../gdn_sync.h"
 #include <type_traits>
 
 #ifdef MEGA_CHUNK_GDN_HELPER_NAMESPACE
@@ -640,7 +636,7 @@ AICORE inline void mega_cast_fp32_to_dtype_bsnd(__gm__ float *src, __gm__ Comput
 
 namespace mk_cumsum {
 using pto::Stride;
-#include "chunk_cumsum.cpp"
+#include "../chunk_cumsum.cpp"
 }
 
 namespace mk_kkt {
@@ -684,7 +680,8 @@ AICORE inline void mega_solve_tril(__gm__ ComputeT *out, __gm__ ComputeT *in, __
                                    uint32_t num_matrices, uint32_t num_bsnd_heads, __gm__ int32_t *cu_seqlens,
                                    uint32_t is_lower,
                                    __gm__ ComputeT *packed_workspace,
-                                   bool use_precomputed_m_neg = false)
+                                   bool use_precomputed_m_neg = false,
+                                   bool packed_head_major_output = false)
 {
 #ifdef MEGA_CHUNK_GDN_PRECOMPUTED_SOLVE_AUX
     constexpr bool PrecomputedAuxiliary = true;
@@ -697,7 +694,8 @@ AICORE inline void mega_solve_tril(__gm__ ComputeT *out, __gm__ ComputeT *in, __
     mk_solve::runKernelTriInvRecUnroll<ComputeT, float, GDN_C, 1, true,
                                        ComputeT>(
         out, in, minus_id, num_matrices, num_bsnd_heads, cu_seqlens,
-        is_lower, packed_workspace, use_precomputed_m_neg);
+        is_lower, packed_workspace, use_precomputed_m_neg,
+        packed_head_major_output);
 #else
     if constexpr (WaitForKktReady) {
         mk_solve::runKernelTriInvRecUnroll<ComputeT, float, GDN_C,
@@ -771,17 +769,27 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
 #define GDN_STAGE_SYNC() SyncAllImpl<false>()
 
+
     mk_cumsum::cumsum_kernel<C>(reinterpret_cast<__gm__ float *>(g_in_ptr),
                                 reinterpret_cast<__gm__ float *>(g_sum_ptr),
                                 reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len, H,
                                 ffts_addr);
 #ifdef MEGA_STOP_AFTER_CUMSUM
-    pipe_barrier(PIPE_ALL);
+    // Profile-only terminal: all MIX participants must retire the same
+    // rendezvous before the kernel exits.
+    GDN_STAGE_SYNC();
     return;
 #endif
-
+#ifdef MEGA_CHUNK_GDN_A5_PUBLISH_INPUTS_BEFORE_WY
+#if defined(GDN_A5_VECTOR_KERNEL)
+    // Frontend K/V are produced by the AIV side of this fused kernel. Publish
+    // every AIV's private cache before the following full MIX rendezvous lets
+    // Cube bypass selected AIV packing mailboxes and read inputs from GM.
+    dcci((__gm__ void *)0, ENTIRE_DATA_CACHE);
+    dsb(DSB_ALL);
+#endif
+#endif
     GDN_STAGE_SYNC();
-
 
     const bool reuse_group_kk =
         mk_kkt::CanReuseGroupKk<C>(
@@ -831,7 +839,13 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
     GDN_STAGE_SYNC();
 
-#ifdef MEGA_CHUNK_GDN_PRECOMPUTED_M_NEG
+#ifdef MEGA_STOP_AFTER_TRANSPOSE
+    return;
+#endif
+
+#ifdef MEGA_CHUNK_GDN_A5_PRECOMPUTED_M_NEG
+    constexpr bool use_precomputed_m_neg = true;
+#elif defined(MEGA_CHUNK_GDN_PRECOMPUTED_M_NEG)
     const bool use_precomputed_m_neg = !reuse_group_kk;
 #else
     constexpr bool use_precomputed_m_neg = false;
@@ -860,6 +874,13 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     if (!use_kkt_solve_pipeline) {
         GDN_STAGE_SYNC();
     }
+
+#ifdef MEGA_STOP_AFTER_KKT
+    if (use_kkt_solve_pipeline) {
+        GDN_STAGE_SYNC();
+    }
+    return;
+#endif
 
 #if defined(GDN_A5_KERNEL) && \
     defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE)
@@ -895,6 +916,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
     __gm__ ComputeT *wy_a_input_ptr =
         reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr);
+    constexpr bool use_packed_solve_wy_handoff = false;
 #ifdef MEGA_CHUNK_GDN_BLOCKED_SOLVE
     const bool use_blocked_solve =
         batch_size >= 1 && cu_seqlens_ptr != nullptr && H > 0 &&
@@ -918,9 +940,9 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                         reinterpret_cast<__gm__ ComputeT *>(A_ptr),
                         reinterpret_cast<__gm__ ComputeT *>(minus_id_ptr), C,
                         num_matrices, H,
-                        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-                        1, reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
-                        use_precomputed_m_neg);
+                    reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+                    1, reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
+                    use_precomputed_m_neg, use_packed_solve_wy_handoff);
                 } else {
                     mega_solve_tril<true, 3>(
                         reinterpret_cast<__gm__ ComputeT *>(A_inv_ptr),
@@ -929,7 +951,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                         num_matrices, H,
                         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
                         1, reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
-                        use_precomputed_m_neg);
+                        use_precomputed_m_neg, use_packed_solve_wy_handoff);
                 }
             } else {
                 mega_solve_tril<false>(
@@ -939,7 +961,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                     num_matrices, H,
                     reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), 1,
                     reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
-                    use_precomputed_m_neg);
+                    use_precomputed_m_neg, use_packed_solve_wy_handoff);
             }
         } else {
             mega_solve_tril<false>(
@@ -949,7 +971,7 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                 num_matrices, H,
                 reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), 1,
                 reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
-                use_precomputed_m_neg);
+                use_precomputed_m_neg, use_packed_solve_wy_handoff);
         }
 #ifdef MEGA_CHUNK_GDN_BLOCKED_SOLVE
     }
@@ -957,6 +979,10 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 
 
     GDN_STAGE_SYNC();
+
+#ifdef MEGA_STOP_AFTER_SOLVE
+    return;
+#endif
 
 #ifdef MEGA_CHUNK_GDN_A5_DUMP_SOLVE_OUTPUT
 #if defined(__DAV_C310_VEC__)
@@ -981,9 +1007,14 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ ComputeT *>(k_ptr), reinterpret_cast<__gm__ ComputeT *>(v_ptr),
         reinterpret_cast<__gm__ ComputeT *>(beta_t_ptr), reinterpret_cast<__gm__ float *>(g_t_ptr),
         wy_a_input_ptr, reinterpret_cast<__gm__ ComputeT *>(wy_ws_a1_ptr),
-        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr), reinterpret_cast<__gm__ ComputeT *>(w_ptr),
+        reinterpret_cast<__gm__ ComputeT *>(wy_ws_a2_ptr),
+#ifdef MEGA_CHUNK_GDN_A5_WY_SINGLE_A_READ
+        reinterpret_cast<__gm__ ComputeT *>(kkt_ws_ptr),
+#endif
+        reinterpret_cast<__gm__ ComputeT *>(w_ptr),
         reinterpret_cast<__gm__ ComputeT *>(u_ptr), reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), batch_size, seq_len,
-        total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr);
+        total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr,
+        use_packed_solve_wy_handoff);
 
 #if defined(__DAV_C220_VEC__) && !defined(GDN_A5_KERNEL)
     if (get_block_idx() < num_matrices) {
@@ -994,7 +1025,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
 #endif
 
 #ifdef MEGA_STOP_AFTER_WY
-    pipe_barrier(PIPE_ALL);
+    // Match every other profile endpoint: close the MIX stage before exit.
+    GDN_STAGE_SYNC();
     return;
 #endif
 
@@ -1005,54 +1037,9 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     const uint32_t expected_h_o_matrices =
         h_o_chunk_count * static_cast<uint32_t>(H);
 #if defined(GDN_A5_KERNEL)
-#if defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-    bool h_o_sequences_valid = cu_seqlens_ptr != nullptr;
-    uint64_t scanned_h_o_chunks = 0;
-    if (h_o_sequences_valid) {
-        auto *h_o_cu_seqlens =
-            reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr);
-        for (int64_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-            const int64_t seq_start =
-                static_cast<int64_t>(h_o_cu_seqlens[seq_idx]);
-            const int64_t seq_end =
-                static_cast<int64_t>(h_o_cu_seqlens[seq_idx + 1]);
-            const int64_t seq_tokens = seq_end - seq_start;
-            if (seq_start < 0 || seq_end > total_tokens ||
-                seq_tokens <= 0) {
-                h_o_sequences_valid = false;
-                break;
-            }
-            const uint64_t seq_chunks =
-                static_cast<uint64_t>((seq_tokens + C - 1) / C);
-            if (seq_chunks > 64u) {
-                h_o_sequences_valid = false;
-                break;
-            }
-            scanned_h_o_chunks += seq_chunks;
-        }
-    }
-    constexpr uint64_t H_O_READY_STRIDE_BYTES =
-        16u * static_cast<uint64_t>(sizeof(int32_t));
-    const uint64_t h_o_ready_bytes =
-        batch_size > 0 && H > 0
-            ? static_cast<uint64_t>(batch_size) *
-                  static_cast<uint64_t>(H) * H_O_READY_STRIDE_BYTES
-            : 0u;
-    // Variant16's regular O path starts its ping QK mailbox in the second
-    // KKT tile. The first tile is dead after WY and can hold the ready lines.
-    const uint64_t h_o_ready_capacity_bytes =
-        static_cast<uint64_t>(get_block_num()) * C * C * sizeof(ComputeT);
-    const bool use_h_o_pipeline =
-        EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
-        h_o_sequences_valid && h_o_chunk_count >= 4 &&
-        scanned_h_o_chunks == static_cast<uint64_t>(h_o_chunk_count) &&
-        num_matrices == expected_h_o_matrices &&
-        h_o_ready_bytes <= h_o_ready_capacity_bytes;
-#else
     // Keep the validated A5 full MIX barrier unless an A5-only candidate
     // explicitly enables the per-chunk H/O readiness protocol.
     constexpr bool use_h_o_pipeline = false;
-#endif
 #else
     const bool use_h_o_pipeline =
         EnableHoPipeline && H >= 8 && D == C && batch_size >= 1 &&
@@ -1064,7 +1051,8 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
     defined(MEGA_CHUNK_GDN_A5_GROUP_QK_REUSE)
     const bool precompute_qs = use_h_o_pipeline || reuse_group_qk;
 #endif
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_C220_VEC__) && \
+    !defined(MEGA_CHUNK_GDN_A5_O_ORDERED_TWO_BANK)
     if (use_h_o_pipeline && get_subblockid() == 0) {
         constexpr int64_t H_O_READY_STRIDE = 16;
         AscendC::GlobalTensor<int32_t> h_o_ready_gm;
@@ -1084,12 +1072,6 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
                 h_o_ready_gm[ready_offset]);
             __asm__ __volatile__("");
         }
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-        // The zero generation belongs to this launch. Flush it before the
-        // following full MIX rendezvous releases H on graph replay.
-        dsb(DSB_DDR);
-#endif
     }
 #endif
     GDN_STAGE_SYNC();
@@ -1121,29 +1103,16 @@ AICORE inline void mega_kernel_impl(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr,
         reinterpret_cast<__gm__ int32_t *>(state_indices_ptr),
         state_index_stride, state_cache_slots);
 
-    if (use_h_o_pipeline && EnableHoOverlap) {
-#if defined(GDN_A5_KERNEL) && \
-    defined(MEGA_CHUNK_GDN_A5_HO_OVERLAP)
-        // H and O reuse event IDs 0..7. A local 1-AIC/2-AIV rendezvous closes
-        // every H event before this physical MIX block enters O, without
-        // waiting for other physical blocks that are still executing H.
-        constexpr uint16_t H_O_LOCAL_BARRIER_EVENT = 8;
-        static_assert(H_O_LOCAL_BARRIER_EVENT <= 10,
-                      "A5 H/O local barrier must fit event IDs 0..10");
-        constexpr uint16_t H_O_LOCAL_BARRIER_CONFIG =
-            static_cast<uint16_t>(
-                1u | (2u << SYNC_MODE_SHIFT_VALUE) |
-                (H_O_LOCAL_BARRIER_EVENT << SYNC_FLAG_SHIFT_VALUE));
-#if defined(GDN_A5_CUBE_KERNEL)
-        gdn_sync::Wait<PIPE_MTE2>(H_O_LOCAL_BARRIER_EVENT);
-        gdn_sync::Signal<PIPE_FIX>(H_O_LOCAL_BARRIER_CONFIG);
-#elif defined(GDN_A5_VECTOR_KERNEL)
-        gdn_sync::Signal<PIPE_MTE3>(H_O_LOCAL_BARRIER_CONFIG);
-        gdn_sync::Wait<PIPE_MTE2>(H_O_LOCAL_BARRIER_EVENT);
+#ifdef MEGA_STOP_AFTER_H
+    GDN_STAGE_SYNC();
+    return;
 #endif
-#else
+
+    const bool use_h_o_overlap =
+        use_h_o_pipeline && EnableHoOverlap
+        ;
+    if (use_h_o_overlap) {
         pipe_barrier(PIPE_ALL);
-#endif
     } else {
 #if defined(__DAV_C220_VEC__)
         // O consumes H's GM state/workspace. Cross-core rendezvous alone does
@@ -1266,6 +1235,4 @@ GDN_KERNEL_NAME(GM_ADDR q_ptr, GM_ADDR k_ptr, GM_ADDR v_ptr, GM_ADDR g_in_ptr, G
 #ifdef GDN_COMPUTE_DTYPE_DEFAULTED
 #undef GDN_COMPUTE_DTYPE_DEFAULTED
 #undef GDN_COMPUTE_DTYPE
-#endif
-
 #endif

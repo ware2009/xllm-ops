@@ -174,7 +174,8 @@ The convolution state stores the original `qkv`, not `convOut`.
 - with separate output buffers, slots not written by the invocation are
   undefined; callers that need a complete state cache must preserve or
   pre-copy those slots;
-- write slots must be unique within a batch;
+- write slots must be unique among valid requests.
+  ACL Graph padding may share a valid reserved slot, such as slot 0. This slot must always be used only for padding: normal requests must never read it, write it, or use it as cached state. This applies to Conv state, SSM state, and all MTP checkpoints. All padding outputs and state must be discarded; other inputs must still satisfy the operator requirements. For example, two normal requests followed by two padding requests may use `write slots = [1, 2, 0, 0]`. Padding requests overwrite each other's state in slot 0, so its contents must not be used. If the slot cannot remain reserved, assign a separate slot to each padding request.
 - read slots may be shared by multiple requests reading the same prefix;
 - when `read_state_id == write_state_id`, the kernel must load the initial
   SSM state into UB before checkpoint 0 is written;
@@ -278,8 +279,8 @@ workspace. Checkpoints are written directly to the target GM state.
 - after any state write, execution must not fall back to the unfused chain;
 - prefix-cache callers must hold a shared read lease and an exclusive write
   lease before dispatch;
-- graph padding must use valid, exclusive sink write slots rather than
-  negative or out-of-range indices.
+- graph padding may share valid sink write slots under the isolation constraints
+  above; negative or out-of-range indices remain invalid.
 
 ## Invocation and build layout
 

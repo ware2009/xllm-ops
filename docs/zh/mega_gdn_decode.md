@@ -138,7 +138,8 @@ recurrent 数学统一使用逻辑布局 `H[K,V]`。`flaSsmStateLayout=true` 时
 - kernel 只从输入 buffer 的 read slot 读取，只向输出 buffer 的 write slot 写入；
 - 使用独立输出 buffer 时，未被本次调用写入的其他 slot 内容不定义；如果调用方
   需要完整 state cache，必须自行保留或预拷贝这些 slot；
-- 同一 batch 中的 write slot 必须唯一；
+- 同一 batch 中有效请求的 write slot 必须唯一。
+  ACL Graph padding 可以共用专门预留的合法 slot，例如 slot 0。这个 slot 必须始终只给 padding 使用，正常请求不能读写它或把它当作缓存；Conv state、SSM state 都要遵守这一点。padding 的输出和状态必须全部丢弃，其他输入仍须满足算子要求。例如两个正常请求加两个 padding，可以使用 `write slots = [1, 2, 0, 0]`。多个 padding 会互相覆盖 slot 0，不能使用其中的结果；若无法保证 slot 0 始终专用，就给每个 padding 分配不同的 slot。
 - read slot 可以重复，以支持多个请求读取同一个 shared prefix；
 - same-slot 场景必须先完成 read state 的 GM→UB，再写回；
 - prefix-fork 场景中 read slot 保持只读，所有更新只写入 private write slot。

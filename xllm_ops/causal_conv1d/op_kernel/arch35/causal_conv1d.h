@@ -1,7 +1,3 @@
-// Preserve upstream main for non-A5 targets.
-#if defined(GDN_PREFILL_TARGET_A5) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3510) || (defined(__CCE_AICORE__) && __CCE_AICORE__ == 310)
-#include "arch35/causal_conv1d.h"
-#else
 /**
  * This program is free software, you can redistribute it and/or modify it.
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
@@ -24,9 +20,18 @@
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "adv_api/pad/broadcast.h"
-#include "causal_conv1d_tiling_data.h"
-#include "causal_conv1d_tiling_key.h"
-#include "causal_conv1d_common.h"
+#include "../causal_conv1d_tiling_data.h"
+#include "../causal_conv1d_tiling_key.h"
+#include "../causal_conv1d_common.h"
+#if defined(MEGA_GDN_PREFILL_A5_CONV_REGBASE_C1) && defined(__CCE_AICORE__) && \
+    __CCE_AICORE__ == 310
+#include "../arch35/causal_conv1d_regbase_c1.h"
+#endif
+#if defined(GDN_PREFILL_ARCH_A5) && \
+    defined(MEGA_GDN_PREFILL_A5_PACKED_NORM_REGBASE_C2) && \
+    defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "../arch35/causal_conv1d_packed_norm_regbase_c2.h"
+#endif
 
 namespace NsCausalConv1d {
 
@@ -604,6 +609,16 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::AdvanceFnLocalPartials(int32_t slotC
     LocalTensor<T> ring = inBuf.Get<T>();
     constexpr int32_t w0Idx = MAX_WIDTH - kTemplateWidth;
 
+#if defined(MEGA_GDN_PREFILL_A5_CONV_REGBASE_C1) && defined(__CCE_AICORE__) && \
+    __CCE_AICORE__ == 310
+    if constexpr (kTemplateWidth == 4) {
+        AdvanceFnLocalPartialsRegbaseC1<T>(
+            ring[slotCurr * MAX_BLOCK_DIM], weightF[w0Idx * MAX_BLOCK_DIM],
+            state0F, state1F, state2F, baseDim, MAX_BLOCK_DIM);
+        return;
+    }
+#endif
+
     Cast(currF, ring[slotCurr * MAX_BLOCK_DIM], RoundMode::CAST_NONE, baseDim);
     PipeBarrier<PIPE_V>();
 
@@ -642,6 +657,31 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::PreparePackedQkvOutput(const LocalTe
         return;
     }
 
+#if defined(GDN_PREFILL_ARCH_A5) && \
+    defined(MEGA_GDN_PREFILL_A5_PACKED_NORM_REGBASE_C2) && \
+    defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    const int32_t headDim = static_cast<int32_t>(tilingData_->packedHeadDim);
+    const int32_t qkDim = static_cast<int32_t>(tilingData_->packedQDim + tilingData_->packedKDim);
+    const int32_t totalDim = qkDim + static_cast<int32_t>(tilingData_->packedVDim);
+    const int32_t channelEnd = channelStart + baseDim;
+    const int32_t qkStart = (channelStart > 0) ? channelStart : 0;
+    const int32_t qkEnd = (channelEnd < qkDim) ? channelEnd : qkDim;
+    if constexpr (IsSameType<PackedQkvT, half>::value) {
+        const bool hasQkIntersection = qkStart < qkEnd;
+        const bool hasFullQkHeads =
+            !hasQkIntersection ||
+            ((qkStart % static_cast<int32_t>(C2_PACKED_HEAD_DIM)) == 0 &&
+             (qkEnd % static_cast<int32_t>(C2_PACKED_HEAD_DIM)) == 0);
+        if (headDim == static_cast<int32_t>(C2_PACKED_HEAD_DIM) &&
+            channelStart >= 0 && baseDim > 0 && baseDim <= MAX_BLOCK_DIM &&
+            channelEnd <= totalDim && hasFullQkHeads) {
+            PreparePackedQkvOutputRegbaseC2(
+                outSlotT, channelStart, baseDim, qkDim, totalDim);
+            return;
+        }
+    }
+#endif
+
     auto cl = CalcBufLayout::FromCalcBuf(calcBuf);
     LocalTensor<float> &headF = cl.currF;
     LocalTensor<float> normScratch = packedQkvNormBuf.Get<float>();
@@ -649,11 +689,15 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::PreparePackedQkvOutput(const LocalTe
     LocalTensor<float> sumF = normScratch[PACKED_QKV_REDUCE_TMP_ELEMS];
     LocalTensor<float> normF = normScratch[PACKED_QKV_REDUCE_TMP_ELEMS + PACKED_QKV_REDUCE_SUM_ELEMS];
 
+#if !defined(GDN_PREFILL_ARCH_A5) || \
+    !defined(MEGA_GDN_PREFILL_A5_PACKED_NORM_REGBASE_C2) || \
+    !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
     const int32_t headDim = static_cast<int32_t>(tilingData_->packedHeadDim);
     const int32_t qkDim = static_cast<int32_t>(tilingData_->packedQDim + tilingData_->packedKDim);
     const int32_t channelEnd = channelStart + baseDim;
     const int32_t qkStart = (channelStart > 0) ? channelStart : 0;
     const int32_t qkEnd = (channelEnd < qkDim) ? channelEnd : qkDim;
+#endif
     const int32_t totalHeadCount = (headDim > 0) ? ((qkEnd - qkStart) / headDim) : 0;
     for (int32_t headOffset = 0; headOffset < totalHeadCount; headOffset += PACKED_QKV_NORM_HEADS_PER_PASS) {
         const int32_t remainingHeads = totalHeadCount - headOffset;
@@ -767,15 +811,73 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
         }
 
+#if defined(MEGA_GDN_PREFILL_A5_CONV_FUSED_ROLL) && \
+    defined(MEGA_GDN_PREFILL_A5_CONV_REGBASE_C1) && \
+    defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+        const bool packedQkvOutput = IsPackedQkvOutput();
+        const int32_t outSlot = packedQkvOutput ? 0 : (t & 1);
+        LocalTensor<T> outSlotT = outT[outSlot * MAX_BLOCK_DIM];
+        if constexpr (kTemplateWidth == 4 &&
+                      IsSameType<T, bfloat16_t>::value) {
+            if (packedQkvOutput) {
+#if defined(MEGA_GDN_PREFILL_A5_CONV_FUSED_FP32_STAGE)
+                RunPackedBf16Width4FusedRoll<float>(
+                    ring[slotCurr * MAX_BLOCK_DIM], cl.weightF,
+                    state0F, cl.accF, cl.biasF,
+                    currF, baseDim, MAX_BLOCK_DIM);
+                if (t >= 1) {
+                    WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+                }
+                Cast(outSlotT, currF, RoundMode::CAST_RINT, baseDim);
+#else
+                if (t >= 1) {
+                    WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+                }
+                RunPackedBf16Width4FusedRoll<bfloat16_t>(
+                    ring[slotCurr * MAX_BLOCK_DIM], cl.weightF,
+                    state0F, cl.accF, cl.biasF,
+                    outSlotT, baseDim, MAX_BLOCK_DIM);
+#endif
+            } else {
+                ComputeFnRollingOutput(slotCurr, baseDim);
+                if (t >= 2) {
+                    WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+                }
+                if (hasActivation) {
+                    Cast(outSlotT, currF, RoundMode::CAST_RINT, baseDim);
+                } else {
+                    Cast(outSlotT, state0F, RoundMode::CAST_RINT, baseDim);
+                }
+                AdvanceFnLocalPartials(slotCurr, baseDim);
+            }
+        } else {
+            ComputeFnRollingOutput(slotCurr, baseDim);
+            if ((packedQkvOutput && t >= 1) || (!packedQkvOutput && t >= 2)) {
+                WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+            }
+            if constexpr (IsSameType<T, float>::value) {
+                if (hasActivation) {
+                    DataCopy(outSlotT, currF, baseDim);
+                } else {
+                    DataCopy(outSlotT, state0F, baseDim);
+                }
+            } else {
+                if (hasActivation) {
+                    Cast(outSlotT, currF, RoundMode::CAST_RINT, baseDim);
+                } else {
+                    Cast(outSlotT, state0F, RoundMode::CAST_RINT, baseDim);
+                }
+            }
+            AdvanceFnLocalPartials(slotCurr, baseDim);
+        }
+#else
         ComputeFnRollingOutput(slotCurr, baseDim);
-
         const bool packedQkvOutput = IsPackedQkvOutput();
         const int32_t outSlot = packedQkvOutput ? 0 : (t & 1);
         LocalTensor<T> outSlotT = outT[outSlot * MAX_BLOCK_DIM];
         if ((packedQkvOutput && t >= 1) || (!packedQkvOutput && t >= 2)) {
             WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
         }
-
         if constexpr (IsSameType<T, float>::value) {
             if (hasActivation) {
                 DataCopy(outSlotT, currF, baseDim);
@@ -789,8 +891,8 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
                 Cast(outSlotT, state0F, RoundMode::CAST_RINT, baseDim);
             }
         }
-
         AdvanceFnLocalPartials(slotCurr, baseDim);
+#endif
 
         if (packedQkvOutput) {
             PreparePackedQkvOutput(outSlotT, channelStart, baseDim);
@@ -806,7 +908,8 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
             const int64_t outOffset = static_cast<int64_t>(start + t) * dim + channelStart;
             DataCopy(yGm[outOffset], outSlotT, baseDim);
         }
-        if ((packedQkvOutput && t + 1 < len) || (!packedQkvOutput && t + 2 < len)) {
+        if ((packedQkvOutput && t + 1 < len) ||
+            (!packedQkvOutput && t + 2 < len)) {
             SetFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
         }
 
@@ -1141,12 +1244,10 @@ __aicore__ inline bool CAUSAL_CONV1D_CLASS::IsUpdateSpecDecodingEnabled() const
     return kIsUpdateMode && (tilingData_->hasNumAcceptedTokens != 0) && (tilingData_->width == 4);
 }
 
-#include "causal_conv1d_fn_tasks.h"
+#include "../causal_conv1d_fn_tasks.h"
 
 #undef CAUSAL_CONV1D_CLASS
 #undef CAUSAL_CONV1D_TEMPLATE_ARGS
 
 } // namespace NsCausalConv1d
 #endif // CAUSAL_CONV1D_H
-
-#endif

@@ -145,7 +145,8 @@ transposing the `128 x 128` state.
 - with separate output buffers, slots not written by the invocation are
   undefined; callers that need a complete state cache must preserve or
   pre-copy those slots;
-- write slots must be unique within a batch;
+- write slots must be unique among valid requests.
+  ACL Graph padding may share a valid reserved slot, such as slot 0. This slot must always be used only for padding: normal requests must never read it, write it, or use it as cached state. This applies to Conv state, SSM state. All padding outputs and state must be discarded; other inputs must still satisfy the operator requirements. For example, two normal requests followed by two padding requests may use `write slots = [1, 2, 0, 0]`. Padding requests overwrite each other's state in slot 0, so its contents must not be used. If the slot cannot remain reserved, assign a separate slot to each padding request.
 - read slots may be shared by requests reading the same prefix;
 - same-slot execution must complete the read-state GM-to-UB load before
   writing the result;

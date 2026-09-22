@@ -351,6 +351,38 @@ def test_k1_to_k16_matches_reference(speculative_tokens: int) -> None:
 
 
 @pytest.mark.parametrize(
+    ("num_k_heads", "num_v_heads"),
+    (
+        pytest.param(16, 16, id="2b-tp1"),
+        pytest.param(16, 48, id="27b-tp1"),
+        pytest.param(8, 24, id="27b-tp2"),
+    ),
+)
+@pytest.mark.parametrize("same_slot", (False, True), ids=("fork", "same"))
+def test_batch4_mtp3_serving_geometries_match_reference(
+    num_k_heads: int,
+    num_v_heads: int,
+    same_slot: bool,
+) -> None:
+    """Cover the B4/MTP3 shapes used by the 2B and 27B serving paths."""
+    inputs = _make_inputs(
+        3,
+        batch_size=4,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        same_slot=same_slot,
+    )
+    inputs["num_accepted_tokens"] = torch.tensor(
+        (1, 2, 3, 4), dtype=torch.int32
+    )
+
+    expected = _expected_from_unfused_conv(inputs)
+    actual = _run_npu(inputs)
+
+    _assert_matches_reference(actual, expected)
+
+
+@pytest.mark.parametrize(
     "speculative_tokens", SUPPORTED_SPECULATIVE_TOKENS
 )
 def test_non_fla_k1_to_k16_matches_reference(

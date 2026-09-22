@@ -1,15 +1,6 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved. */
-
-#include <algorithm>
-#include <array>
-#include <cstdint>
-
-#include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
-
-#include "mega_gdn_mtp_decode_tiling.h"
-
-#include "mega_gdn_mtp_decode_tiling_a5.inc"
+// A5-only host implementation; included after the upstream headers.
+namespace gdn_a5_backend {
+using namespace ::optiling;
 
 namespace optiling {
 namespace {
@@ -22,10 +13,13 @@ constexpr int64_t kMaxNumCacheSlots = 1024;
 constexpr uint64_t kRequiredUbBytes = 175360;
 constexpr uint64_t kQkGroupCacheRequiredUbBytes = 187936;
 constexpr uint64_t kQkGroupCacheTilingKey = 208;
-constexpr uint64_t kA5TwoOwnerQkGroupTilingKey = 308;
+constexpr uint64_t kA5TwoOwnerQkGroupTilingKeyBase = 300;
+constexpr uint64_t kA5RegBaseDeferredTilingKey = 403;
+constexpr uint64_t kA5RegBaseTwoOwnerTilingKey = 503;
 constexpr int64_t kMinDeferredNormSpeculativeTokens = 10;
 constexpr uint64_t kDeferredNormRequiredUbBytes = 182816;
 constexpr uint64_t kDeferredNormTilingKeyBase = 200;
+constexpr int64_t kA5DeferredNormSpeculativeTokens = 3;
 constexpr uint32_t kQkGroupCacheRequiredAivCores = 32;
 constexpr uint32_t kAivPerA2A3MixedBlock = 2;
 constexpr uint32_t kAivPerA5MixedBlock = 2;
@@ -197,11 +191,6 @@ uint64_t GetTilingKey(int64_t speculative_tokens) {
 
 static ge::graphStatus MegaGdnMtpDecodeTiling(
     gert::TilingContext* context) {
-    if (platform_ascendc::PlatformAscendC(context->GetPlatformInfo()).GetSocVersion() ==
-        platform_ascendc::SocVersion::ASCEND950) {
-        return gdn_a5_backend::optiling::MegaGdnMtpDecodeTiling(context);
-    }
-
   ShapeInfo info;
   if (GetShapeInfo(context, info) != ge::GRAPH_SUCCESS) {
     return ge::GRAPH_FAILED;
@@ -233,6 +222,10 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   const bool is_qk_group_cache_shape =
       info.speculative_tokens == 8 && info.batch_size == 4 &&
       info.num_k_heads == 8 && info.num_v_heads == 24;
+  const bool is_a5_two_owner_qk_group_shape =
+      (info.speculative_tokens == 3 || info.speculative_tokens == 8) &&
+      info.batch_size == 4 && info.num_k_heads == 8 &&
+      info.num_v_heads == 24;
   const uint32_t qk_group_count =
       static_cast<uint32_t>(info.batch_size * info.num_k_heads);
   const uint32_t a5_mixed_aiv_core_count =
@@ -243,7 +236,8 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
       (recurrent_tasks + 1) / 2;
   const uint32_t max_useful_two_owner_aiv_cores = 2 * qk_group_count;
   const bool use_a5_two_owner_qk_group =
-      *fla_ssm_state_layout && is_ascend950 && is_qk_group_cache_shape &&
+      *fla_ssm_state_layout && is_ascend950 &&
+      is_a5_two_owner_qk_group_shape &&
       schedulable_aiv_core_count >= min_two_owner_aiv_cores &&
       ub_size >= kQkGroupCacheRequiredUbBytes;
   const uint32_t recurrent_dispatch_tasks =
@@ -272,11 +266,29 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
       ub_size >= kQkGroupCacheRequiredUbBytes;
   const bool use_deferred_norm =
       *fla_ssm_state_layout &&
-      info.speculative_tokens >= kMinDeferredNormSpeculativeTokens &&
+      (info.speculative_tokens >= kMinDeferredNormSpeculativeTokens ||
+       (is_ascend950 &&
+        info.speculative_tokens == kA5DeferredNormSpeculativeTokens)) &&
       ub_size >= kDeferredNormRequiredUbBytes;
+  // Keep the row-streaming recurrent experiment isolated from the proven
+  // MTP keys.  These are precisely the A5 B4/MTP3 model geometries exercised
+  // by Qwen3.5-2B TP1 and Qwen3.5-27B TP1/TP2.  A2/A3, non-FLA layout, other
+  // batches/token counts and all other head geometries retain their old key.
+  const bool use_a5_regbase_two_owner =
+      use_a5_two_owner_qk_group && info.speculative_tokens == 3;
+  const bool use_a5_regbase_deferred =
+      *fla_ssm_state_layout && is_ascend950 && use_deferred_norm &&
+      info.speculative_tokens == 3 && info.batch_size == 4 &&
+      info.num_k_heads == 16 &&
+      (info.num_v_heads == 16 || info.num_v_heads == 48);
   uint64_t tiling_key = GetTilingKey(info.speculative_tokens);
-  if (use_a5_two_owner_qk_group) {
-    tiling_key = kA5TwoOwnerQkGroupTilingKey;
+  if (use_a5_regbase_two_owner) {
+    tiling_key = kA5RegBaseTwoOwnerTilingKey;
+  } else if (use_a5_regbase_deferred) {
+    tiling_key = kA5RegBaseDeferredTilingKey;
+  } else if (use_a5_two_owner_qk_group) {
+    tiling_key = kA5TwoOwnerQkGroupTilingKeyBase +
+                 static_cast<uint64_t>(info.speculative_tokens);
   } else if (use_qk_group_cache) {
     tiling_key = kQkGroupCacheTilingKey;
   } else if (use_deferred_norm) {
@@ -308,6 +320,7 @@ static ge::graphStatus MegaGdnMtpDecodeTiling(
   return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(MegaGdnMtpDecode).Tiling(MegaGdnMtpDecodeTiling);
 
 }  // namespace optiling
+
+} // namespace gdn_a5_backend
