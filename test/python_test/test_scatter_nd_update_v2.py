@@ -169,26 +169,21 @@ def test_scatter_nd_update_v2(var_shape, index_dim, num_indices, dup_pairs,
 
 
 # ---------------------------------------------------------------------------
-# Performance: A5 moe target shapes (indices (8,1) int64)
+# Performance: all functional CASES above (10 original + 3 A5 moe shapes)
 # Two metrics per case:
 #   e2e_us    : host loop timing over PERF_ITERS submits + final sync
 #   device_us : NPU kernel time from torch_npu profiler (device side)
 # Result JSON path: env SCATTER_PERF_OUT (default ./scatter_perf_result.json)
 # ---------------------------------------------------------------------------
-PERF_CASES = [
-    ((20736, 512),   1, 8, torch.bfloat16, torch.int64),
-    ((1241088, 1),   1, 8, torch.float16,  torch.int64),
-    ((1241088, 128), 1, 8, torch.int8,     torch.int64),
-]
 PERF_WARMUP = 20
 PERF_ITERS = 1000
 
 
-def _make_npu_inputs(var_shape, index_dim, num_indices, var_dtype, idx_dtype):
+def _make_npu_inputs(var_shape, index_dim, num_indices, dup_pairs, var_dtype, idx_dtype):
     gen = torch.Generator()
     gen.manual_seed(2026)
     var, indices, updates, strides = _build_inputs(
-        var_shape, index_dim, num_indices, 0, var_dtype, idx_dtype, gen)
+        var_shape, index_dim, num_indices, dup_pairs, var_dtype, idx_dtype, gen)
     return (var.clone().npu(), indices.npu(), updates.npu(), strides)
 
 
@@ -239,8 +234,9 @@ def _perf_device_us(npu_inputs):
 def test_scatter_nd_update_v2_perf():
     tag = os.environ.get("SCATTER_PERF_TAG", "untagged")
     results = []
-    for var_shape, index_dim, num_indices, var_dtype, idx_dtype in PERF_CASES:
-        npu_inputs = _make_npu_inputs(var_shape, index_dim, num_indices, var_dtype, idx_dtype)
+    for var_shape, index_dim, num_indices, dup_pairs, var_dtype, idx_dtype in CASES:
+        npu_inputs = _make_npu_inputs(
+            var_shape, index_dim, num_indices, dup_pairs, var_dtype, idx_dtype)
         e2e_us = _perf_e2e_us(npu_inputs)
         try:
             device_us = _perf_device_us(npu_inputs)
