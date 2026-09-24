@@ -41,7 +41,7 @@ private:
     __aicore__ inline void InitAllBuffer();
     __aicore__ inline void InitLoopParams();
     // 各个层级的Process函数
-    __aicore__ inline void ProcessInLoop(LocalTensor<T>& cos, LocalTensor<T>& sin, int64_t bStart, int64_t bLength);
+    __aicore__ inline void ProcessInLoop(LocalTensor<T>& cos, LocalTensor<T>& sin, int64_t bStart, int64_t bLength, bool qPreLoaded = false);
     // 拷入拷出函数
     __aicore__ inline void CopyInCosAndSin(int64_t bStart, int64_t bLength);
     __aicore__ inline void CopyInQ(GlobalTensor<T>& source, int64_t bStart, int64_t bLength);
@@ -82,6 +82,7 @@ private:
     uint8_t dSplitCoef_ = 1;
     uint8_t copyInQSplitCoef_ = 1; // 拷贝q时使用的splitCoef
     uint64_t ubCopyInStride = 0;   // 输入在ub中的stride，deepseek_interleave中不为0
+    bool fullRow_ = false;  // full-row-copy: broadcast INTERLEAVE full-row copy (UB budget gated)
 };
 
 template <typename T, bool IsBoardCast>
@@ -130,8 +131,17 @@ __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::InitAllBuff
         }
     }
 
-    this->pipe_->InitBuffer(this->qInQueue_, DOUBLE_BUFFER, ubFactorB_ * dAlign_ * sizeof(T));
-    this->pipe_->InitBuffer(this->qOutQueue_, DOUBLE_BUFFER, ubFactorB_ * dAlign_ * sizeof(T));
+    // full-row (broadcast INTERLEAVE): q full-row copy, UB row width extended to D; over-budget shapes fall back
+    if constexpr (IsBoardCast) {
+        fullRow_ = FULLROW_ENABLE &&
+                   (tilingData_->rotaryMode == static_cast<int64_t>(RotaryPosEmbeddingMode::INTERLEAVE)) &&
+                   (dSplitCoef_ == 1) &&
+                   ((tilingData_->D * sizeof(T)) % 32 == 0) &&  // whole-row UB copy block alignment
+                   (4 * ubFactorB_ * (tilingData_->D + dAlign_) * sizeof(T) <= FULLROW_UB_BUDGET);
+    }
+    int64_t qRowWidth = fullRow_ ? tilingData_->D : dAlign_;
+    this->pipe_->InitBuffer(this->qInQueue_, DOUBLE_BUFFER, ubFactorB_ * qRowWidth * sizeof(T));
+    this->pipe_->InitBuffer(this->qOutQueue_, DOUBLE_BUFFER, ubFactorB_ * qRowWidth * sizeof(T));
     if constexpr (IsBoardCast) {
         this->pipe_->InitBuffer(this->cosInQueue_, COS_DB_BUFFER, dAlign_ * sizeof(T));
         this->pipe_->InitBuffer(this->sinInQueue_, COS_DB_BUFFER, dAlign_ * sizeof(T));
@@ -158,25 +168,30 @@ __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::Process()
     int64_t ubLoopCount = ops::CeilDiv(bBlockLength_, ubFactorB_);
     if constexpr (IsBoardCast) {
         this->CopyInCosAndSin(0, 1);
+        // parallel copy-in: q first-round copy-in issued concurrently with cos/sin MTE2, DeQue waits moved to Compute
+        if (ubLoopCount > 0) {
+            this->CopyInQ(qGm_, bBlockStart_, ubLoopCount > 1 ? ubFactorB_ : bBlockLength_);
+        }
         LocalTensor<T> cosUb = this->cosInQueue_.template DeQue<T>();
         LocalTensor<T> sinUb = this->sinInQueue_.template DeQue<T>();
         for (int64_t ubLoopIdx = 0; ubLoopIdx < ubLoopCount; ubLoopIdx++) {
             this->ProcessInLoop(
                 cosUb, sinUb, bBlockStart_ + ubLoopIdx * ubFactorB_,
-                ubLoopIdx != ubLoopCount - 1 ? ubFactorB_ : bBlockLength_ - ubLoopIdx * ubFactorB_);
+                ubLoopIdx != ubLoopCount - 1 ? ubFactorB_ : bBlockLength_ - ubLoopIdx * ubFactorB_,
+                ubLoopIdx == 0);
         }
         this->cosInQueue_.FreeTensor(cosUb);
         this->sinInQueue_.FreeTensor(sinUb);
     } else {
         for (int64_t ubLoopIdx = 0; ubLoopIdx < ubLoopCount; ubLoopIdx++) {
-            this->CopyInCosAndSin(
-                bBlockStart_ + ubLoopIdx * ubFactorB_,
-                ubLoopIdx != ubLoopCount - 1 ? ubFactorB_ : bBlockLength_ - ubLoopIdx * ubFactorB_);
+            int64_t bStart = bBlockStart_ + ubLoopIdx * ubFactorB_;
+            int64_t bLen = ubLoopIdx != ubLoopCount - 1 ? ubFactorB_ : bBlockLength_ - ubLoopIdx * ubFactorB_;
+            this->CopyInCosAndSin(bStart, bLen);
+            // parallel copy-in: q issued concurrently with cos/sin MTE2
+            this->CopyInQ(qGm_, bStart, bLen);
             LocalTensor<T> cosUb = this->cosInQueue_.template DeQue<T>();
             LocalTensor<T> sinUb = this->sinInQueue_.template DeQue<T>();
-            this->ProcessInLoop(
-                cosUb, sinUb, bBlockStart_ + ubLoopIdx * ubFactorB_,
-                ubLoopIdx != ubLoopCount - 1 ? ubFactorB_ : bBlockLength_ - ubLoopIdx * ubFactorB_);
+            this->ProcessInLoop(cosUb, sinUb, bStart, bLen, true);
             this->cosInQueue_.FreeTensor(cosUb);
             this->sinInQueue_.FreeTensor(sinUb);
         }
@@ -185,9 +200,11 @@ __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::Process()
 
 template <typename T, bool IsBoardCast>
 __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::ProcessInLoop(
-    LocalTensor<T>& cos, LocalTensor<T>& sin, int64_t bUbStart, int64_t bUbLength)
+    LocalTensor<T>& cos, LocalTensor<T>& sin, int64_t bUbStart, int64_t bUbLength, bool qPreLoaded)
 {
-    CopyInQ(qGm_, bUbStart, bUbLength);
+    if (!qPreLoaded) {
+        CopyInQ(qGm_, bUbStart, bUbLength);
+    }
     Compute(cos, sin, bUbLength);
     CopyOutQ(qOutGm_, bUbStart, bUbLength);
 }
@@ -218,17 +235,26 @@ __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::CopyInQ(
     GlobalTensor<T>& source, int64_t bStart, int64_t bLength)
 {
     LocalTensor<T> target = this->qInQueue_.template AllocTensor<T>();
-    DataCopyExtParams copyExtParams;
-    copyExtParams.blockCount = bLength * copyInQSplitCoef_;
-    copyExtParams.blockLen = tilingData_->sliceLength * sizeof(T) / copyInQSplitCoef_;
-    copyExtParams.srcStride = (tilingData_->D - tilingData_->sliceLength) * sizeof(T);
-    copyExtParams.dstStride = ubCopyInStride;
     DataCopyPadExtParams<T> copyPadExtparams;
     copyPadExtparams.isPad = false;
     copyPadExtparams.leftPadding = 0;
     copyPadExtparams.rightPadding = 0;
     copyPadExtparams.paddingValue = 0;
-    DataCopyPad(target, source[bStart * D_ + tilingData_->sliceStart], copyExtParams, copyPadExtparams);
+    DataCopyExtParams copyExtParams;
+    if (fullRow_) {
+        // full-row: continuous whole-row copy-in (removes small-block+gap), GM base at row start
+        copyExtParams.blockCount = bLength;
+        copyExtParams.blockLen = D_ * sizeof(T);
+        copyExtParams.srcStride = 0;
+        copyExtParams.dstStride = 0;
+        DataCopyPad(target, source[bStart * D_], copyExtParams, copyPadExtparams);
+    } else {
+        copyExtParams.blockCount = bLength * copyInQSplitCoef_;
+        copyExtParams.blockLen = tilingData_->sliceLength * sizeof(T) / copyInQSplitCoef_;
+        copyExtParams.srcStride = (tilingData_->D - tilingData_->sliceLength) * sizeof(T);
+        copyExtParams.dstStride = ubCopyInStride;
+        DataCopyPad(target, source[bStart * D_ + tilingData_->sliceStart], copyExtParams, copyPadExtparams);
+    }
     this->qInQueue_.template EnQue(target);
 }
 
@@ -238,11 +264,20 @@ __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::CopyOutQ(
 {
     LocalTensor<T> source = this->qOutQueue_.template DeQue<T>();
     DataCopyExtParams copyExtParams;
-    copyExtParams.blockCount = bLength * dSplitCoef_;
-    copyExtParams.blockLen = tilingData_->sliceLength * sizeof(T) / dSplitCoef_;
-    copyExtParams.srcStride = 0;
-    copyExtParams.dstStride = (tilingData_->D - tilingData_->sliceLength) * sizeof(T);
-    DataCopyPad(target[bStart * D_+ tilingData_->sliceStart], source, copyExtParams);
+    if (fullRow_) {
+        // full-row: whole-row write-back (out-of-segment = read-back original values, bit-exact), GM base at row start
+        copyExtParams.blockCount = bLength;
+        copyExtParams.blockLen = D_ * sizeof(T);
+        copyExtParams.srcStride = 0;
+        copyExtParams.dstStride = 0;
+        DataCopyPad(target[bStart * D_], source, copyExtParams);
+    } else {
+        copyExtParams.blockCount = bLength * dSplitCoef_;
+        copyExtParams.blockLen = tilingData_->sliceLength * sizeof(T) / dSplitCoef_;
+        copyExtParams.srcStride = 0;
+        copyExtParams.dstStride = (tilingData_->D - tilingData_->sliceLength) * sizeof(T);
+        DataCopyPad(target[bStart * D_+ tilingData_->sliceStart], source, copyExtParams);
+    }
     this->qOutQueue_.FreeTensor(source);
 }
 
@@ -256,7 +291,14 @@ __aicore__ inline void RotaryPositionEmbeddingAAndB<T, IsBoardCast>::Compute(
         if (tilingData_->rotaryMode == static_cast<int64_t>(RotaryPosEmbeddingMode::HALF)) {
             HalfAlignVF<T>(sin, cos, inUb, outUb, tilingData_->sliceLength, dAlign_, 1, bLength);
         } else if (tilingData_->rotaryMode == static_cast<int64_t>(RotaryPosEmbeddingMode::INTERLEAVE)) {
-            InterleaveModeVF<T>(sin, cos, inUb, outUb, tilingData_->sliceLength, 1, bLength);
+            if (fullRow_) {
+                // full-row: whole-row UB copy keeps out-of-segment original values on write-back; VF uses D row stride offset sliceStart
+                DataCopy(outUb, inUb, static_cast<uint32_t>(bLength * D_));
+                InterleaveModeVFRowStrided<T>(sin, cos, inUb[tilingData_->sliceStart], outUb[tilingData_->sliceStart],
+                    tilingData_->sliceLength, static_cast<uint32_t>(D_), 1, static_cast<uint16_t>(bLength));
+            } else {
+                InterleaveModeVF<T>(sin, cos, inUb, outUb, tilingData_->sliceLength, 1, bLength);
+            }
         } else if (tilingData_->rotaryMode == static_cast<int64_t>(RotaryPosEmbeddingMode::QUARTER)) {
             QuarterAlignVF<T>(sin, cos, inUb, outUb, tilingData_->sliceLength, dAlign_, 1, bLength);
         } else {

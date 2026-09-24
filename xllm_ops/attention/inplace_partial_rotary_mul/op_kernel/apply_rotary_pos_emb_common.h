@@ -39,6 +39,11 @@ constexpr uint32_t BLOCK_TYPE_SIZE = GetUbBlockSize();
 constexpr uint32_t HALF_INTERLEAVE_COEF = 2;
 constexpr uint32_t QUARTER_MODE_COEF = 4;
 constexpr uint32_t DOUBLE_BUFFER = 2;
+// full-row-copy: x/y/cos/sin four-queue DB total UB budget (about half of UB size; over-budget shapes fall back)
+inline constexpr int64_t FULLROW_UB_BUDGET = 126976;
+// scheme-B abandon switch: round1 rerun showed full-row copy regresses large INTERLEAVE cases
+// (case20 +3.3% slower: doubled GM write-back traffic outweighs small-block removal); keep code, gate off
+inline constexpr bool FULLROW_ENABLE = false;
 
 enum class ApplyRotaryPosEmbRotaryMode : int64_t {
     HALF = 1,
@@ -303,6 +308,121 @@ __aicore__ inline void InterleaveModeVF(
                 }
 
                 // 尾块小于VL时,只读取VL
+                for (uint16_t i = 0; i < tailOneVL; i++) {
+                    uint32_t updateCnt = tailLen;
+                    pregTail = MicroAPI::UpdateMask<float>(updateCnt);
+                    ops::LoadOneTensorForDtypeT<T>(currInUb, vregFormerIn, pregTail, 0);
+                    ops::LoadOneTensorForDtypeT<T>(tailCosUb, vregFormerCos, pregTail, 0);
+                    ops::LoadOneTensorForDtypeT<T>(tailSinUb, vregFormerSin, pregTail, 0);
+                    Mul(vregFormerCos, vregFormerCos, vregFormerIn, pregTail);
+                    MicroAPI::DeInterleave<float>(vregEven, vregOdd, vregFormerIn, vregLatterIn);
+                    Muls(vregOdd, vregOdd, float(-1.0), pregTail);
+                    MicroAPI::Interleave<float>(vregFormerIn, vregLatterIn, vregOdd, vregEven);
+                    Mul(vregFormerSin, vregFormerSin, vregFormerIn, pregTail);
+                    Add(vregFormerCos, vregFormerCos, vregFormerSin, pregTail);
+                    ops::StoreOneTensorForDtypeT<T>(currOutUb, vregFormerCos, pregTail, 0);
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+__aicore__ inline void InterleaveModeVFRowStrided(
+    const LocalTensor<T>& sinTensor, const LocalTensor<T>& cosTensor, const LocalTensor<T>& inTensor,
+    const LocalTensor<T>& outTensor, uint32_t dLen, uint32_t inOutRowStride, uint16_t currSNum, uint16_t currDNum)
+{
+    // new helper (full-row-copy, add-only): compute body identical to InterleaveModeVF,
+    // only in/out UB row stride is passed by caller (full-row layout = D); sin/cos row stride keeps original semantics.
+    __local_mem__ T* sinUb = (__local_mem__ T*)sinTensor.GetPhyAddr();
+    __local_mem__ T* cosUb = (__local_mem__ T*)cosTensor.GetPhyAddr();
+    __local_mem__ T* inUb = (__local_mem__ T*)inTensor.GetPhyAddr();
+    __local_mem__ T* outUb = (__local_mem__ T*)outTensor.GetPhyAddr();
+    uint32_t sinCosAlign = ops::CeilAlign(dLen, static_cast<uint32_t>(BLOCK_TYPE_SIZE / sizeof(T)));
+    uint16_t repeatTimes = dLen / VL_FLOAT32_SIZE;
+    uint16_t loopNum = repeatTimes / 2;
+    uint32_t tailNum = dLen - loopNum * 2 * VL_FLOAT32_SIZE;
+    uint16_t tailTwoVL = tailNum / VL_FLOAT32_SIZE;
+    uint16_t tailOneVL = (tailTwoVL == 1) ? 0 : 1;
+    uint32_t tailLen = tailNum % VL_FLOAT32_SIZE;
+    __local_mem__ T* currInUb;
+    __local_mem__ T* currOutUb;
+    __local_mem__ T* currSinUb;
+    __local_mem__ T* currCosUb;
+    __local_mem__ T* tailSinUb;
+    __local_mem__ T* tailCosUb;
+
+    __VEC_SCOPE__
+    {
+        MicroAPI::RegTensor<float> vregFormerCos;
+        MicroAPI::RegTensor<float> vregLatterCos;
+        MicroAPI::RegTensor<float> vregFormerSin;
+        MicroAPI::RegTensor<float> vregLatterSin;
+        MicroAPI::RegTensor<float> vregFormerIn;
+        MicroAPI::RegTensor<float> vregLatterIn;
+        MicroAPI::RegTensor<float> vregOdd;
+        MicroAPI::RegTensor<float> vregEven;
+        MicroAPI::RegTensor<float> vregFormerOut;
+        MicroAPI::RegTensor<float> vregLatterOut;
+        MicroAPI::MaskReg pregLoop;
+        MicroAPI::MaskReg pregTail;
+        for (uint16_t sIdx = 0; sIdx < currSNum; sIdx++) {
+            currSinUb = sinUb + sIdx * sinCosAlign;
+            currCosUb = cosUb + sIdx * sinCosAlign;
+            for (uint16_t idxD = 0; idxD < currDNum; idxD++) {
+                currInUb = inUb + (sIdx * currDNum + idxD) * inOutRowStride;
+                currOutUb = outUb + (sIdx * currDNum + idxD) * inOutRowStride;
+                pregLoop = MicroAPI::CreateMask<float, MicroAPI::MaskPattern::ALL>();
+                for (uint16_t i = 0; i < loopNum; i++) {
+                    uint32_t evenOffSet = (i * 2) * VL_FLOAT32_SIZE;
+                    uint32_t oddOffset = evenOffSet + VL_FLOAT32_SIZE;
+                    ops::LoadOneTensorForDtypeT<T>(currInUb, vregFormerIn, pregLoop, evenOffSet);
+                    ops::LoadOneTensorForDtypeT<T>(currInUb, vregLatterIn, pregLoop, oddOffset);
+                    ops::LoadOneTensorForDtypeT<T>(currCosUb, vregFormerCos, pregLoop, evenOffSet);
+                    ops::LoadOneTensorForDtypeT<T>(currCosUb, vregLatterCos, pregLoop, oddOffset);
+                    ops::LoadOneTensorForDtypeT<T>(currSinUb, vregFormerSin, pregLoop, evenOffSet);
+                    ops::LoadOneTensorForDtypeT<T>(currSinUb, vregLatterSin, pregLoop, oddOffset);
+                    Mul(vregFormerCos, vregFormerCos, vregFormerIn, pregLoop);
+                    Mul(vregLatterCos, vregLatterCos, vregLatterIn, pregLoop);
+                    MicroAPI::DeInterleave<float>(vregEven, vregOdd, vregFormerIn, vregLatterIn);
+                    Muls(vregOdd, vregOdd, float(-1.0), pregLoop);
+                    MicroAPI::Interleave<float>(vregFormerIn, vregLatterIn, vregOdd, vregEven);
+                    Mul(vregFormerSin, vregFormerSin, vregFormerIn, pregLoop);
+                    Add(vregFormerCos, vregFormerCos, vregFormerSin, pregLoop);
+                    Mul(vregLatterSin, vregLatterSin, vregLatterIn, pregLoop);
+                    Add(vregLatterCos, vregLatterCos, vregLatterSin, pregLoop);
+                    ops::StoreOneTensorForDtypeT<T>(currOutUb, vregFormerCos, pregLoop, evenOffSet);
+                    ops::StoreOneTensorForDtypeT<T>(currOutUb, vregLatterCos, pregLoop, oddOffset);
+                }
+
+                currInUb = inUb + (sIdx * currDNum + idxD) * inOutRowStride + (loopNum * 2 * VL_FLOAT32_SIZE);
+                currOutUb = outUb + (sIdx * currDNum + idxD) * inOutRowStride + (loopNum * 2 * VL_FLOAT32_SIZE);
+                tailSinUb = currSinUb + loopNum * 2 * VL_FLOAT32_SIZE;
+                tailCosUb = currCosUb + loopNum * 2 * VL_FLOAT32_SIZE;
+                // tail larger than VL: read one VL, read tail
+                for (uint16_t i = 0; i < tailTwoVL; i++) {
+                    uint32_t updateCnt = tailLen;
+                    pregTail = MicroAPI::UpdateMask<float>(updateCnt);
+                    ops::LoadOneTensorForDtypeT<T>(currInUb, vregFormerIn, pregLoop, 0);
+                    ops::LoadOneTensorForDtypeT<T>(currInUb, vregLatterIn, pregTail, VL_FLOAT32_SIZE);
+                    ops::LoadOneTensorForDtypeT<T>(tailCosUb, vregFormerCos, pregLoop, 0);
+                    ops::LoadOneTensorForDtypeT<T>(tailCosUb, vregLatterCos, pregTail, VL_FLOAT32_SIZE);
+                    ops::LoadOneTensorForDtypeT<T>(tailSinUb, vregFormerSin, pregLoop, 0);
+                    ops::LoadOneTensorForDtypeT<T>(tailSinUb, vregLatterSin, pregTail, VL_FLOAT32_SIZE);
+                    Mul(vregFormerCos, vregFormerCos, vregFormerIn, pregLoop);
+                    Mul(vregLatterCos, vregLatterCos, vregLatterIn, pregTail);
+                    MicroAPI::DeInterleave<float>(vregEven, vregOdd, vregFormerIn, vregLatterIn);
+                    Muls(vregOdd, vregOdd, float(-1.0), pregLoop);
+                    MicroAPI::Interleave<float>(vregFormerIn, vregLatterIn, vregOdd, vregEven);
+                    Mul(vregFormerSin, vregFormerSin, vregFormerIn, pregLoop);
+                    Add(vregFormerCos, vregFormerCos, vregFormerSin, pregLoop);
+                    Mul(vregLatterSin, vregLatterSin, vregLatterIn, pregTail);
+                    Add(vregLatterCos, vregLatterCos, vregLatterSin, pregTail);
+                    ops::StoreOneTensorForDtypeT<T>(currOutUb, vregFormerCos, pregLoop, 0);
+                    ops::StoreOneTensorForDtypeT<T>(currOutUb, vregLatterCos, pregTail, VL_FLOAT32_SIZE);
+                }
+
+                // tail smaller than VL: read VL only
                 for (uint16_t i = 0; i < tailOneVL; i++) {
                     uint32_t updateCnt = tailLen;
                     pregTail = MicroAPI::UpdateMask<float>(updateCnt);
