@@ -7,11 +7,13 @@
 #   1. 安装依赖包: 读取 third_party/ops-transformer/requirements.txt 并 pip 安装
 #   2. 执行编译:   bash build.sh --pkg --soc={soc} --vendor_name={vendor_name}
 #                  --ops={ops} -j{jobs} -O3
+#   3. 安装产物:   将编译生成的 *.run 包安装到 ${ASCEND_HOME_PATH}/opp
 #
 # 用法:
-#   bash build_ops_transformer.sh            # 使用默认常量编译
+#   bash build_ops_transformer.sh            # 安装依赖 + 编译 + 安装产物 (默认)
 #   bash build_ops_transformer.sh install    # 仅安装依赖
 #   bash build_ops_transformer.sh build      # 仅执行编译
+#   bash build_ops_transformer.sh all        # 安装依赖 + 编译 + 安装产物
 #   bash build_ops_transformer.sh --soc=ascend950 build   # 指定 SOC 编译
 # =============================================================================
 
@@ -118,6 +120,50 @@ build_ops() {
 }
 
 # -----------------------------------------------------------------------------
+# 函数: 安装编译产物 (.run 包)
+# 将 third_party/ops-transformer/build_out/*.run 安装到 ${ASCEND_HOME_PATH}/opp
+# -----------------------------------------------------------------------------
+install_package() {
+    echo "============================================================"
+    echo "[Step 3/3] 安装编译产物"
+    echo "============================================================"
+
+    if [ -z "${ASCEND_HOME_PATH}" ]; then
+        echo "错误: 环境变量 ASCEND_HOME_PATH 未设置, 无法确定安装路径。"
+        exit 1
+    fi
+
+    local build_out_dir="${OPS_TRANSFORMER_DIR}/build_out"
+    if [[ ! -d "${build_out_dir}" ]]; then
+        echo "错误: 未找到编译产物目录 ${build_out_dir}"
+        exit 1
+    fi
+
+    local run_files=("${build_out_dir}"/*.run)
+    if [[ ${#run_files[@]} -eq 0 ]]; then
+        echo "错误: 目录 ${build_out_dir} 下未找到 .run 包"
+        exit 1
+    fi
+    if [[ ${#run_files[@]} -gt 1 ]]; then
+        echo "错误: 目录 ${build_out_dir} 下存在多个 .run 包:"
+        printf '%s\n' "${run_files[@]}"
+        exit 1
+    fi
+
+    local run_file="${run_files[0]}"
+    local opp_install_path="${ASCEND_HOME_PATH}/opp"
+
+    echo "安装包: ${run_file}"
+    echo "安装路径: ${opp_install_path}"
+    echo ""
+
+    bash "${run_file}" --quiet --install-path="${opp_install_path}"
+
+    echo "产物安装完成。"
+    echo ""
+}
+
+# -----------------------------------------------------------------------------
 # 解析参数: 支持 --soc=xxx 覆盖默认 SOC, 其余位置参数作为 action
 # -----------------------------------------------------------------------------
 parse_args() {
@@ -184,6 +230,7 @@ main() {
     case "${action}" in
         install)
             install_deps
+            install_package
             ;;
         build)
             build_ops
@@ -191,12 +238,13 @@ main() {
         all)
             install_deps
             build_ops
+            install_package
             ;;
         *)
             echo "用法: bash build_ops_transformer.sh [install|build|all]"
-            echo "  install  仅安装依赖包"
+            echo "  install  安装依赖包并安装编译产物"
             echo "  build    仅执行编译"
-            echo "  all      安装依赖并编译 (默认)"
+            echo "  all      安装依赖 + 编译 + 安装产物 (默认)"
             exit 1
             ;;
     esac

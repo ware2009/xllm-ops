@@ -252,7 +252,7 @@ build_ops_transformer() {
     done
 
     echo ">>> Building ops-transformer for SOC=${soc_str}"
-    stdbuf -oL bash "${transformer_script}" --soc="${soc_str}" build
+    stdbuf -oL bash "${transformer_script}" --soc="${soc_str}" all
 }
 
 # ============================================================================
