@@ -7,8 +7,8 @@
 #   1. 安装依赖包: 读取 third_party/ops-transformer/requirements.txt 并 pip 安装
 #   2. 执行编译:   bash build.sh --pkg --soc={soc} --vendor_name={vendor_name}
 #                  --ops={ops} -j{jobs} -O3
-#   3. 安装产物:   将编译生成的 *.run 包安装到 ${ASCEND_HOME_PATH}/opp
-#                  （vendor 目录与 config.ini 由 .run 包内置 install.sh 自动处理）
+#   3. 安装产物:   将编译生成的 *.run 包安装到 ${ASCEND_HOME_PATH}/opp，
+#                  并补写 vendors/config.ini（install.sh 在 --install-path 下不写 config.ini）
 #
 # 用法:
 #   bash build_ops_transformer.sh            # 安装依赖 + 编译 + 安装产物 (默认)
@@ -163,8 +163,51 @@ install_package() {
 
     bash "${run_file}" --quiet --install-path="${install_path}"
 
-    echo "产物安装完成 (vendor 目录与 config.ini 已由 install.sh 自动配置)。"
+    # 补写 config.ini：install.sh 在显式 --install-path 时只写 set_env.bash，
+    # 不会更新 vendors/config.ini，需在此手动把 custom_transformer 加入 load_priority。
+    update_vendor_config "${install_path}"
+
+    echo "产物安装完成 (vendor 目录已安装, config.ini 已补写)。"
     echo ""
+}
+
+# -----------------------------------------------------------------------------
+# 函数: 补写 vendors/config.ini
+#
+# 背景：.run 包内置 install.sh 在使用 --install-path 时，仅生成 bin/set_env.bash，
+#       不会创建/更新 vendors/config.ini，导致默认 OPP 加载链找不到该自定义 vendor。
+#       此处在外层手动补写 config.ini，使其包含本次安装的 vendor。
+# -----------------------------------------------------------------------------
+update_vendor_config() {
+    local opp_install_path="$1"
+    local vendor_dir_root="${opp_install_path}/vendors"
+    local config_file="${vendor_dir_root}/config.ini"
+
+    # vendor 目录名：CMake 打包时会将 install.sh 中的 vendor_name 替换为
+    # ${VENDOR_NAME}_transformer（即 custom_transformer）
+    local vendor_name="${VENDOR_NAME}_transformer"
+
+    echo "[INFO] post-install: write config.ini for vendor '${vendor_name}'"
+
+    if [ ! -f "${config_file}" ]; then
+        echo "load_priority=${vendor_name}" > "${config_file}"
+        chmod 640 "${config_file}" 2>/dev/null || true
+        echo "[INFO] created ${config_file}"
+    else
+        # 已存在：把当前 vendor 合并进 load_priority（若不存在则前置加入）
+        local found_vendors
+        found_vendors="$(grep -w 'load_priority' "${config_file}" | cut --only-delimited -d'=' -f2-)"
+        if echo ",${found_vendors}," | grep -q ",${vendor_name},"; then
+            echo "[INFO] ${vendor_name} already in load_priority, skip"
+        else
+            if [ -z "${found_vendors}" ]; then
+                echo "load_priority=${vendor_name}" > "${config_file}"
+            else
+                sed -i "s@load_priority=${found_vendors}@load_priority=${vendor_name},${found_vendors}@g" "${config_file}"
+            fi
+            echo "[INFO] updated ${config_file}"
+        fi
+    fi
 }
 
 # -----------------------------------------------------------------------------
