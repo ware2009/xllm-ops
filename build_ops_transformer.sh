@@ -7,14 +7,14 @@
 #   1. 安装依赖包: 读取 third_party/ops-transformer/requirements.txt 并 pip 安装
 #   2. 执行编译:   bash build.sh --pkg --soc={soc} --vendor_name={vendor_name}
 #                  --ops={ops} -j{jobs} -O3
-#   3. 安装产物:   将编译生成的 *.run 包安装到 ${ASCEND_HOME_PATH}/opp
-#   4. 注册 vendor: 校验并确保 vendor(custom) 已写入 ${ASCEND_HOME_PATH}/opp/vendors/config.ini
+#   3. 安装产物:   将编译生成的 *.run 包安装（vendor 目录与 config.ini 由
+#                  .run 包内置 install.sh 自动处理，无需外层显式指定）
 #
 # 用法:
-#   bash build_ops_transformer.sh            # 安装依赖 + 编译 + 安装产物 + 注册 vendor (默认)
-#   bash build_ops_transformer.sh install    # 安装依赖 + 安装产物 + 注册 vendor
+#   bash build_ops_transformer.sh            # 安装依赖 + 编译 + 安装产物 (默认)
+#   bash build_ops_transformer.sh install    # 安装依赖 + 安装产物
 #   bash build_ops_transformer.sh build      # 仅执行编译
-#   bash build_ops_transformer.sh all        # 安装依赖 + 编译 + 安装产物 + 注册 vendor
+#   bash build_ops_transformer.sh all        # 安装依赖 + 编译 + 安装产物
 #   bash build_ops_transformer.sh --soc=ascend950 build   # 指定 SOC 编译
 # =============================================================================
 
@@ -43,10 +43,6 @@ SOC="ascend910_93"
 # 自定义算子包 vendor 名称 (编译参数 --vendor_name 使用, CMake 会追加 _transformer 后缀)
 VENDOR_NAME="custom"
 
-# 实际安装到 ${ASCEND_HOME_PATH}/opp/vendors/ 下的目录名
-# (ops-transformer 的 CMake 将 VENDOR_NAME 拼成 ${VENDOR_NAME}_transformer 作为安装目录)
-VENDOR_DIR_NAME="${VENDOR_NAME}_transformer"
-
 # 并行编译线程数 (自动获取当前 CPU 核数)
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 16)"
 
@@ -66,7 +62,7 @@ REQUIREMENTS_FILE="${OPS_TRANSFORMER_DIR}/requirements.txt"
 # -----------------------------------------------------------------------------
 install_deps() {
     echo "============================================================"
-    echo "[Step 1/4] 安装依赖包"
+    echo "[Step 1/3] 安装依赖包"
     echo "============================================================"
 
     if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
@@ -89,7 +85,7 @@ install_deps() {
 # -----------------------------------------------------------------------------
 build_ops() {
     echo "============================================================"
-    echo "[Step 2/4] 执行编译"
+    echo "[Step 2/3] 执行编译"
     echo "============================================================"
 
     if [[ ! -d "${OPS_TRANSFORMER_DIR}" ]]; then
@@ -130,7 +126,7 @@ build_ops() {
 # -----------------------------------------------------------------------------
 install_package() {
     echo "============================================================"
-    echo "[Step 3/4] 安装编译产物"
+    echo "[Step 3/3] 安装编译产物"
     echo "============================================================"
 
     if [ -z "${ASCEND_HOME_PATH}" ]; then
@@ -156,71 +152,14 @@ install_package() {
     fi
 
     local run_file="${run_files[0]}"
-    local opp_install_path="${ASCEND_HOME_PATH}/opp"
 
     echo "安装包: ${run_file}"
-    echo "安装路径: ${opp_install_path}"
+    echo "安装路径: 由 .run 包内置 install.sh 自动确定 (默认 ${ASCEND_HOME_PATH}/opp)"
     echo ""
 
-    bash "${run_file}" --quiet --install-path="${opp_install_path}"
+    bash "${run_file}" --quiet
 
-    echo "产物安装完成。"
-    echo ""
-
-    update_config_ini
-}
-
-# -----------------------------------------------------------------------------
-# 函数: 校验并确保 vendor 已注册到 config.ini
-# .run 包安装时通常会写入 ${OPP}/vendors/config.ini 的 load_priority,
-# 此处作为兜底: 若缺失则显式补充, 保证自定义算子包被加载。
-# -----------------------------------------------------------------------------
-update_config_ini() {
-    local opp_install_path="${ASCEND_HOME_PATH}/opp"
-    local config_file="${opp_install_path}/vendors/config.ini"
-
-    echo "============================================================"
-    echo "[Step 4/4] 校验 config.ini 中的 vendor 注册"
-    echo "============================================================"
-
-    if [[ ! -f "${config_file}" ]]; then
-        echo "警告: 未找到 ${config_file}, 尝试创建并写入 load_priority。"
-        if ! mkdir -p "$(dirname "${config_file}")"; then
-            echo "错误: 无法创建目录 $(dirname "${config_file}")"
-            exit 1
-        fi
-        if ! echo "load_priority=${VENDOR_DIR_NAME}" > "${config_file}"; then
-            echo "错误: 写入 ${config_file} 失败, 请检查写权限 (当前用户: $(whoami))"
-            exit 1
-        fi
-        echo "已创建 ${config_file} 并写入 load_priority=${VENDOR_DIR_NAME}"
-        echo ""
-        return
-    fi
-
-    # 已存在 config.ini: 检查 load_priority 是否包含本 vendor
-    local found_vendors
-    found_vendors="$(grep -w "load_priority" "${config_file}" | cut --only-delimited -d"=" -f2-)"
-
-    if [[ -z "${found_vendors}" ]]; then
-        # 无 load_priority 行, 追加
-        if ! echo "load_priority=${VENDOR_DIR_NAME}" >> "${config_file}"; then
-            echo "错误: 追加 load_priority 到 ${config_file} 失败, 请检查写权限"
-            exit 1
-        fi
-        echo "已向 ${config_file} 追加 load_priority=${VENDOR_DIR_NAME}"
-    elif ! echo "${found_vendors}" | grep -qw "${VENDOR_DIR_NAME}"; then
-        # 已有 load_priority 但不含本 vendor, 将本 vendor 置顶追加
-        if ! sed -i "s/^load_priority=${found_vendors}/load_priority=${VENDOR_DIR_NAME},${found_vendors}/" "${config_file}"; then
-            echo "错误: 更新 ${config_file} 的 load_priority 失败, 请检查写权限"
-            exit 1
-        fi
-        echo "已更新 ${config_file}: load_priority=${VENDOR_DIR_NAME},${found_vendors}"
-    else
-        echo "${config_file} 已包含 vendor [${VENDOR_DIR_NAME}], 无需更新。"
-    fi
-
-    echo "校验结果: $(grep -w 'load_priority' "${config_file}")"
+    echo "产物安装完成 (vendor 目录与 config.ini 已由 install.sh 自动配置)。"
     echo ""
 }
 
@@ -282,7 +221,6 @@ main() {
     echo "ops-transformer 构建脚本"
     echo "  SOC          : ${SOC}"
     echo "  VENDOR_NAME  : ${VENDOR_NAME}"
-    echo "  VENDOR_DIR   : ${VENDOR_DIR_NAME}"
     echo "  OPS          : ${ops_str}"
     echo "  JOBS         : ${JOBS}"
     echo "  OPT_LEVEL    : ${OPT_LEVEL}"
