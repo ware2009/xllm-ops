@@ -7,8 +7,8 @@
 #   1. 安装依赖包: 读取 third_party/ops-transformer/requirements.txt 并 pip 安装
 #   2. 执行编译:   bash build.sh --pkg --soc={soc} --vendor_name={vendor_name}
 #                  --ops={ops} -j{jobs} -O3
-#   3. 安装产物:   将编译生成的 *.run 包安装（vendor 目录与 config.ini 由
-#                  .run 包内置 install.sh 自动处理，无需外层显式指定）
+#   3. 安装产物:   将编译生成的 *.run 包安装到 ${ASCEND_HOME_PATH}/opp
+#                  （vendor 目录与 config.ini 由 .run 包内置 install.sh 自动处理）
 #
 # 用法:
 #   bash build_ops_transformer.sh            # 安装依赖 + 编译 + 安装产物 (默认)
@@ -153,11 +153,15 @@ install_package() {
 
     local run_file="${run_files[0]}"
 
+    # 显式指定 --install-path：当 ASCEND_CUSTOM_OPP_PATH 含冒号(多路径)时，
+    # .run 包内置 install.sh 会拒绝自动推断安装路径并要求显式指定。
+    local install_path="${ASCEND_HOME_PATH}/opp"
+
     echo "安装包: ${run_file}"
-    echo "安装路径: 由 .run 包内置 install.sh 自动确定 (默认 ${ASCEND_HOME_PATH}/opp)"
+    echo "安装路径: ${install_path}"
     echo ""
 
-    bash "${run_file}" --quiet
+    bash "${run_file}" --quiet --install-path="${install_path}"
 
     echo "产物安装完成 (vendor 目录与 config.ini 已由 install.sh 自动配置)。"
     echo ""
