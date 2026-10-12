@@ -31,6 +31,8 @@ show_help() {
     echo '  -c|--compute-unit   Specifies the chip type. If there are multiple values, separate'
     echo '                       them with semicolons and use quotation marks. Default: ascend910b'
     echo '                       e.g. -c "ascend910b" or -c "ascend910b;ascend310p"'
+    echo '  --build-transformer  Build ops-transformer third-party ops (default: enabled)'
+    echo '  --no-build-transformer  Skip building ops-transformer third-party ops'
     echo "  -h, --help          Show this help message"
     echo ""
     echo "Examples:"
@@ -48,6 +50,7 @@ parse_args() {
     BUILD_DIR=""
     OP_NAME=""
     COMPUTE_UNIT=""
+    BUILD_TRANSFORMER="true"
 
     # 第一轮：解析 --key=value 形式参数
     for arg in "$@"; do
@@ -57,6 +60,12 @@ parse_args() {
                 ;;
             --compute-unit=*)
                 COMPUTE_UNIT="${arg#*=}"
+                ;;
+            --build-transformer)
+                BUILD_TRANSFORMER="true"
+                ;;
+            --no-build-transformer)
+                BUILD_TRANSFORMER="false"
                 ;;
             -n|--op-name)
                 # 需要取下一个参数，在第二轮中处理
@@ -215,6 +224,38 @@ run_build() {
 }
 
 # ============================================================================
+# 编译 ops-transformer 三方依赖
+# 通过 build_ops_transformer.sh 编译 third_party/ops-transformer 子模块,
+# SOC 跟随 resolve_soc_version_list 的结果(逗号分隔多值)。
+# ============================================================================
+build_ops_transformer() {
+    if [[ "${BUILD_TRANSFORMER}" != "true" ]]; then
+        echo ">>> Skip ops-transformer build (--no-build-transformer)"
+        return 0
+    fi
+
+    local transformer_script="${BASE_DIR}/build_ops_transformer.sh"
+    if [[ ! -f "${transformer_script}" ]]; then
+        echo "[WARN] build_ops_transformer.sh not found, skip ops-transformer build: ${transformer_script}"
+        return 0
+    fi
+
+    # 将 SOC_VERSION_LIST 数组转换为逗号分隔字符串
+    local soc_str=""
+    local soc_ver
+    for soc_ver in "${SOC_VERSION_LIST[@]}"; do
+        if [[ -z "${soc_str}" ]]; then
+            soc_str="${soc_ver}"
+        else
+            soc_str="${soc_str},${soc_ver}"
+        fi
+    done
+
+    echo ">>> Building ops-transformer for SOC=${soc_str}"
+    stdbuf -oL bash "${transformer_script}" --soc="${soc_str}" build
+}
+
+# ============================================================================
 # 安装构建产物
 # ============================================================================
 install_artifacts() {
@@ -294,6 +335,7 @@ main() {
     run_build
     install_artifacts
     update_vendor_config
+    build_ops_transformer
 }
 
 main "$@"
