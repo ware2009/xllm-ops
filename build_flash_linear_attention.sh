@@ -139,7 +139,7 @@ build_fla() {
         local ops_list
         ops_list=$(IFS=','; echo "${NPU_OPS[*]}")
         echo "[INFO] build flash-linear-attention-npu (FLA_NPU_SOC=${SOC}, ops=${ops_list})"
-        build_cmd+=(--build-args "--ops=${ops_list}")
+        build_cmd+=(--build-args="--ops=${ops_list}")
     else
         echo "[INFO] build flash-linear-attention-npu (FLA_NPU_SOC=${SOC}, all ops)"
     fi
