@@ -60,6 +60,7 @@ BUILD_TORCH_EXTENSION="true"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPS_TRANSFORMER_DIR="${SCRIPT_DIR}/third_party/ops-transformer"
 REQUIREMENTS_FILE="${OPS_TRANSFORMER_DIR}/requirements.txt"
+TORCH_EXTENSION_REQUIREMENTS_FILE="${OPS_TRANSFORMER_DIR}/torch_extension/requirements.txt"
 
 # -----------------------------------------------------------------------------
 # 函数: 安装依赖包
@@ -121,6 +122,19 @@ build_ops() {
     # 若开启 torch_extension 打包, 先单独构建 whl 到 torch_extension/dist/
     # 随后 --pkg 打包时 package.cmake 会自动把 dist 里的 whl 一并打进 .run 包
     if [[ "${BUILD_TORCH_EXTENSION}" == "true" ]]; then
+        # 构建 whl 依赖 python 'build' 模块, 缺失时自动安装 torch_extension 依赖
+        if ! python3 -c "import build" 2>/dev/null; then
+            echo "[INFO] 缺少 python 'build' 模块, 安装 torch_extension 依赖..."
+            if [[ -f "${TORCH_EXTENSION_REQUIREMENTS_FILE}" ]]; then
+                pip install -r "${TORCH_EXTENSION_REQUIREMENTS_FILE}" || { cd "${SCRIPT_DIR}"; exit 1; }
+            else
+                echo "错误: 未找到 ${TORCH_EXTENSION_REQUIREMENTS_FILE}"
+                cd "${SCRIPT_DIR}"
+                exit 1
+            fi
+            echo ""
+        fi
+
         local whl_cmd="bash build.sh --torch_extension_only --vendor_name=${VENDOR_NAME} --ops=${ops_str}"
         echo "[INFO] 构建 torch_extension whl:"
         echo "  ${whl_cmd}"
