@@ -67,21 +67,21 @@ TORCH_EXTENSION_REQUIREMENTS_FILE="${OPS_TRANSFORMER_DIR}/torch_extension/requir
 # -----------------------------------------------------------------------------
 install_deps() {
     echo "============================================================"
-    echo "[Step 1/3] 安装依赖包"
+    echo "[Step 1/3] Install dependencies"
     echo "============================================================"
 
     if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
-        echo "错误: 未找到依赖文件 ${REQUIREMENTS_FILE}"
+        echo "Error: dependency file not found: ${REQUIREMENTS_FILE}"
         exit 1
     fi
 
-    echo "读取依赖文件: ${REQUIREMENTS_FILE}"
+    echo "Reading dependency file: ${REQUIREMENTS_FILE}"
     echo "----------------------------------------"
     cat "${REQUIREMENTS_FILE}"
     echo "----------------------------------------"
-    echo "开始安装依赖..."
+    echo "Installing dependencies..."
     pip install -r "${REQUIREMENTS_FILE}"
-    echo "依赖安装完成。"
+    echo "Dependencies installed."
     echo ""
 }
 
@@ -90,18 +90,18 @@ install_deps() {
 # -----------------------------------------------------------------------------
 build_ops() {
     echo "============================================================"
-    echo "[Step 2/3] 执行编译"
+    echo "[Step 2/3] Build"
     echo "============================================================"
 
     # 310P (ascend310p) 目标无 quant_lightning_indexer_v2 等算子注册，跳过编译
     if [[ "${SOC}" == "ascend310p" || "${SOC}" == *",ascend310p"* || "${SOC}" == "ascend310p,"* ]]; then
-        echo "[WARN] SOC=${SOC} 含 ascend310p，无 quant_lightning_indexer_v2 等算子注册，跳过编译"
+        echo "[WARN] SOC=${SOC} contains ascend310p, no quant_lightning_indexer_v2 ops registered, skip build"
         return 0
     fi
 
     if [[ ! -d "${OPS_TRANSFORMER_DIR}" ]]; then
-        echo "错误: 未找到 ops-transformer 目录 ${OPS_TRANSFORMER_DIR}"
-        echo "请先执行 git submodule update --init --recursive 拉取子模块。"
+        echo "Error: ops-transformer directory not found: ${OPS_TRANSFORMER_DIR}"
+        echo "Please run 'git submodule update --init --recursive' first to pull the submodule."
         exit 1
     fi
 
@@ -118,8 +118,8 @@ build_ops() {
 
     local build_cmd="bash build.sh --pkg --soc=${SOC} --vendor_name=${VENDOR_NAME} --ops=${ops_str} -j${JOBS} -${OPT_LEVEL}"
 
-    echo "编译目录: ${OPS_TRANSFORMER_DIR}"
-    echo "编译命令:"
+    echo "Build directory: ${OPS_TRANSFORMER_DIR}"
+    echo "Build command:"
     echo "  ${build_cmd}"
     echo ""
 
@@ -128,7 +128,7 @@ build_ops() {
     # 若关闭 torch_extension 打包，清理 dist/ 残留的旧 whl，避免 --pkg 误打包
     if [[ "${BUILD_TORCH_EXTENSION}" != "true" ]]; then
         if [[ -d "${OPS_TRANSFORMER_DIR}/torch_extension/dist" ]]; then
-            echo "[INFO] --no-torch-extension: 清理 torch_extension/dist/ 残留 whl"
+            echo "[INFO] --no-torch-extension: clean stale whl in torch_extension/dist/"
             rm -rf "${OPS_TRANSFORMER_DIR}/torch_extension/dist"
         fi
     fi
@@ -138,18 +138,18 @@ build_ops() {
     if [[ "${BUILD_TORCH_EXTENSION}" == "true" ]]; then
         # 构建 whl 依赖 python 'build' 模块, 缺失时自动安装 torch_extension 依赖
         if ! python3 -c "import build" 2>/dev/null; then
-            echo "[INFO] 缺少 python 'build' 模块, 安装 torch_extension 依赖..."
+            echo "[INFO] Missing python 'build' module, install torch_extension dependencies..."
             if [[ -f "${TORCH_EXTENSION_REQUIREMENTS_FILE}" ]]; then
                 pip install -r "${TORCH_EXTENSION_REQUIREMENTS_FILE}" || { cd "${SCRIPT_DIR}"; exit 1; }
             else
-                echo "错误: 未找到 ${TORCH_EXTENSION_REQUIREMENTS_FILE}"
+                echo "Error: file not found: ${TORCH_EXTENSION_REQUIREMENTS_FILE}"
                 cd "${SCRIPT_DIR}"
                 exit 1
             fi
             echo ""
         fi
 
-        echo "[INFO] 构建 torch_extension whl:"
+        echo "[INFO] Build torch_extension whl:"
         echo "  bash build.sh --torch_extension_only --vendor_name=${VENDOR_NAME} --ops=${ops_str}"
         echo ""
         bash build.sh --torch_extension_only --vendor_name="${VENDOR_NAME}" --ops="${ops_str}" || { cd "${SCRIPT_DIR}"; exit 1; }
@@ -159,7 +159,7 @@ build_ops() {
     bash build.sh --pkg --soc="${SOC}" --vendor_name="${VENDOR_NAME}" --ops="${ops_str}" -j"${JOBS}" -"${OPT_LEVEL}"
     cd "${SCRIPT_DIR}"
 
-    echo "编译完成。"
+    echo "Build completed."
     echo ""
 }
 
@@ -169,27 +169,27 @@ build_ops() {
 # -----------------------------------------------------------------------------
 install_package() {
     echo "============================================================"
-    echo "[Step 3/3] 安装编译产物"
+    echo "[Step 3/3] Install build artifacts"
     echo "============================================================"
 
     if [ -z "${ASCEND_HOME_PATH}" ]; then
-        echo "错误: 环境变量 ASCEND_HOME_PATH 未设置, 无法确定安装路径。"
+        echo "Error: environment variable ASCEND_HOME_PATH is not set, cannot determine install path."
         exit 1
     fi
 
     local build_out_dir="${OPS_TRANSFORMER_DIR}/build_out"
     if [[ ! -d "${build_out_dir}" ]]; then
-        echo "错误: 未找到编译产物目录 ${build_out_dir}"
+        echo "Error: build output directory not found: ${build_out_dir}"
         exit 1
     fi
 
     local run_files=("${build_out_dir}"/*.run)
     if [[ ${#run_files[@]} -eq 0 ]]; then
-        echo "错误: 目录 ${build_out_dir} 下未找到 .run 包"
+        echo "Error: no .run package found under directory ${build_out_dir}"
         exit 1
     fi
     if [[ ${#run_files[@]} -gt 1 ]]; then
-        echo "错误: 目录 ${build_out_dir} 下存在多个 .run 包:"
+        echo "Error: multiple .run packages found under directory ${build_out_dir}:"
         printf '%s\n' "${run_files[@]}"
         exit 1
     fi
@@ -200,8 +200,8 @@ install_package() {
     # .run 包内置 install.sh 会拒绝自动推断安装路径并要求显式指定。
     local install_path="${ASCEND_HOME_PATH}/opp"
 
-    echo "安装包: ${run_file}"
-    echo "安装路径: ${install_path}"
+    echo "Install package: ${run_file}"
+    echo "Install path: ${install_path}"
     echo ""
 
     bash "${run_file}" --quiet --install-path="${install_path}"
@@ -210,7 +210,7 @@ install_package() {
     # 不会更新 vendors/config.ini，需在此手动把 custom_transformer 加入 load_priority。
     update_vendor_config "${install_path}"
 
-    echo "产物安装完成 (vendor 目录已安装, config.ini 已补写)。"
+    echo "Artifacts installed (vendor directory installed, config.ini written)."
     echo ""
 }
 
@@ -282,7 +282,7 @@ parse_args() {
                 ACTION="${arg}"
                 ;;
             *)
-                echo "错误: 未知参数 '${arg}'" >&2
+                echo "Error: unknown argument '${arg}'" >&2
                 ACTION="__invalid__"
                 ;;
         esac
@@ -321,7 +321,7 @@ main() {
     done
 
     echo "============================================================"
-    echo "ops-transformer 构建脚本"
+    echo "ops-transformer build script"
     echo "  SOC          : ${SOC}"
     echo "  VENDOR_NAME  : ${VENDOR_NAME}"
     echo "  OPS          : ${ops_str}"
@@ -344,17 +344,17 @@ main() {
             install_package
             ;;
         *)
-            echo "用法: bash build_ops_transformer.sh [install|build|all] [--soc=xxx] [--torch-extension|--no-torch-extension]"
-            echo "  install  安装依赖包并安装编译产物"
-            echo "  build    仅执行编译"
-            echo "  all      安装依赖 + 编译 + 安装产物 (默认)"
-            echo "  --torch-extension      将 torch_extension whl 一并打包进 .run 包 (默认开启)"
-            echo "  --no-torch-extension   不打包 torch_extension whl"
+            echo "Usage: bash build_ops_transformer.sh [install|build|all] [--soc=xxx] [--torch-extension|--no-torch-extension]"
+            echo "  install  Install dependencies and install build artifacts"
+            echo "  build    Build only"
+            echo "  all      Install dependencies + build + install artifacts (default)"
+            echo "  --torch-extension      Package torch_extension whl into the .run package (enabled by default)"
+            echo "  --no-torch-extension   Do not package torch_extension whl"
             exit 1
             ;;
     esac
 
-    echo "全部完成。"
+    echo "All done."
 }
 
 main "$@"

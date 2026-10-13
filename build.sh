@@ -243,8 +243,8 @@ build_ops_transformer() {
     # 子模块未初始化时 requirements.txt 缺失，会导致主 build 失败，提前检查并提示
     local transformer_requirements="${BASE_DIR}/third_party/ops-transformer/requirements.txt"
     if [[ ! -f "${transformer_requirements}" ]]; then
-        echo "[ERROR] ops-transformer 子模块未初始化 (缺失 ${transformer_requirements})"
-        echo "        请先执行: git submodule update --init --recursive"
+        echo "[ERROR] ops-transformer submodule not initialized (missing ${transformer_requirements})"
+        echo "        Please run first: git submodule update --init --recursive"
         exit 1
     fi
 
@@ -269,7 +269,7 @@ build_ops_transformer() {
         fi
     done
     if [[ "${has_310p}" == "true" ]]; then
-        echo ">>> Skip ops-transformer build: ascend310p 无 quant_lightning_indexer_v2 等算子注册"
+        echo ">>> Skip ops-transformer build: ascend310p has no quant_lightning_indexer_v2 ops registered"
         return 0
     fi
 
