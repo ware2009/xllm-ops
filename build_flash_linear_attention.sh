@@ -27,7 +27,7 @@ FLA_DIR="${BASE_DIR}/third_party/flash-linear-attention-npu"
 # 默认配置
 # ============================================================================
 # SOC 芯片类型（FLA_NPU_SOC）：ascend910b(A2) / ascend910_93(A3) / ascend950(A5)
-SOC="${FLA_NPU_SOC:-ascend910b}"
+SOC="${FLA_NPU_SOC:-ascend910_93}"
 # 是否编译，默认编译（1）；--no-build 时跳过编译与安装
 BUILD=1
 # 是否安装 wheel，默认安装（1）；--no-install 时跳过安装
@@ -61,7 +61,7 @@ show_help() {
     echo "安装依赖、编译并安装 flash-linear-attention-npu 三方库。"
     echo ""
     echo "Options:"
-    echo "  --soc SOC           SOC 芯片类型（FLA_NPU_SOC），默认 ascend910b"
+    echo "  --soc SOC           SOC 芯片类型（FLA_NPU_SOC），默认 ascend910_93"
     echo "                       A2 -> ascend910b, A3 -> ascend910_93, A5 -> ascend950"
     echo "  --no-build          跳过编译（不执行 build_wheel.py）"
     echo "  --no-install        编译后不安装 wheel"
@@ -71,7 +71,7 @@ show_help() {
     echo "  -h, --help          显示帮助信息"
     echo ""
     echo "Examples:"
-    echo "  bash build_flash_linear_attention.sh                       # 默认 ascend910b，安装依赖+编译+安装"
+    echo "  bash build_flash_linear_attention.sh                       # 默认 ascend910_93，安装依赖+编译+安装"
     echo "  bash build_flash_linear_attention.sh --soc ascend950       # 指定 A5 芯片"
     echo "  bash build_flash_linear_attention.sh --no-build            # 仅安装依赖，不编译"
     echo "  bash build_flash_linear_attention.sh --no-install          # 编译但不安装 wheel"
@@ -82,7 +82,8 @@ show_help() {
 # 参数解析
 # ============================================================================
 parse_args() {
-    for arg in "$@"; do
+    while [ "$#" -gt 0 ]; do
+        arg="$1"
         case "$arg" in
             --soc=*)
                 SOC="${arg#*=}"
@@ -113,6 +114,7 @@ parse_args() {
                 exit 1
                 ;;
         esac
+        shift
     done
 }
 
