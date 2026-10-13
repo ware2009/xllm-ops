@@ -4,3 +4,7 @@
 [submodule "third_party/pto-isa"]
 	path = third_party/pto-isa
 	url = https://gitcode.com/cann/pto-isa.git
+[submodule "third_party/flash-linear-attention-npu"]
+	path = third_party/flash-linear-attention-npu
+	url = https://github.com/flashserve/flash-linear-attention-npu.git
+	branch = v26.9.1

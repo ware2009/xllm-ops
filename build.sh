@@ -286,6 +286,29 @@ update_vendor_config() {
 }
 
 # ============================================================================
+# 构建 flash-linear-attention-npu 三方库
+# ============================================================================
+build_flash_linear_attention() {
+    local fla_script="${BASE_DIR}/build_flash_linear_attention.sh"
+    if [ ! -f "${fla_script}" ]; then
+        echo "[WARN] flash-linear-attention-npu build script not found: ${fla_script}, skip"
+        return 0
+    fi
+
+    # 从 build.sh 的 SOC 解析结果中取第一个芯片类型传给子脚本。
+    # SOC_VERSION_LIST 由 run_build 中的 resolve_soc_version_list 填充（本函数在其后调用）。
+    local soc="${SOC_VERSION_LIST[0]}"
+    if [ -z "${soc}" ]; then
+        echo "[WARN] SOC not resolved, flash-linear-attention-npu falls back to sub-script default ascend910b"
+        bash "${fla_script}"
+        return 0
+    fi
+
+    echo "[INFO] build flash-linear-attention-npu (SOC=${soc})"
+    bash "${fla_script}" --soc "${soc}"
+}
+
+# ============================================================================
 # 主流程
 # ============================================================================
 main() {
@@ -294,6 +317,7 @@ main() {
     run_build
     install_artifacts
     update_vendor_config
+    build_flash_linear_attention
 }
 
 main "$@"
