@@ -240,6 +240,14 @@ build_ops_transformer() {
         return 0
     fi
 
+    # 子模块未初始化时 requirements.txt 缺失，会导致主 build 失败，提前检查并提示
+    local transformer_requirements="${BASE_DIR}/third_party/ops-transformer/requirements.txt"
+    if [[ ! -f "${transformer_requirements}" ]]; then
+        echo "[ERROR] ops-transformer 子模块未初始化 (缺失 ${transformer_requirements})"
+        echo "        请先执行: git submodule update --init --recursive"
+        exit 1
+    fi
+
     # 将 SOC_VERSION_LIST 数组转换为逗号分隔字符串
     local soc_str=""
     local soc_ver
@@ -250,6 +258,20 @@ build_ops_transformer() {
             soc_str="${soc_str},${soc_ver}"
         fi
     done
+
+    # 310P (ascend310p) 目标无 quant_lightning_indexer_v2 等算子注册，
+    # 无条件构建 transformer 会导致编译失败，故跳过并提示。
+    local has_310p="false"
+    for soc_ver in "${SOC_VERSION_LIST[@]}"; do
+        if [[ "${soc_ver}" == "ascend310p" ]]; then
+            has_310p="true"
+            break
+        fi
+    done
+    if [[ "${has_310p}" == "true" ]]; then
+        echo ">>> Skip ops-transformer build: ascend310p 无 quant_lightning_indexer_v2 等算子注册"
+        return 0
+    fi
 
     echo ">>> Building ops-transformer for SOC=${soc_str}"
     stdbuf -oL bash "${transformer_script}" --soc="${soc_str}" all
@@ -311,15 +333,20 @@ update_vendor_config() {
         echo "[INFO] created ${config_file}"
     else
         # 已存在：把当前 vendor 合并进 load_priority（若不存在则前置加入）
+        # 注意：只读取非注释行的 load_priority，避免误读注释行。
         local found_vendors
-        found_vendors="$(grep -w 'load_priority' "${config_file}" | cut --only-delimited -d'=' -f2-)"
+        found_vendors="$(grep -E '^[[:space:]]*load_priority[[:space:]]*=' "${config_file}" | cut --only-delimited -d'=' -f2- | head -n 1)"
         if echo ",${found_vendors}," | grep -q ",${vendor_name},"; then
             echo "[INFO] ${vendor_name} already in load_priority, skip"
         else
             if [ -z "${found_vendors}" ]; then
-                echo "load_priority=${vendor_name}" > "${config_file}"
+                # 追加而非截断：避免覆盖已有其它配置行
+                echo "load_priority=${vendor_name}" >> "${config_file}"
             else
-                sed -i "s@load_priority=${found_vendors}@load_priority=${vendor_name},${found_vendors}@g" "${config_file}"
+                # 用 awk 做字面量精确替换，避免 sed 分隔符/正则元字符(&、@、.等)被误解释
+                awk -v old="${found_vendors}" -v new="${vendor_name},${found_vendors}" \
+                    '{ gsub("load_priority=" old, "load_priority=" new); print }' \
+                    "${config_file}" > "${config_file}.tmp" && mv "${config_file}.tmp" "${config_file}"
             fi
             echo "[INFO] updated ${config_file}"
         fi

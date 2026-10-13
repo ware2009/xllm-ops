@@ -93,6 +93,12 @@ build_ops() {
     echo "[Step 2/3] 执行编译"
     echo "============================================================"
 
+    # 310P (ascend310p) 目标无 quant_lightning_indexer_v2 等算子注册，跳过编译
+    if [[ "${SOC}" == "ascend310p" || "${SOC}" == *",ascend310p"* || "${SOC}" == "ascend310p,"* ]]; then
+        echo "[WARN] SOC=${SOC} 含 ascend310p，无 quant_lightning_indexer_v2 等算子注册，跳过编译"
+        return 0
+    fi
+
     if [[ ! -d "${OPS_TRANSFORMER_DIR}" ]]; then
         echo "错误: 未找到 ops-transformer 目录 ${OPS_TRANSFORMER_DIR}"
         echo "请先执行 git submodule update --init --recursive 拉取子模块。"
@@ -119,6 +125,14 @@ build_ops() {
 
     cd "${OPS_TRANSFORMER_DIR}"
 
+    # 若关闭 torch_extension 打包，清理 dist/ 残留的旧 whl，避免 --pkg 误打包
+    if [[ "${BUILD_TORCH_EXTENSION}" != "true" ]]; then
+        if [[ -d "${OPS_TRANSFORMER_DIR}/torch_extension/dist" ]]; then
+            echo "[INFO] --no-torch-extension: 清理 torch_extension/dist/ 残留 whl"
+            rm -rf "${OPS_TRANSFORMER_DIR}/torch_extension/dist"
+        fi
+    fi
+
     # 若开启 torch_extension 打包, 先单独构建 whl 到 torch_extension/dist/
     # 随后 --pkg 打包时 package.cmake 会自动把 dist 里的 whl 一并打进 .run 包
     if [[ "${BUILD_TORCH_EXTENSION}" == "true" ]]; then
@@ -135,15 +149,14 @@ build_ops() {
             echo ""
         fi
 
-        local whl_cmd="bash build.sh --torch_extension_only --vendor_name=${VENDOR_NAME} --ops=${ops_str}"
         echo "[INFO] 构建 torch_extension whl:"
-        echo "  ${whl_cmd}"
+        echo "  bash build.sh --torch_extension_only --vendor_name=${VENDOR_NAME} --ops=${ops_str}"
         echo ""
-        eval "${whl_cmd}" || { cd "${SCRIPT_DIR}"; exit 1; }
+        bash build.sh --torch_extension_only --vendor_name="${VENDOR_NAME}" --ops="${ops_str}" || { cd "${SCRIPT_DIR}"; exit 1; }
         echo ""
     fi
 
-    eval "${build_cmd}"
+    bash build.sh --pkg --soc="${SOC}" --vendor_name="${VENDOR_NAME}" --ops="${ops_str}" -j"${JOBS}" -"${OPT_LEVEL}"
     cd "${SCRIPT_DIR}"
 
     echo "编译完成。"
@@ -225,15 +238,20 @@ update_vendor_config() {
         echo "[INFO] created ${config_file}"
     else
         # 已存在：把当前 vendor 合并进 load_priority（若不存在则前置加入）
+        # 注意：只读取非注释行的 load_priority，避免误读注释行。
         local found_vendors
-        found_vendors="$(grep -w 'load_priority' "${config_file}" | cut --only-delimited -d'=' -f2-)"
+        found_vendors="$(grep -E '^[[:space:]]*load_priority[[:space:]]*=' "${config_file}" | cut --only-delimited -d'=' -f2- | head -n 1)"
         if echo ",${found_vendors}," | grep -q ",${vendor_name},"; then
             echo "[INFO] ${vendor_name} already in load_priority, skip"
         else
             if [ -z "${found_vendors}" ]; then
-                echo "load_priority=${vendor_name}" > "${config_file}"
+                # 追加而非截断：避免覆盖已有其它配置行
+                echo "load_priority=${vendor_name}" >> "${config_file}"
             else
-                sed -i "s@load_priority=${found_vendors}@load_priority=${vendor_name},${found_vendors}@g" "${config_file}"
+                # 用 awk 做字面量精确替换，避免 sed 分隔符/正则元字符(&、@、.等)被误解释
+                awk -v old="${found_vendors}" -v new="${vendor_name},${found_vendors}" \
+                    '{ gsub("load_priority=" old, "load_priority=" new); print }' \
+                    "${config_file}" > "${config_file}.tmp" && mv "${config_file}.tmp" "${config_file}"
             fi
             echo "[INFO] updated ${config_file}"
         fi
@@ -244,7 +262,7 @@ update_vendor_config() {
 # 解析参数: 支持 --soc=xxx 覆盖默认 SOC, 其余位置参数作为 action
 # -----------------------------------------------------------------------------
 parse_args() {
-    local action="all"
+    ACTION="all"
 
     for arg in "$@"; do
         case "${arg}" in
@@ -261,7 +279,11 @@ parse_args() {
                 BUILD_TORCH_EXTENSION="false"
                 ;;
             install|build|all)
-                action="${arg}"
+                ACTION="${arg}"
+                ;;
+            *)
+                echo "错误: 未知参数 '${arg}'" >&2
+                ACTION="__invalid__"
                 ;;
         esac
     done
@@ -278,16 +300,14 @@ parse_args() {
         fi
         idx=$((idx + 1))
     done
-
-    echo "${action}"
 }
 
 # -----------------------------------------------------------------------------
 # 主流程
 # -----------------------------------------------------------------------------
 main() {
-    local action
-    action="$(parse_args "$@")"
+    parse_args "$@"
+    local action="${ACTION}"
 
     # 将 OPS 数组转换为逗号分隔字符串用于显示
     local ops_str=""
