@@ -49,6 +49,10 @@ JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 16)"
 # 编译优化级别 (默认 O3)
 OPT_LEVEL="O3"
 
+# 是否将 torch_extension 打包进 .run 安装包 (默认开启)
+# 开启时: 先构建 whl 到 torch_extension/dist/, 再由 --pkg 打包进同一个 .run 包
+BUILD_TORCH_EXTENSION="true"
+
 # -----------------------------------------------------------------------------
 # 路径定义
 # -----------------------------------------------------------------------------
@@ -113,6 +117,18 @@ build_ops() {
     echo ""
 
     cd "${OPS_TRANSFORMER_DIR}"
+
+    # 若开启 torch_extension 打包, 先单独构建 whl 到 torch_extension/dist/
+    # 随后 --pkg 打包时 package.cmake 会自动把 dist 里的 whl 一并打进 .run 包
+    if [[ "${BUILD_TORCH_EXTENSION}" == "true" ]]; then
+        local whl_cmd="bash build.sh --torch_extension_only --vendor_name=${VENDOR_NAME} --ops=${ops_str}"
+        echo "[INFO] 构建 torch_extension whl:"
+        echo "  ${whl_cmd}"
+        echo ""
+        eval "${whl_cmd}" || { cd "${SCRIPT_DIR}"; exit 1; }
+        echo ""
+    fi
+
     eval "${build_cmd}"
     cd "${SCRIPT_DIR}"
 
@@ -224,6 +240,12 @@ parse_args() {
             --soc)
                 # 需要取下一个参数, 在第二轮中处理
                 ;;
+            --torch-extension)
+                BUILD_TORCH_EXTENSION="true"
+                ;;
+            --no-torch-extension)
+                BUILD_TORCH_EXTENSION="false"
+                ;;
             install|build|all)
                 action="${arg}"
                 ;;
@@ -288,10 +310,12 @@ main() {
             install_package
             ;;
         *)
-            echo "用法: bash build_ops_transformer.sh [install|build|all]"
+            echo "用法: bash build_ops_transformer.sh [install|build|all] [--soc=xxx] [--torch-extension|--no-torch-extension]"
             echo "  install  安装依赖包并安装编译产物"
             echo "  build    仅执行编译"
             echo "  all      安装依赖 + 编译 + 安装产物 (默认)"
+            echo "  --torch-extension      将 torch_extension whl 一并打包进 .run 包 (默认开启)"
+            echo "  --no-torch-extension   不打包 torch_extension whl"
             exit 1
             ;;
     esac
