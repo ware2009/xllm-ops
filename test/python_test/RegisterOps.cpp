@@ -224,6 +224,9 @@ at::Tensor x_flash_attention_infer_impl_npu(
   // aclnn expects layout as char* (1 slot). Passing c10::string_view
   // (16 bytes = 2 slots) shifts subsequent args -> SIGSEGV.
   char* layout_c = const_cast<char*>(layout.c_str());
+  // ConvertTypes(Ts&...) binds by lvalue ref; optional args must be named
+  // lvalues (an rvalue temporary fails to compile).
+  const c10::optional<at::Tensor> kvstarts_opt = c10::nullopt;
   EXEC_NPU_CMD(aclnnXFlashAttentionInfer,
                query,
                key_cache,
@@ -233,7 +236,7 @@ at::Tensor x_flash_attention_infer_impl_npu(
                actual_q_lens,
                actual_kv_lens,
                extra_tiling,
-               c10::optional<at::Tensor>{},  // kvstarts: full KV prefix
+               kvstarts_opt,  // kvstarts: full KV prefix
                layout_c,
                qHead,
                kvHead,
