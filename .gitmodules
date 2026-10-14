@@ -8,3 +8,6 @@
 	path = third_party/flash-linear-attention-npu
 	url = https://github.com/flashserve/flash-linear-attention-npu.git
 	branch = v26.9.1
+[submodule "third_party/ops-transformer"]
+	path = third_party/ops-transformer
+	url = https://gitcode.com/cann/ops-transformer.git
