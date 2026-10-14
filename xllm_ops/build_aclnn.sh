@@ -124,7 +124,6 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "lightning_indexer_quant_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
-        "kv_quant_sparse_flash_attention_vllm"
         "hc_pre_sinkhorn"
         "hc_pre_inv_rms"
         "hc_post"
