@@ -384,6 +384,33 @@ def multi_latent_attention_npu(query, query_rope, kv_cache, kv_cache_rope,
     )
 
 
+# kv_quant_sparse_flash_attention_vllm: paged KV int8-quant sparse flash
+# attention (vLLM variant). Returns (attention_out, softmax_max, softmax_sum);
+# softmax outputs are empty unless return_softmax_lse=True.
+# layout_query: "BSND" (query 4D) or "TND" (query 3D).
+# layout_kv: e.g. "BSND" / "PA_BSND" / "PA_ND".
+def kv_quant_sparse_flash_attention_vllm_npu(
+        query, key, value, sparse_indices,
+        scale_value=1.0, key_quant_mode=1, value_quant_mode=1,
+        key_dequant_scale=None, value_dequant_scale=None,
+        block_table=None, actual_seq_lengths_query=None,
+        actual_seq_lengths_kv=None,
+        sparse_block_size=1, layout_query="BSND", layout_kv="BSND",
+        sparse_mode=3, pre_tokens=9223372036854775807,
+        next_tokens=9223372036854775807, attention_mode=0,
+        quant_scale_repo_mode=1, tile_size=128, rope_head_dim=64,
+        return_softmax_lse=False):
+    return custom_ops_lib.kv_quant_sparse_flash_attention_vllm(
+        query, key, value, sparse_indices,
+        scale_value, key_quant_mode, value_quant_mode,
+        key_dequant_scale, value_dequant_scale,
+        block_table, actual_seq_lengths_query, actual_seq_lengths_kv,
+        sparse_block_size, layout_query, layout_kv,
+        sparse_mode, pre_tokens, next_tokens, attention_mode,
+        quant_scale_repo_mode, tile_size, rope_head_dim,
+        return_softmax_lse)
+
+
 # mega_chunk_gdn
 def mega_chunk_gdn_npu(q, k, v, g, beta, scale=None, initial_state=None,
                        output_final_state=False, cu_seqlens=None):
