@@ -212,12 +212,12 @@ def add_rms_norm_bias_npu(x1, x2, gamma, beta=None, eps=1e-6):
     return custom_ops_lib.add_rms_norm_bias(x1, x2, gamma, beta, eps)
 
 
-# rms_norm_cast_vllm: RMSNorm + fp32 cast (dual output).
+# rms_norm_cast_va: RMSNorm + fp32 cast (dual output).
 #   rstd = 1/sqrt(mean(x^2, -1) + eps); y = x*rstd*gamma (input dtype);
 #   y_fp32 = y widened to fp32 (already-rounded result for MoE routing).
 #   x:(...,H) fp16/bf16, gamma:(H,) same dtype. epsilon default 1e-6.
-def rms_norm_cast_vllm_npu(x, gamma, epsilon=1e-6):
-    return custom_ops_lib.rms_norm_cast_vllm(x, gamma, epsilon)
+def rms_norm_cast_va_npu(x, gamma, epsilon=1e-6):
+    return custom_ops_lib.rms_norm_cast_va(x, gamma, epsilon)
 
 
 def gamma_add_rms_norm_npu(x1, x2, gamma, eps=1e-6,
@@ -392,12 +392,12 @@ def multi_latent_attention_npu(query, query_rope, kv_cache, kv_cache_rope,
     )
 
 
-# kv_quant_sparse_flash_attention_vllm: paged KV int8-quant sparse flash
+# kv_quant_sparse_flash_attention_va: paged KV int8-quant sparse flash
 # attention (vLLM variant). Returns (attention_out, softmax_max, softmax_sum);
 # softmax outputs are empty unless return_softmax_lse=True.
 # layout_query: "BSND" (query 4D) or "TND" (query 3D).
 # layout_kv: e.g. "BSND" / "PA_BSND" / "PA_ND".
-def kv_quant_sparse_flash_attention_vllm_npu(
+def kv_quant_sparse_flash_attention_va_npu(
         query, key, value, sparse_indices,
         scale_value=1.0, key_quant_mode=1, value_quant_mode=1,
         key_dequant_scale=None, value_dequant_scale=None,
@@ -408,7 +408,7 @@ def kv_quant_sparse_flash_attention_vllm_npu(
         next_tokens=9223372036854775807, attention_mode=0,
         quant_scale_repo_mode=1, tile_size=128, rope_head_dim=64,
         return_softmax_lse=False):
-    return custom_ops_lib.kv_quant_sparse_flash_attention_vllm(
+    return custom_ops_lib.kv_quant_sparse_flash_attention_va(
         query, key, value, sparse_indices,
         scale_value, key_quant_mode, value_quant_mode,
         key_dequant_scale, value_dequant_scale,

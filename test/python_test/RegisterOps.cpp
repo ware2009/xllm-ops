@@ -298,13 +298,13 @@ at::Tensor multi_latent_attention_impl_npu(
   return atten_out;
 }
 
-// kv_quant_sparse_flash_attention_vllm: paged KV int8-quant sparse flash
+// kv_quant_sparse_flash_attention_va: paged KV int8-quant sparse flash
 // attention (vLLM variant, separate NoPE/RoPE head dim). Signature mirrors
-// xllm_ops op_adpt kv_quant_sparse_flash_attention_vllm_torch_adpt.h.
+// xllm_ops op_adpt kv_quant_sparse_flash_attention_va_torch_adpt.h.
 // Returns (attention_out, softmax_max, softmax_sum); softmax outputs are
 // empty ({0}) unless return_softmax_lse is true.
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-kv_quant_sparse_flash_attention_vllm_impl_npu(
+kv_quant_sparse_flash_attention_va_impl_npu(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
@@ -382,7 +382,7 @@ kv_quant_sparse_flash_attention_vllm_impl_npu(
   char* layout_query_ptr = const_cast<char*>(layout_query.c_str());
   char* layout_kv_ptr = const_cast<char*>(layout_kv.c_str());
 
-  EXEC_NPU_CMD(aclnnKvQuantSparseFlashAttentionVllm,
+  EXEC_NPU_CMD(aclnnKvQuantSparseFlashAttentionVa,
                query,
                key,
                value,
@@ -924,7 +924,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_bias_impl_npu(
   return std::make_tuple(y, rstd, x);
 }
 
-std::tuple<at::Tensor, at::Tensor> rms_norm_cast_vllm_impl_npu(
+std::tuple<at::Tensor, at::Tensor> rms_norm_cast_va_impl_npu(
     const at::Tensor& x,
     const at::Tensor& gamma,
     double epsilon) {
@@ -933,7 +933,7 @@ std::tuple<at::Tensor, at::Tensor> rms_norm_cast_vllm_impl_npu(
   at::Tensor y = at::empty(x.sizes(), x.options());
   at::Tensor y_fp32 =
       at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float));
-  EXEC_NPU_CMD(aclnnRmsNormCastVllm, x, gamma, epsilon, y, y_fp32);
+  EXEC_NPU_CMD(aclnnRmsNormCastVa, x, gamma, epsilon, y, y_fp32);
   return std::make_tuple(y, y_fp32);
 }
 
@@ -2271,7 +2271,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("inplace_partial_rotary_mul", &inplace_partial_rotary_mul_impl_npu, "inplace_partial_rotary_mul");
   m.def("hc_post", &hc_post_impl_npu, "hc_post");
   m.def("add_rms_norm_bias", &add_rms_norm_bias_impl_npu, "add_rms_norm_bias");
-  m.def("rms_norm_cast_vllm", &rms_norm_cast_vllm_impl_npu, "rms_norm_cast_vllm");
+  m.def("rms_norm_cast_va", &rms_norm_cast_va_impl_npu, "rms_norm_cast_va");
   m.def("gamma_add_rms_norm",
         &gamma_add_rms_norm_impl_npu,
         "gamma_add_rms_norm");
@@ -2290,9 +2290,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("laser_attention", &laser_attention_impl_npu, "laser_attention");
   m.def("x_flash_attention_infer", &x_flash_attention_infer_impl_npu, "x_flash_attention_infer");
   m.def("multi_latent_attention", &multi_latent_attention_impl_npu, "multi_latent_attention");
-  m.def("kv_quant_sparse_flash_attention_vllm",
-        &kv_quant_sparse_flash_attention_vllm_impl_npu,
-        "kv_quant_sparse_flash_attention_vllm");
+  m.def("kv_quant_sparse_flash_attention_va",
+        &kv_quant_sparse_flash_attention_va_impl_npu,
+        "kv_quant_sparse_flash_attention_va");
   m.def("rms_norm_dynamic_quant", &rms_norm_dynamic_quant_impl_npu, "rms_norm_dynamic_quant");
   m.def("lightning_indexer_quant", &lightning_indexer_quant_impl_npu, "lightning_indexer_quant");
   m.def("compressor", &compressor_impl_npu, "compressor");
