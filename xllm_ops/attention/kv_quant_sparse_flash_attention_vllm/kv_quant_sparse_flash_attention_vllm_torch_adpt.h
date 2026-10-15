@@ -16,7 +16,7 @@
 #ifndef KV_QUANT_SPARSE_FLASH_ATTENTION_VLLM_TORCH_ADPT_H
 #define KV_QUANT_SPARSE_FLASH_ATTENTION_VLLM_TORCH_ADPT_H
 
-namespace vllm_ascend {
+namespace xllm_ops {
 
 namespace {
 
@@ -163,6 +163,6 @@ npu_kv_quant_sparse_flash_attention_vllm(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(
         attention_output, softmax_max, softmax_sum);
 }
-}  // namespace vllm_ascend
+}  // namespace xllm_ops
 
 #endif  // KV_QUANT_SPARSE_FLASH_ATTENTION_VLLM_TORCH_ADPT_H
