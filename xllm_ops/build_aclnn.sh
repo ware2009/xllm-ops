@@ -209,8 +209,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "dispatch_gmm_combine_decode"
         "dequant_swiglu_quant"  ## 已在 CANN 中内置，见 aarch64-linux/include/aclnnop/aclnn_dequant_swiglu_quant.h
         "scatter_nd_update_v2"
-        "kv_quant_sparse_flash_attention_vllm"
-        "rms_norm_cast_vllm"
+        "kv_quant_sparse_flash_attention_va"
+        "rms_norm_cast_va"
 
          ### JD's in-house operators ####
         "beam_search_group"
