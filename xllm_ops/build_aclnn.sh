@@ -110,7 +110,6 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
     log "catlass include=${ABSOLUTE_CATLASS_PATH}"
 
     CUSTOM_OPS_ARRAY=(
-        "sparse_flash_attention"
         "sparse_flash_attention_lse"
         "moe_init_routing_custom"
         "moe_gating_top_k"
@@ -119,8 +118,10 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         "gamma_add_rms_norm"
         "lightning_indexer_quant"
         "compressor"
-        "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
+        "quant_lightning_indexer"  ## 已在 CANN 中内置
         "quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2_va"
+        "quant_lightning_indexer_v2_metadata_va"
         "lightning_indexer_quant_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
@@ -186,7 +187,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     fi
     
     CUSTOM_OPS_ARRAY=(
-        "sparse_flash_attention"
         "sparse_flash_attention_lse"
         "moe_init_routing_custom"
         "moe_gating_top_k"
@@ -196,12 +196,15 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "lightning_indexer_quant"
         "lightning_indexer_quant_metadata"
         "compressor"
-        "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
+        "quant_lightning_indexer"  ## 已在 CANN 中内置
         "quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2_va"
+        "quant_lightning_indexer_v2_metadata_va"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
         "hc_pre_inv_rms"
+        "hc_pre_va"
         "hc_post"
         "rms_norm_dynamic_quant"
         "inplace_partial_rotary_mul"
@@ -283,7 +286,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "lightning_indexer_quant" 
         "lightning_indexer_quant_metadata"
         "compressor"
-        "quant_lightning_indexer"  ## 已在 CANN 中内置，见 opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/quant_lightning_indexer
+        "quant_lightning_indexer"  ## 已在 CANN 中内置
         "quant_lightning_indexer_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"

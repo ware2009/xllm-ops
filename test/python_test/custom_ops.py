@@ -195,6 +195,23 @@ def scatter_nd_update_v2_npu(var, indices, updates, strides):
     return custom_ops_lib.scatter_nd_update_v2(var, indices, updates, strides)
 
 
+# quant_lightning_indexer_v2_metadata_va (AICPU-only metadata producer for the
+# QLI v3 candidate path): builds the 1024 x int32 per-core tiling metadata that
+# the fused top-k kernel consumes. Every tensor input is optional; the output
+# device is resolved from the first present tensor. Returns the 1024-length
+# int32 metadata tensor.
+def quant_lightning_indexer_v2_metadata_va_npu(
+        num_heads_q, num_heads_k, head_dim, topk, quant_mode,
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k,
+        batch_size, max_seqlen_q, max_seqlen_k, layout_q, layout_k,
+        mask_mode, cmp_ratio):
+    return custom_ops_lib.quant_lightning_indexer_v2_metadata_va(
+        num_heads_q, num_heads_k, head_dim, topk, quant_mode,
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cmp_residual_k,
+        batch_size, max_seqlen_q, max_seqlen_k, layout_q, layout_k,
+        mask_mode, cmp_ratio)
+
+
 # inplace_partial_rotary_mul (in-place interleaved partial RoPE on x[..., start:end])
 #   x: [B, S, N, allHeadDim]; cos/sin: [B, S, 1, headDim] with headDim=end-start
 #   mode must be 1 (interleave); partial_slice=[start, end]
@@ -206,6 +223,10 @@ def inplace_partial_rotary_mul_npu(x, cos, sin, mode, partial_slice):
 #   y[b,hc,d] = sum_j residual[b,j,d]*comb[b,j,hc] + x[b,d]*post[b,hc])
 def hc_post_npu(x, residual, post, comb):
     return custom_ops_lib.hc_post(x, residual, post, comb)
+
+
+def hc_post_va_npu(x, residual, post, comb):
+    return custom_ops_lib.hc_post_va(x, residual, post, comb)
 
 
 def add_rms_norm_bias_npu(x1, x2, gamma, beta=None, eps=1e-6):
@@ -224,6 +245,22 @@ def gamma_add_rms_norm_npu(x1, x2, gamma, eps=1e-6,
                            add_gamma_offset=False):
     return custom_ops_lib.gamma_add_rms_norm(
         x1, x2, gamma, eps, add_gamma_offset)
+
+
+def hc_pre_va_npu(
+    hidden: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre_mix: torch.Tensor | None = None,
+    hc_mult: int = 4,
+    hc_sinkhorn_iters: int = 20,
+    norm_eps: float = 1e-6,
+    hc_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return custom_ops_lib.hc_pre_va(
+        hidden, hc_fn, hc_scale, hc_base, pre_mix, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps
+    )
 
 
 # hc_pre_sinkhorn (per-token: pre/post gating + sinkhorn-normalized comb_frag)

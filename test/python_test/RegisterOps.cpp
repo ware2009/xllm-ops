@@ -13,9 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <dlfcn.h>
 #include <torch/library.h>
 
-#include <dlfcn.h>
+#include <cmath>
 
 #include "acl/acl_rt.h"
 #include "pytorch_npu_helper.hpp"
@@ -872,6 +873,67 @@ at::Tensor& scatter_nd_update_v2_impl_npu(
   return var;
 }
 
+at::Tensor quant_lightning_indexer_v2_metadata_va_impl_npu(
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t topk,
+    int64_t quant_mode,
+    const c10::optional<at::Tensor>& cu_seqlens_q,
+    const c10::optional<at::Tensor>& cu_seqlens_k,
+    const c10::optional<at::Tensor>& seqused_q,
+    const c10::optional<at::Tensor>& seqused_k,
+    const c10::optional<at::Tensor>& cmp_residual_k,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    std::string layout_q,
+    std::string layout_k,
+    int64_t mask_mode,
+    int64_t cmp_ratio) {
+  // Every Tensor argument may be omitted, so the output device has to be
+  // resolved explicitly: the first present optional Tensor wins.
+  at::Device output_device = at::Device("npu");
+  if (cu_seqlens_q.has_value() && cu_seqlens_q.value().defined()) {
+    output_device = cu_seqlens_q.value().device();
+  } else if (cu_seqlens_k.has_value() && cu_seqlens_k.value().defined()) {
+    output_device = cu_seqlens_k.value().device();
+  } else if (seqused_q.has_value() && seqused_q.value().defined()) {
+    output_device = seqused_q.value().device();
+  } else if (seqused_k.has_value() && seqused_k.value().defined()) {
+    output_device = seqused_k.value().device();
+  } else if (cmp_residual_k.has_value() && cmp_residual_k.value().defined()) {
+    output_device = cmp_residual_k.value().device();
+  }
+
+  at::Tensor output = at::zeros({1024},
+      at::TensorOptions().dtype(at::kInt).device(output_device));
+
+  char* layout_q_ptr = const_cast<char*>(layout_q.c_str());
+  char* layout_k_ptr = const_cast<char*>(layout_k.c_str());
+
+  EXEC_NPU_CMD(aclnnQuantLightningIndexerV2MetadataVa,
+               cu_seqlens_q,
+               cu_seqlens_k,
+               seqused_q,
+               seqused_k,
+               cmp_residual_k,
+               num_heads_q,
+               num_heads_k,
+               head_dim,
+               topk,
+               quant_mode,
+               batch_size,
+               max_seqlen_q,
+               max_seqlen_k,
+               layout_q_ptr,
+               layout_k_ptr,
+               mask_mode,
+               cmp_ratio,
+               output);
+  return output;
+}
+
 std::tuple<at::Tensor&, at::Tensor&> reshape_and_cache_a5_impl_npu(
     const at::Tensor& key,
     const at::Tensor& value,
@@ -896,6 +958,16 @@ at::Tensor hc_post_impl_npu(const at::Tensor& x,
   // y has the same shape / dtype as residual ([bs, hc, d]).
   at::Tensor y = at::empty(residual.sizes(), residual.options());
   EXEC_NPU_CMD(aclnnHcPost, x, residual, post, comb, y);
+  return y;
+}
+
+at::Tensor hc_post_va_impl_npu(const at::Tensor& x,
+                               const at::Tensor& residual,
+                               const at::Tensor& post,
+                               const at::Tensor& comb) {
+  // y has the same shape / dtype as residual ([bs, hc, d]).
+  at::Tensor y = at::empty(residual.sizes(), residual.options());
+  EXEC_NPU_CMD(aclnnHcPostVa, x, residual, post, comb, y);
   return y;
 }
 
@@ -1196,6 +1268,80 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_sinkhorn_impl_npu(
                post,
                comb_frag);
   return std::make_tuple(y, post, comb_frag);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hc_pre_va_impl_npu(
+    const at::Tensor& hidden,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double norm_eps,
+    double hc_eps) {
+  TORCH_CHECK(hidden.device().type() == torch_npu::utils::get_npu_device_type(),
+              "hidden must be on an NPU");
+  TORCH_CHECK(hidden.dim() == 3 || hidden.dim() == 4,
+              "hidden must have rank 3 or 4");
+  TORCH_CHECK(hc_mult == 4 && hidden.size(-2) == hc_mult,
+              "hc_mult and hidden.size(-2) must equal 4");
+  TORCH_CHECK(hidden.numel() > 0 && hidden.scalar_type() == at::kBFloat16,
+              "hidden must be nonempty BF16");
+  TORCH_CHECK(hc_fn.dim() == 2 && hc_fn.size(0) == 24 &&
+                  hc_fn.size(1) == hc_mult * hidden.size(-1),
+              "hc_fn must have shape [24, 4 * hidden_size]");
+  TORCH_CHECK(hc_scale.dim() == 1 && hc_scale.size(0) == 3,
+              "hc_scale must have shape [3]");
+  TORCH_CHECK(hc_base.dim() == 1 && hc_base.size(0) == 24,
+              "hc_base must have shape [24]");
+  TORCH_CHECK(hc_sinkhorn_iters > 0 && std::isfinite(norm_eps) &&
+                  norm_eps > 0 && std::isfinite(hc_eps) && hc_eps > 0,
+              "iterations and finite epsilon values must be positive");
+  for (const at::Tensor& tensor : {hidden, hc_fn, hc_scale, hc_base}) {
+    TORCH_CHECK(tensor.device() == hidden.device() && tensor.is_contiguous(),
+                "all inputs must be contiguous on the same NPU");
+  }
+  for (const at::Tensor& tensor : {hc_fn, hc_scale, hc_base}) {
+    TORCH_CHECK(tensor.scalar_type() == at::kFloat,
+                "hc_fn, hc_scale and hc_base must be FP32");
+  }
+  std::vector<int64_t> batch_shape(hidden.sizes().begin(),
+                                   hidden.sizes().end() - 2);
+  std::vector<int64_t> output_shape = batch_shape;
+  output_shape.push_back(hidden.size(-1));
+  std::vector<int64_t> mix_shape = batch_shape;
+  mix_shape.push_back(hc_mult);
+  std::vector<int64_t> comb_shape = mix_shape;
+  comb_shape.push_back(hc_mult);
+  if (pre_mix.has_value()) {
+    TORCH_CHECK(pre_mix->sizes().vec() == mix_shape &&
+                    pre_mix->scalar_type() == at::kFloat &&
+                    pre_mix->device() == hidden.device() &&
+                    pre_mix->is_contiguous(),
+                "pre_mix must be contiguous FP32 with shape hidden.shape[:-1] "
+                "on the same NPU");
+  }
+  at::Tensor output = at::empty(output_shape, hidden.options());
+  at::Tensor post = at::empty(mix_shape, hidden.options().dtype(at::kFloat));
+  at::Tensor comb_frag =
+      at::empty(comb_shape, hidden.options().dtype(at::kFloat));
+  at::Tensor pre = at::empty(mix_shape, hidden.options().dtype(at::kFloat));
+  EXEC_NPU_CMD(aclnnHcPreVa,
+               hidden,
+               hc_fn,
+               hc_scale,
+               hc_base,
+               pre_mix,
+               hc_mult,
+               hc_sinkhorn_iters,
+               hc_eps,
+               norm_eps,
+               output,
+               post,
+               comb_frag,
+               pre);
+  return std::make_tuple(output, post, comb_frag, pre);
 }
 
 at::Tensor hc_pre_inv_rms_impl_npu(const at::Tensor& x, double epsilon) {
@@ -2265,11 +2411,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "mtp_prepare_next_draft");
   m.def("convert_kv_cache_format", &convert_kv_cache_format_impl_npu, "convert_kv_cache_format");
   m.def("scatter_nd_update_v2", &scatter_nd_update_v2_impl_npu, "scatter_nd_update_v2");
+  m.def("quant_lightning_indexer_v2_metadata_va",
+        &quant_lightning_indexer_v2_metadata_va_impl_npu,
+        "quant_lightning_indexer_v2_metadata_va");
   m.def("reshape_and_cache_a5",
         &reshape_and_cache_a5_impl_npu,
         "reshape_and_cache_a5");
   m.def("inplace_partial_rotary_mul", &inplace_partial_rotary_mul_impl_npu, "inplace_partial_rotary_mul");
   m.def("hc_post", &hc_post_impl_npu, "hc_post");
+  m.def("hc_post_va", &hc_post_va_impl_npu, "hc_post_va");
   m.def("add_rms_norm_bias", &add_rms_norm_bias_impl_npu, "add_rms_norm_bias");
   m.def("rms_norm_cast_va", &rms_norm_cast_va_impl_npu, "rms_norm_cast_va");
   m.def("gamma_add_rms_norm",
@@ -2278,6 +2428,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_init_routing_custom", &moe_init_routing_custom_impl_npu, "moe_init_routing_custom");
   m.def("moe_init_routing_v3", &moe_init_routing_v3_impl_npu, "moe_init_routing_v3");
   m.def("hc_pre_sinkhorn", &hc_pre_sinkhorn_impl_npu, "hc_pre_sinkhorn");
+  m.def("hc_pre_va", &hc_pre_va_impl_npu, "hc_pre_va");
   m.def("pp_matmul_opt", &pp_matmul_opt_impl_npu, "pp_matmul_opt");
   m.def("moe_grouped_matmul", &moe_grouped_matmul_impl_npu, "moe_grouped_matmul");
   m.def("index_group_matmul", &index_group_matmul_impl_npu, "index_group_matmul");

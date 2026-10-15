@@ -31,6 +31,9 @@ show_help() {
     echo '  -c|--compute-unit   Specifies the chip type. If there are multiple values, separate'
     echo '                       them with semicolons and use quotation marks. Default: ascend910b'
     echo '                       e.g. -c "ascend910b" or -c "ascend910b;ascend310p"'
+    echo '  --build-transformer  Build ops-transformer third-party ops (default: enabled)'
+    echo '  --no-build-transformer  Skip building ops-transformer third-party ops'
+    echo '  --no-build-flash     Skip building flash-linear-attention-npu third-party ops'
     echo "  -h, --help          Show this help message"
     echo ""
     echo "Examples:"
@@ -48,6 +51,7 @@ parse_args() {
     BUILD_DIR=""
     OP_NAME=""
     COMPUTE_UNIT=""
+    BUILD_TRANSFORMER="true"
 
     # 第一轮：解析 --key=value 形式参数
     for arg in "$@"; do
@@ -57,6 +61,16 @@ parse_args() {
                 ;;
             --compute-unit=*)
                 COMPUTE_UNIT="${arg#*=}"
+                ;;
+            --build-transformer)
+    BUILD_TRANSFORMER="true"
+    BUILD_FLASH="true"
+                ;;
+            --no-build-transformer)
+                BUILD_TRANSFORMER="false"
+                ;;
+            --no-build-flash)
+                BUILD_FLASH="false"
                 ;;
             -n|--op-name)
                 # 需要取下一个参数，在第二轮中处理
@@ -215,6 +229,60 @@ run_build() {
 }
 
 # ============================================================================
+# 编译 ops-transformer 三方依赖
+# 通过 build_ops_transformer.sh 编译 third_party/ops-transformer 子模块,
+# SOC 跟随 resolve_soc_version_list 的结果(逗号分隔多值)。
+# ============================================================================
+build_ops_transformer() {
+    if [[ "${BUILD_TRANSFORMER}" != "true" ]]; then
+        echo ">>> Skip ops-transformer build (--no-build-transformer)"
+        return 0
+    fi
+
+    local transformer_script="${BASE_DIR}/build_ops_transformer.sh"
+    if [[ ! -f "${transformer_script}" ]]; then
+        echo "[WARN] build_ops_transformer.sh not found, skip ops-transformer build: ${transformer_script}"
+        return 0
+    fi
+
+    # 子模块未初始化时 requirements.txt 缺失，会导致主 build 失败，提前检查并提示
+    local transformer_requirements="${BASE_DIR}/third_party/ops-transformer/requirements.txt"
+    if [[ ! -f "${transformer_requirements}" ]]; then
+        echo "[ERROR] ops-transformer submodule not initialized (missing ${transformer_requirements})"
+        echo "        Please run first: git submodule update --init --recursive"
+        exit 1
+    fi
+
+    # 将 SOC_VERSION_LIST 数组转换为逗号分隔字符串
+    local soc_str=""
+    local soc_ver
+    for soc_ver in "${SOC_VERSION_LIST[@]}"; do
+        if [[ -z "${soc_str}" ]]; then
+            soc_str="${soc_ver}"
+        else
+            soc_str="${soc_str},${soc_ver}"
+        fi
+    done
+
+    # 310P (ascend310p) 目标无 quant_lightning_indexer_v2 等算子注册，
+    # 无条件构建 transformer 会导致编译失败，故跳过并提示。
+    local has_310p="false"
+    for soc_ver in "${SOC_VERSION_LIST[@]}"; do
+        if [[ "${soc_ver}" == "ascend310p" ]]; then
+            has_310p="true"
+            break
+        fi
+    done
+    if [[ "${has_310p}" == "true" ]]; then
+        echo ">>> Skip ops-transformer build: ascend310p has no quant_lightning_indexer_v2 ops registered"
+        return 0
+    fi
+
+    echo ">>> Building ops-transformer for SOC=${soc_str}"
+    stdbuf -oL bash "${transformer_script}" --soc="${soc_str}" all
+}
+
+# ============================================================================
 # 安装构建产物
 # ============================================================================
 install_artifacts() {
@@ -270,19 +338,52 @@ update_vendor_config() {
         echo "[INFO] created ${config_file}"
     else
         # 已存在：把当前 vendor 合并进 load_priority（若不存在则前置加入）
+        # 注意：只读取非注释行的 load_priority，避免误读注释行。
         local found_vendors
-        found_vendors="$(grep -w 'load_priority' "${config_file}" | cut --only-delimited -d'=' -f2-)"
+        found_vendors="$(grep -E '^[[:space:]]*load_priority[[:space:]]*=' "${config_file}" | cut --only-delimited -d'=' -f2- | head -n 1)"
         if echo ",${found_vendors}," | grep -q ",${vendor_name},"; then
             echo "[INFO] ${vendor_name} already in load_priority, skip"
         else
             if [ -z "${found_vendors}" ]; then
-                echo "load_priority=${vendor_name}" > "${config_file}"
+                # 追加而非截断：避免覆盖已有其它配置行
+                echo "load_priority=${vendor_name}" >> "${config_file}"
             else
-                sed -i "s@load_priority=${found_vendors}@load_priority=${vendor_name},${found_vendors}@g" "${config_file}"
+                # 用 awk 做字面量精确替换，避免 sed 分隔符/正则元字符(&、@、.等)被误解释
+                awk -v old="${found_vendors}" -v new="${vendor_name},${found_vendors}" \
+                    '{ gsub("load_priority=" old, "load_priority=" new); print }' \
+                    "${config_file}" > "${config_file}.tmp" && mv "${config_file}.tmp" "${config_file}"
             fi
             echo "[INFO] updated ${config_file}"
         fi
     fi
+}
+
+# ============================================================================
+# 构建 flash-linear-attention-npu 三方库
+# ============================================================================
+build_flash_linear_attention() {
+    if [[ "${BUILD_FLASH}" != "true" ]]; then
+        echo ">>> Skip flash-linear-attention-npu build (--no-build-flash)"
+        return 0
+    fi
+
+    local fla_script="${BASE_DIR}/build_flash_linear_attention.sh"
+    if [ ! -f "${fla_script}" ]; then
+        echo "[WARN] flash-linear-attention-npu build script not found: ${fla_script}, skip"
+        return 0
+    fi
+
+    # 从 build.sh 的 SOC 解析结果中取第一个芯片类型传给子脚本。
+    # SOC_VERSION_LIST 由 run_build 中的 resolve_soc_version_list 填充（本函数在其后调用）。
+    local soc="${SOC_VERSION_LIST[0]}"
+    if [ -z "${soc}" ]; then
+        echo "[WARN] SOC not resolved, flash-linear-attention-npu falls back to sub-script default ascend910_93"
+        bash "${fla_script}"
+        return 0
+    fi
+
+    echo "[INFO] build flash-linear-attention-npu (SOC=${soc})"
+    bash "${fla_script}" --soc="${soc}"
 }
 
 # ============================================================================
@@ -294,6 +395,8 @@ main() {
     run_build
     install_artifacts
     update_vendor_config
+    build_flash_linear_attention
+    build_ops_transformer
 }
 
 main "$@"
