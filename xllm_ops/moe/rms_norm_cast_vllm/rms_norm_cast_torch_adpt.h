@@ -18,7 +18,7 @@ std::tuple<at::Tensor, at::Tensor> npu_rms_norm_cast(
                 "gamma must be 1D and match the last dimension of x");
     at::Tensor y = at::empty(x.sizes(), x.options());
     at::Tensor y_fp32 = at::empty(x.sizes(), x.options().dtype(at::kFloat));
-    EXEC_NPU_CMD(aclnnRmsNormCast, x, gamma, epsilon, y, y_fp32);
+    EXEC_NPU_CMD(aclnnRmsNormCastVllm, x, gamma, epsilon, y, y_fp32);
     return {y, y_fp32};
 }
 }  // namespace xllm_ops

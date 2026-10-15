@@ -924,6 +924,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_bias_impl_npu(
   return std::make_tuple(y, rstd, x);
 }
 
+std::tuple<at::Tensor, at::Tensor> rms_norm_cast_vllm_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& gamma,
+    double epsilon) {
+  // rstd = 1/sqrt(mean(x^2, -1) + eps); y = x*rstd*gamma (input dtype);
+  // y_fp32 = y widened to fp32 (already-rounded result for MoE routing).
+  at::Tensor y = at::empty(x.sizes(), x.options());
+  at::Tensor y_fp32 =
+      at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float));
+  EXEC_NPU_CMD(aclnnRmsNormCastVllm, x, gamma, epsilon, y, y_fp32);
+  return std::make_tuple(y, y_fp32);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 gamma_add_rms_norm_impl_npu(const at::Tensor& x1,
                             const at::Tensor& x2,
@@ -2258,6 +2271,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("inplace_partial_rotary_mul", &inplace_partial_rotary_mul_impl_npu, "inplace_partial_rotary_mul");
   m.def("hc_post", &hc_post_impl_npu, "hc_post");
   m.def("add_rms_norm_bias", &add_rms_norm_bias_impl_npu, "add_rms_norm_bias");
+  m.def("rms_norm_cast_vllm", &rms_norm_cast_vllm_impl_npu, "rms_norm_cast_vllm");
   m.def("gamma_add_rms_norm",
         &gamma_add_rms_norm_impl_npu,
         "gamma_add_rms_norm");

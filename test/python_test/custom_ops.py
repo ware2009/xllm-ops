@@ -212,6 +212,14 @@ def add_rms_norm_bias_npu(x1, x2, gamma, beta=None, eps=1e-6):
     return custom_ops_lib.add_rms_norm_bias(x1, x2, gamma, beta, eps)
 
 
+# rms_norm_cast_vllm: RMSNorm + fp32 cast (dual output).
+#   rstd = 1/sqrt(mean(x^2, -1) + eps); y = x*rstd*gamma (input dtype);
+#   y_fp32 = y widened to fp32 (already-rounded result for MoE routing).
+#   x:(...,H) fp16/bf16, gamma:(H,) same dtype. epsilon default 1e-6.
+def rms_norm_cast_vllm_npu(x, gamma, epsilon=1e-6):
+    return custom_ops_lib.rms_norm_cast_vllm(x, gamma, epsilon)
+
+
 def gamma_add_rms_norm_npu(x1, x2, gamma, eps=1e-6,
                            add_gamma_offset=False):
     return custom_ops_lib.gamma_add_rms_norm(
