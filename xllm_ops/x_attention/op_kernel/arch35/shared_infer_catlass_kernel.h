@@ -91,6 +91,9 @@ class SharedFaInferKernel {
                     maxUb[i] = resource.ubBuf.template GetBufferByByte<ElementS>(ubBufAddrStart);
                     ubBufAddrStart += reduceSize;
                 }
+                // 32B magic slot staging buffer for the fused-combine soft sync
+                publishUb = resource.ubBuf.template GetBufferByByte<int32_t>(ubBufAddrStart);
+                ubBufAddrStart += XASync::SYNC_SLOT_BYTES;
             }
 
             auto pL1Size = qSeqlenTemplateType * kvSeqlenTemplateType * sizeof(ElementP);
@@ -143,14 +146,14 @@ class SharedFaInferKernel {
             auto layoutV = tla::MakeLayout<ElementV, LayoutTagV>(sharedKvTokens, kvHeads * headDim);
             auto tensorV = tla::MakeTensor(gV, layoutV, Arch::PositionGM{});
 
-            AscendC::GlobalTensor<ElementOTmp> gSharedO;
-            gSharedO.SetGlobalBuffer((__gm__ ElementOTmp *)params.sharedO);
-            auto layoutO = tla::MakeLayout<ElementOTmp, LayoutTagOTmp>(totalTokensQ, qHeads * headDim);
+            AscendC::GlobalTensor<float> gSharedO;
+            gSharedO.SetGlobalBuffer((__gm__ float *)params.sharedO);
+            auto layoutO = tla::MakeLayout<float, LayoutTagOTmp>(totalTokensQ, qHeads * headDim);
             auto tensorO = tla::MakeTensor(gSharedO, layoutO, Arch::PositionGM{});
-            AscendC::GlobalTensor<ElementOTmp> sharedMaxGm;
-            sharedMaxGm.SetGlobalBuffer((__gm__ ElementOTmp *)params.sharedMax);
-            AscendC::GlobalTensor<ElementOTmp> sharedSumGm;
-            sharedSumGm.SetGlobalBuffer((__gm__ ElementOTmp *)params.sharedSum);
+            AscendC::GlobalTensor<float> sharedMaxGm;
+            sharedMaxGm.SetGlobalBuffer((__gm__ float *)params.sharedMax);
+            AscendC::GlobalTensor<float> sharedSumGm;
+            sharedSumGm.SetGlobalBuffer((__gm__ float *)params.sharedSum);
 
             BlockMmadQK blockMmadQK(resource, l1BufAddrStart, l0CBufAddrStart);
             BlockMmadPV blockMmadPV(resource, l1BufAddrStart, l0CBufAddrStart);
@@ -341,6 +344,26 @@ class SharedFaInferKernel {
             //     AscendC::DumpTensor(sharedSumGm, 8, 8);
             // }
         }
+
+        // Called by the helper after operator() returns: all epilogue dtors have
+        // drained their MTE3 (WaitFlag MTE3_V), so this AIV's shared O/max/sum GM
+        // writes are complete. Publish one 32B magic slot in the workspace tail so
+        // the unshared AIVs can soft-sync without a full-kernel SyncAll barrier.
+        CATLASS_DEVICE void PublishSharedDone(XAttnKernelCommonParams const &params) {
+            if ASCEND_IS_AIV {
+                uint64_t syncBaseAddr =
+                    ((uint64_t)(params.unsharedSum + tilingData->sumMaxSize) + 31) & ~uint64_t(31);
+                int32_t slotIdx = static_cast<int32_t>(coreIdx) * CV_RATIO + static_cast<int32_t>(subVecIdx);
+                __gm__ int32_t *syncSlot = reinterpret_cast<__gm__ int32_t *>(syncBaseAddr) +
+                    slotIdx * (XASync::SYNC_SLOT_BYTES / sizeof(int32_t));
+                AscendC::GlobalTensor<int32_t> gSync;
+                gSync.SetGlobalBuffer(syncSlot);
+                AscendC::Duplicate(publishUb, XASync::SYNC_MAGIC, XASync::SYNC_SLOT_BYTES / sizeof(int32_t));
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+                AscendC::DataCopy(gSync, publishUb, XASync::SYNC_SLOT_BYTES);
+            }
+        }
     
     private:
         static constexpr uint8_t SYNC_MODE = 4;
@@ -352,6 +375,7 @@ class SharedFaInferKernel {
         AscendC::LocalTensor<ElementS> expSumUb[3];
         AscendC::LocalTensor<ElementS> expMaxUb[3];
         AscendC::LocalTensor<ElementS> maxUb[3];
+        AscendC::LocalTensor<int32_t> publishUb;
 
         SharedInfer::TaskArgs taskArgList[4];
         XAttentionTilingData* tilingData;

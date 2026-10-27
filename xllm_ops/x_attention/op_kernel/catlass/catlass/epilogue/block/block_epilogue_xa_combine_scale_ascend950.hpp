@@ -21,6 +21,10 @@
 
 namespace Catlass::Epilogue::Block {
 
+// fp16o probe variant: the unshared O tensor in GM is fp16 (fixpipe F322F16 direct
+// write), so its combine input is staged as half in UB and widened in-register via
+// Cast<float, half> inside ComputeFinalAttn. All weighting math (max/sum/gl/final)
+// stays fp32, shared O stays fp32 GM (contract unchanged).
 template <class OutputType_, class InputType_>
 class BlockEpilogue<EpilogueAscend950XACombineScale, OutputType_, InputType_> {
 public:
@@ -30,6 +34,8 @@ public:
 
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
+    static_assert(sizeof(ElementInput) == 4, "combine weighting math requires a 32-bit input type");
+    using ElementOTmpIn = half; // unshared O GM dtype (fp16o probe)
 
     using LayoutOutput = typename OutputType_::Layout;
     using LayoutInput = typename InputType_::Layout;
@@ -42,6 +48,7 @@ public:
         headDim = headDim_;
         uint32_t reduceUbSize = rowNumPerLoop * sizeof(ElementInput);
         uint32_t inputUbSize = rowNumPerLoop * headDim * sizeof(ElementInput);
+        uint32_t otmpInUbSize = rowNumPerLoop * headDim * sizeof(ElementOTmpIn);
 
         for (int i = 0; i < 2; i++) {
             sharedAttnUbTensorList[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(ubBufAddrStart);
@@ -50,8 +57,8 @@ public:
             ubBufAddrStart += reduceUbSize;
             sharedGlUbTensorList[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(ubBufAddrStart);
             ubBufAddrStart += reduceUbSize;
-            unsharedAttnUbTensorList[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(ubBufAddrStart);
-            ubBufAddrStart += inputUbSize;
+            unsharedAttnUbTensorList[i] = resource.ubBuf.template GetBufferByByte<ElementOTmpIn>(ubBufAddrStart);
+            ubBufAddrStart += otmpInUbSize;
             unsharedGmUbTensorList[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(ubBufAddrStart);
             ubBufAddrStart += reduceUbSize;
             unsharedGlUbTensorList[i] = resource.ubBuf.template GetBufferByByte<ElementInput>(ubBufAddrStart);
@@ -91,7 +98,7 @@ public:
     void operator()(
         AscendC::GlobalTensor<ElementInput> gSharedGm, AscendC::GlobalTensor<ElementInput> gUnsharedGm,
         AscendC::GlobalTensor<ElementInput> gSharedGl, AscendC::GlobalTensor<ElementInput> gUnsharedGl,
-        AscendC::GlobalTensor<ElementInput> gSharedOut, AscendC::GlobalTensor<ElementInput> gUnsharedOut,
+        AscendC::GlobalTensor<ElementInput> gSharedOut, AscendC::GlobalTensor<ElementOTmpIn> gUnsharedOut,
         AscendC::GlobalTensor<ElementOutput> gFinalOutput, uint32_t m, int8_t& taskId)
     {
         uint32_t attnCount = m * headDim;
@@ -111,8 +118,8 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(taskId);
 
         __ubuf__ ElementInput* sharedAttnUbAddr = (__ubuf__ ElementInput*)sharedAttnUbTensorList[taskId].GetPhyAddr();
-        __ubuf__ ElementInput* unsharedAttnUbAddr =
-            (__ubuf__ ElementInput*)unsharedAttnUbTensorList[taskId].GetPhyAddr();
+        __ubuf__ ElementOTmpIn* unsharedAttnUbAddr =
+            (__ubuf__ ElementOTmpIn*)unsharedAttnUbTensorList[taskId].GetPhyAddr();
         __ubuf__ ElementInput* sharedGmUbAddr = (__ubuf__ ElementInput*)sharedGmUbTensorList[taskId].GetPhyAddr();
         __ubuf__ ElementInput* sharedGlUbAddr = (__ubuf__ ElementInput*)sharedGlUbTensorList[taskId].GetPhyAddr();
         __ubuf__ ElementInput* unsharedGmUbAddr = (__ubuf__ ElementInput*)unsharedGmUbTensorList[taskId].GetPhyAddr();
@@ -190,15 +197,25 @@ private:
         StoreAlign<ElementInput, StoreDist::DIST_NORM_B32>(finalGl, finalGlVreg, pregTailM);
     }
 
+    // fp16 unpack trait: the low 64 halves of a 128-lane half register widen to
+    // 64 floats (RegLayout::ONE would take the upper 64).
+    constexpr static CastTrait castTraitHalfZero = {
+        RegLayout::ZERO,
+        SatMode::SAT,
+        MaskMergeMode::ZEROING,
+        AscendC::RoundMode::CAST_ROUND,
+    };
+
     template <class ElementInput>
     __simd_vf__ inline void ComputeFinalAttn(
-        __ubuf__ ElementInput* sharedO, __ubuf__ ElementInput* unsharedO, __ubuf__ ElementInput* expMaxShared,
+        __ubuf__ ElementInput* sharedO, __ubuf__ ElementOTmpIn* unsharedO, __ubuf__ ElementInput* expMaxShared,
         __ubuf__ ElementInput* expMaxUnShared, __ubuf__ ElementInput* finalGl, __ubuf__ ElementInput* finalAttn,
         uint16_t m, uint32_t headDim, uint16_t nLoops, uint32_t tailN)
     {
         using namespace AscendC::Reg;
         RegTensor<ElementInput> sharedOVreg;
         RegTensor<ElementInput> unsharedOVreg;
+        RegTensor<ElementOTmpIn> unsharedHalfVreg;
         RegTensor<ElementInput> expMaxSharedVreg;
         RegTensor<ElementInput> expMaxUnsharedVreg;
         RegTensor<ElementInput> finalGlVreg;
@@ -214,7 +231,11 @@ private:
             LoadAlign<ElementInput, LoadDist::DIST_BRC_B32>(finalGlVreg, finalGl + i);
             for (uint16_t j = 0; j < nLoops; ++j) {
                 LoadAlign(sharedOVreg, sharedO + i * headDim + j * FLOAT_REP_SIZE);
-                LoadAlign(unsharedOVreg, unsharedO + i * headDim + j * FLOAT_REP_SIZE);
+                // Load 128 halves (segment j plus the next one, possibly past the row
+                // into UB scratch); only the low 64 lanes are consumed via the ZERO
+                // cast, so the over-read is discarded.
+                LoadAlign(unsharedHalfVreg, unsharedO + i * headDim + j * FLOAT_REP_SIZE);
+                Cast<ElementInput, half, castTraitHalfZero>(unsharedOVreg, unsharedHalfVreg, pregFull);
                 Mul(sharedOVreg, sharedOVreg, expMaxSharedVreg, pregFull);
                 Mul(unsharedOVreg, unsharedOVreg, expMaxUnsharedVreg, pregFull);
                 Add(finalAttnVreg, sharedOVreg, unsharedOVreg, pregFull);
@@ -224,7 +245,8 @@ private:
                     finalAttn + i * headDim + j * FLOAT_REP_SIZE, finalAttnVreg, pregFull);
             }
             LoadAlign(sharedOVreg, sharedO + i * headDim + nLoops * FLOAT_REP_SIZE);
-            LoadAlign(unsharedOVreg, unsharedO + i * headDim + nLoops * FLOAT_REP_SIZE);
+            LoadAlign(unsharedHalfVreg, unsharedO + i * headDim + nLoops * FLOAT_REP_SIZE);
+            Cast<ElementInput, half, castTraitHalfZero>(unsharedOVreg, unsharedHalfVreg, pregFull);
             Mul(sharedOVreg, sharedOVreg, expMaxSharedVreg, pregTailN);
             Mul(unsharedOVreg, unsharedOVreg, expMaxUnsharedVreg, pregTailN);
             Add(finalAttnVreg, sharedOVreg, unsharedOVreg, pregTailN);
@@ -239,7 +261,7 @@ private:
     AscendC::LocalTensor<ElementInput> sharedAttnUbTensorList[2];
     AscendC::LocalTensor<ElementInput> sharedGmUbTensorList[2];
     AscendC::LocalTensor<ElementInput> sharedGlUbTensorList[2];
-    AscendC::LocalTensor<ElementInput> unsharedAttnUbTensorList[2];
+    AscendC::LocalTensor<ElementOTmpIn> unsharedAttnUbTensorList[2];
     AscendC::LocalTensor<ElementInput> unsharedGmUbTensorList[2];
     AscendC::LocalTensor<ElementInput> unsharedGlUbTensorList[2];
 

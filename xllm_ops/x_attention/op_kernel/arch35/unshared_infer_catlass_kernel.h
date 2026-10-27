@@ -35,6 +35,7 @@ template <
     class BlockMmadQK,
     class BlockMmadPV,
     class EpiloueSoftmax,
+    class EpilogueCombine,
     typename KVLEN_T,
     typename TABLE_T>
 class UnSharedInferKernel {
@@ -113,6 +114,9 @@ class UnSharedInferKernel {
                 halfVecGroupOffset = (subVecIdx == 0) ? 0 : halfGroupCount;
                 halfVecRowCount = halfVecGroupCount * groupSize;
                 halfVecRowOffset = halfVecGroupOffset * groupSize;
+                // 1KB staging buffer for polling the shared-publish magic slots
+                pollUb = resource.ubBuf.template GetBufferByByte<int32_t>(ubBufAddrStart);
+                ubBufAddrStart += XASync::SYNC_SLOT_COUNT * XASync::SYNC_SLOT_BYTES;
             }
             coreIdx = coreIdx - tilingData->sharedInfo.usedCoreNum;
             blockQLen = groupCountPerLoop * groupSize;
@@ -141,10 +145,10 @@ class UnSharedInferKernel {
             auto layoutO = tla::MakeLayout<ElementOTmp, LayoutTagOTmp>(totalTokensQ * qHeads, headDim);
             auto tensorO = tla::MakeTensor(gUnSharedO, layoutO, Arch::PositionGM{});
             
-            AscendC::GlobalTensor<ElementOTmp> unsharedMaxGm;
-            unsharedMaxGm.SetGlobalBuffer((__gm__ ElementOTmp *)params.unsharedMax);
-            AscendC::GlobalTensor<ElementOTmp> unsharedSumGm;
-            unsharedSumGm.SetGlobalBuffer((__gm__ ElementOTmp *)params.unsharedSum);
+            AscendC::GlobalTensor<float> unsharedMaxGm;
+            unsharedMaxGm.SetGlobalBuffer((__gm__ float *)params.unsharedMax);
+            AscendC::GlobalTensor<float> unsharedSumGm;
+            unsharedSumGm.SetGlobalBuffer((__gm__ float *)params.unsharedSum);
 
             BlockMmadQK blockMmadQK(resource, l1BufAddrStart, l0CBufAddrStart);
             BlockMmadPV blockMmadPV(resource, l1BufAddrStart, l0CBufAddrStart);
@@ -158,6 +162,7 @@ class UnSharedInferKernel {
             int32_t taskStartId = coreIdx * perCoreTaskNum;
             if (taskStartId >= totalTaskNum) {
                 WaitFlag();
+                NotifyUnsharedDone();
                 return;
             }
             int32_t coreTaskNum = perCoreTaskNum;
@@ -291,6 +296,36 @@ class UnSharedInferKernel {
             // }
 
             WaitFlag();
+            NotifyUnsharedDone();
+        }
+
+        // Fused combine, executed by the companion AIVs of the unshared cores.
+        // Sync order:
+        //   1. intra-block flag from this core's AIC  -> its unsharedO fixpipe writes are drained;
+        //   2. magic-slot poll                        -> every shared AIV has drained sharedO/max/sum;
+        // then run the combine epilogue on this core's row range
+        // [taskStartId*blockQLen, taskEndId*blockQLen), split between the two AIVs.
+        CATLASS_DEVICE void RunFusedCombine(XAttnKernelCommonParams const &params) {
+            if ASCEND_IS_AIC {
+                return;
+            }
+            int32_t coreTaskStartId = static_cast<int32_t>(coreIdx) * perCoreTaskNum;
+            if (coreTaskStartId >= totalTaskNum) {
+                return;  // this core owns no rows; nothing to publish or combine
+            }
+            int32_t coreTaskEndId = coreTaskStartId + perCoreTaskNum;
+            if (coreTaskEndId > totalTaskNum) {
+                coreTaskEndId = totalTaskNum;
+            }
+
+            // 1) unshared side ready
+            AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_V>(UnSharedInfer::UNSHARED_DONE_FLAG);
+
+            // 2) shared side ready
+            WaitSharedPublish(params);
+
+            // 3) combine on this core's rows
+            RunCombineRows(params, coreTaskStartId * blockQLen, coreTaskEndId * blockQLen);
         }
     
     private:
@@ -299,6 +334,7 @@ class UnSharedInferKernel {
         AscendC::GlobalTensor<KVLEN_T> decodeStepGm;
         AscendC::LocalTensor<ElementS> qkTensorList[2];
         AscendC::LocalTensor<ElementP> pL1TensorList[3];
+        AscendC::LocalTensor<int32_t> pollUb;
         AscendC::GlobalTensor<TABLE_T> blockTableGm;
 
         UnSharedInfer::TaskArgs taskArgList[3];
@@ -382,6 +418,106 @@ class UnSharedInferKernel {
                 AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_FIX>(UnSharedInfer::QK_UB_RELEASE_FLAG[1]);
                 AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_FIX>(16 + UnSharedInfer::QK_UB_RELEASE_FLAG[0]);
                 AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_FIX>(16 + UnSharedInfer::QK_UB_RELEASE_FLAG[1]);
+            }
+        }
+
+        // AIC side: publish on PIPE_FIX so the signal is ordered after every fixpipe
+        // (L0C -> GM) of this core. Companion AIVs wait the same flag id (the intra-
+        // block set from AIC must cover both sub-vector ids, see the 16+ pairs above).
+        CATLASS_DEVICE void NotifyUnsharedDone() {
+            if ASCEND_IS_AIC {
+                AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_FIX>(UnSharedInfer::UNSHARED_DONE_FLAG);
+                AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_FIX>(16 + UnSharedInfer::UNSHARED_DONE_FLAG);
+            }
+        }
+
+        CATLASS_DEVICE uint64_t SyncSlotBaseAddr(XAttnKernelCommonParams const &params) const {
+            // workspace layout tail: right after unsharedSum, 32B aligned
+            return ((uint64_t)(params.unsharedSum + tilingData->sumMaxSize) + 31) & ~uint64_t(31);
+        }
+
+        // Spin-poll the 32 magic slots (16 shared cores x 2 AIVs) until every
+        // publisher has written XASync::SYNC_MAGIC. MTE2 copies the whole 1KB slot
+        // region into UB; the MTE2_S event orders the scalar reads on PIPE_S.
+        // Publishers fill the entire 32B slot with the magic, so probing the first
+        // int of each slot (32 scalar reads) is a sufficient test.
+        CATLASS_DEVICE void WaitSharedPublish(XAttnKernelCommonParams const &params) {
+            constexpr int32_t POLL_INTS = XASync::SYNC_SLOT_COUNT * XASync::SYNC_SLOT_BYTES / sizeof(int32_t);
+            constexpr int32_t SLOT_INT_STRIDE = XASync::SYNC_SLOT_BYTES / sizeof(int32_t);
+            AscendC::GlobalTensor<int32_t> gSync;
+            gSync.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(SyncSlotBaseAddr(params)));
+            while (true) {
+                AscendC::DataCopy(pollUb, gSync, POLL_INTS);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                bool allDone = true;
+                #pragma unroll 8
+                for (int32_t i = 0; i < XASync::SYNC_SLOT_COUNT; i++) {
+                    if (pollUb.GetValue(i * SLOT_INT_STRIDE) != XASync::SYNC_MAGIC) {
+                        allDone = false;
+                        break;
+                    }
+                }
+                if (allDone) {
+                    break;
+                }
+            }
+        }
+
+        // Row-sharded combine epilogue invocation, mirroring the standalone
+        // CombineScaleKernel: the two AIVs of this core split the core's row range
+        // in half and iterate rowPerLoop-row chunks. Combine arithmetic is row-
+        // independent, so sharding does not change the per-row numerics (bit-exact
+        // vs the standalone combine kernel).
+        CATLASS_DEVICE void RunCombineRows(XAttnKernelCommonParams const &params, int32_t rowStart, int32_t rowEnd) {
+            int32_t rowSpan = rowEnd - rowStart;
+            if (rowSpan <= 0) {
+                return;
+            }
+            int32_t myStart = (subVecIdx == 0) ? rowStart : rowStart + (rowSpan + 1) / 2;
+            int32_t myEnd = (subVecIdx == 0) ? rowStart + (rowSpan + 1) / 2 : rowEnd;
+            int32_t rows = myEnd - myStart;
+            if (rows <= 0) {
+                return;
+            }
+
+            uint32_t rowNumPerLoop = static_cast<uint32_t>(tilingData->combineInfo.rowPerLoop);
+            uint32_t headDimLocal = static_cast<uint32_t>(headDim);
+
+            AscendC::GlobalTensor<float> gSharedMaxGm;
+            gSharedMaxGm.SetGlobalBuffer((__gm__ float *)params.sharedMax);
+            AscendC::GlobalTensor<float> gSharedSumGm;
+            gSharedSumGm.SetGlobalBuffer((__gm__ float *)params.sharedSum);
+            AscendC::GlobalTensor<float> gUnsharedMaxGm;
+            gUnsharedMaxGm.SetGlobalBuffer((__gm__ float *)params.unsharedMax);
+            AscendC::GlobalTensor<float> gUnsharedSumGm;
+            gUnsharedSumGm.SetGlobalBuffer((__gm__ float *)params.unsharedSum);
+            AscendC::GlobalTensor<float> gSharedOGm;
+            gSharedOGm.SetGlobalBuffer((__gm__ float *)params.sharedO);
+            AscendC::GlobalTensor<half> gUnsharedOGm;
+            gUnsharedOGm.SetGlobalBuffer((__gm__ half *)params.unsharedO);
+            AscendC::GlobalTensor<ElementQ> gFinalOGm;
+            gFinalOGm.SetGlobalBuffer((__gm__ ElementQ *)params.o);
+
+            uint32_t ubStart = ubBufAddrStart;
+            EpilogueCombine epilogueCombine(resource, ubStart, rowNumPerLoop, headDimLocal);
+
+            int8_t taskId = 0;
+            for (int32_t off = 0; off < rows; off += static_cast<int32_t>(rowNumPerLoop)) {
+                int32_t n = (rows - off < static_cast<int32_t>(rowNumPerLoop))
+                    ? (rows - off) : static_cast<int32_t>(rowNumPerLoop);
+                int64_t row = static_cast<int64_t>(myStart + off);
+                int64_t attnOff = row * headDim;
+                epilogueCombine(
+                    gSharedMaxGm[row],
+                    gUnsharedMaxGm[row],
+                    gSharedSumGm[row],
+                    gUnsharedSumGm[row],
+                    gSharedOGm[attnOff],
+                    gUnsharedOGm[attnOff],
+                    gFinalOGm[attnOff],
+                    static_cast<uint32_t>(n),
+                    taskId);
             }
         }
 };

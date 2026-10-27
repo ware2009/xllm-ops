@@ -55,6 +55,8 @@ namespace UnSharedInfer {
     constexpr uint16_t SYNC_QK_READY_FLAG[2] = {0, 1};
     constexpr uint16_t SYNC_SOFTMAX_READY_FLAG[3] = {2, 3, 4};
     constexpr uint16_t QK_UB_RELEASE_FLAG[2] = {5, 6};
+    // AIC -> companion AIVs (intra-block): unshared fixpipe O writes are drained.
+    constexpr uint16_t UNSHARED_DONE_FLAG = 7;
     constexpr uint32_t COMPUTE_PIPE_NUM = 3;
     struct TaskArgs {
         int32_t taskId;
@@ -69,8 +71,18 @@ namespace UnSharedInfer {
     };
 }
 
-struct XAttnKernelCommonParams {
-    GM_ADDR q;
+// Soft-sync magic slots for the fused combine (workspace tail region).
+// Producers (shared-kernel AIVs) publish per-core magic words via MTE3 after all
+// their GM writes are drained; the consumer (unshared-kernel AIVs) spin-polls
+// the slot region with MTE2+S before reading sharedO/max/sum for combine.
+namespace XASync {
+    constexpr int32_t SYNC_MAGIC = 0x20261027;
+    constexpr int32_t SYNC_SLOT_COUNT = 32;   // 16 shared cores x 2 AIVs
+    constexpr int32_t SYNC_SLOT_BYTES = 32;   // one 32B aligned slot per publisher
+    constexpr int64_t SYNC_WORKSPACE_SIZE = 2048;  // host reserves this tail region
+}
+
+struct XAttnKernelCommonParams {    GM_ADDR q;
     GM_ADDR sharedK;
     GM_ADDR sharedV;
     GM_ADDR unsharedK;

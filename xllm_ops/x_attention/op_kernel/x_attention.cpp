@@ -71,8 +71,8 @@ extern "C" __global__ __aicore__ void x_attention(GM_ADDR query, GM_ADDR shared_
     } else {
         CallUnsharedInferKernel<DTYPE_QUERY, DTYPE_SHARED_KV_LENS, DTYPE_UNSHARED_BLOCK_TABLE>(params, &tiling_data);
     }
-    AscendC::SyncAll<false>();
-    CallCombineScale<DTYPE_QUERY>(params, &tiling_data);
+    // Fused combine: the unshared kernel's companion AIVs run the combine epilogue
+    // after a soft-sync on the workspace tail magic slots (no SyncAll barrier).
 #else
     // ===== A3(AtlasA2/A3) path =====
     // workspace use; [s,p,oTemp,oUpdate,shared_workspace,unshared_workspace]

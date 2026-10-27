@@ -122,7 +122,8 @@ void TilingXAttentionFunc::SetWorkspaces()
   uint64_t qOSize = totalTokensQ * qHeads * headDim * sizeof(float);
   uint64_t sumMaxSize = totalTokensQ * qHeads * sizeof(float);
   uint64_t sharedWorkspaceSize = qOSize + sumMaxSize * 2;
-  userWorkspaceSize = sharedWorkspaceSize * 2;
+  // +2048: tail magic-slot region for fused-combine soft sync (XASync::SYNC_WORKSPACE_SIZE)
+  userWorkspaceSize = sharedWorkspaceSize * 2 + 2048;
   tiling_data_.set_qOSize(qOSize);
   tiling_data_.set_sumMaxSize(sumMaxSize);
   tiling_data_.set_sharedWorkspaceSize(sharedWorkspaceSize);

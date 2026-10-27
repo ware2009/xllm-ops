@@ -32,7 +32,7 @@ CATLASS_DEVICE void CallSharedInferKernel(const XAttnKernelCommonParams& params,
     using LayoutS = layout::RowMajor;
     using ElementP = INPUT_T;
     using LayoutP = layout::RowMajor;
-    using ElementOTmp = float;
+    using ElementOTmp = half;
     using LayoutOTmp = layout::RowMajor;
     // L1TileShape::K must be embdding
     using L1TileShape = tla::Shape<_128, _128, _128>;
@@ -67,6 +67,8 @@ CATLASS_DEVICE void CallSharedInferKernel(const XAttnKernelCommonParams& params,
 
     SharedFAInferKernel sharedInferKernel(tilingData);
     sharedInferKernel(params);
+    // Publish the magic slot after all shared GM writes are drained by the epilogue dtors.
+    sharedInferKernel.PublishSharedDone(params);
 }
 
 template <typename INPUT_T, typename KVLEN_T, typename TABLE_T>
@@ -82,7 +84,7 @@ CATLASS_DEVICE void CallUnsharedInferKernel(const XAttnKernelCommonParams& param
     using LayoutS = layout::RowMajor;
     using ElementP = INPUT_T;
     using LayoutP = layout::RowMajor;
-    using ElementOTmp = float;
+    using ElementOTmp = half;
     using LayoutOTmp = layout::RowMajor;
     // L1TileShape::K must be embdding
     using L1TileShape = tla::Shape<_128, _128, _128>;
@@ -107,11 +109,24 @@ CATLASS_DEVICE void CallUnsharedInferKernel(const XAttnKernelCommonParams& param
     using TileMmadPV = Gemm::Tile::TileMmadTla<ArchTag, ElementP, typename TileCopyPV::LayoutTagL1A>;
     using BlockMmadPV = Gemm::Block::BlockMmadTla<DispatchPolicyPV, L1TileShape, L0TileShape, ElementP, ElementV, ElementOTmp, void, TileCopyPV, TileMmadPV>;
 
+    // Fused combine epilogue (instantiated on the companion AIVs of unshared cores;
+    // final output dtype == query dtype, same as the standalone CallCombineScale).
+    using DispatchPolicyCombine = Epilogue::EpilogueAscend950XACombineScale;
+    using ElementCombineInput = float;
+    using LayoutCombineInput = layout::RowMajor;
+    using ElementCombineOutput = ElementQ;
+    using LayoutCombineOutput = layout::RowMajor;
+    using CombineInputType = Gemm::GemmType<ElementCombineInput, LayoutCombineInput>;
+    using CombineOutputType = Gemm::GemmType<ElementCombineOutput, LayoutCombineOutput>;
+    using EpilogueCombineScale = Epilogue::Block::BlockEpilogue<DispatchPolicyCombine, CombineOutputType, CombineInputType>;
+
     using UnSharedInferKernel = UnSharedInferKernel<
-            BlockMmadQK, BlockMmadPV, EpilogueSoftmax, KVLEN_T, TABLE_T>;
-    
-    UnSharedInferKernel unsharedInferKernel(tilingData);
-    unsharedInferKernel(params);
+            BlockMmadQK, BlockMmadPV, EpilogueSoftmax, EpilogueCombineScale, KVLEN_T, TABLE_T>;
+
+    UnSharedInferKernel unsharedInferKernel(tilingData);    unsharedInferKernel(params);
+    // Fused combine on the companion AIVs: wait for this core's AIC fixpipe drain,
+    // poll the shared magic slots, then run the combine epilogue on this core's rows.
+    unsharedInferKernel.RunFusedCombine(params);
 }
 
 
