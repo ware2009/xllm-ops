@@ -474,6 +474,7 @@ function(add_bin_compile_target)
     endforeach()
 
     set(_ops_target_list)
+    set(_ops_binary_dependencies)
     set(compile_scripts)
     file(GLOB scripts_list ${GEN_OUT_DIR}/*.sh)
     list(APPEND compile_scripts ${scripts_list})
@@ -612,6 +613,7 @@ function(add_bin_compile_target)
         if (_compile_flag)
             set(_BUILD_COMMAND)
             set(_BUILD_FLAG ${GEN_OUT_DIR}/${OP_TARGET_NAME}_${op_index}.done)
+            list(APPEND _ops_binary_dependencies ${_BUILD_FLAG})
             if (ENABLE_OPS_HOST OR ENABLE_HOST_TILING)
                 list(APPEND _BUILD_COMMAND export ASCEND_CUSTOM_OPP_PATH=${CUSTOM_DIR} &&)
             endif ()
@@ -648,6 +650,8 @@ function(add_bin_compile_target)
 
         add_custom_command(OUTPUT ${BINARY_INFO_CONFIG_FILE}
                 COMMAND ${HI_PYTHON} ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_ops_config.py -p ${BIN_OUT_DIR} -s ${BINARY_COMPUTE_UNIT}
+                DEPENDS ${_ops_binary_dependencies}
+                        ${ASCENDC_CMAKE_UTIL_DIR}/ascendc_ops_config.py
         )
 
         add_custom_target(${OPS_CONFIG_TARGET}

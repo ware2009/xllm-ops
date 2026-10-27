@@ -224,3 +224,27 @@ include(GoogleTest)
 gtest_discover_tests(group_gemm_gtest)
 gtest_discover_tests(multi_latent_attention_gtest)
 gtest_discover_tests(convert_kv_cache_format_test)
+
+# Host-only registration coverage uses the installed operator package rather
+# than compiling its inference source directly, so a missing build glob fails.
+if(EXISTS "${INCLUDE_BASE_DIR}/base/context_builder/op_infer_shape_context_builder.h"
+   AND EXISTS "${ASCEND_PATH}/pkg_inc/base/registry/op_impl_space_registry_v2.h")
+  add_executable(mega_gdn_mtp_decode_varlen_infershape_test
+    mega_gdn_mtp_decode_varlen_infershape_test.cpp
+  )
+  target_include_directories(mega_gdn_mtp_decode_varlen_infershape_test PRIVATE
+    "${INCLUDE_BASE_DIR}"
+    "${ASCEND_PATH}/pkg_inc"
+  )
+  target_compile_definitions(mega_gdn_mtp_decode_varlen_infershape_test PRIVATE
+    XLLM_OPS_PROTO_LIBRARY="${ASCEND_PATH}/opp/vendors/custom_xllm_math/op_proto/lib/linux/${CMAKE_SYSTEM_PROCESSOR}/libcust_opsproto_rt2.0.so"
+  )
+  target_link_libraries(mega_gdn_mtp_decode_varlen_infershape_test PRIVATE
+    GTest::gtest_main
+    "${ASCEND_PATH}/lib64/libmetadef.so"
+    "${ASCEND_PATH}/lib64/libopp_registry.so"
+    "${ASCEND_PATH}/lib64/libgraph.so"
+    "${ASCEND_PATH}/lib64/libgraph_base.so"
+  )
+  gtest_discover_tests(mega_gdn_mtp_decode_varlen_infershape_test)
+endif()
