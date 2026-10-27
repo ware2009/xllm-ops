@@ -343,6 +343,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "xllm_chunk_kda_fwd_prepare"
         "pre_process_fwd_kernel_merged"
         "merge_fwd_bwd_kernel"
+        "cross_attention"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend950"
