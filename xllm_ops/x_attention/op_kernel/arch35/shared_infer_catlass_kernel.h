@@ -374,6 +374,8 @@ class SharedFaInferKernel {
         uint32_t l1BufAddrStart = 0;
         uint32_t l0CBufAddrStart = 0;
         uint32_t ubBufAddrStart = 0;
+        int32_t lastOffsetBatchId{-1};
+        int32_t cachedKvBatchOffset{0};
 
     private:
         CATLASS_DEVICE void GetQTaskInfo(SharedInfer::TaskArgs &taskArgs, int32_t qTaskId) {
@@ -399,12 +401,18 @@ class SharedFaInferKernel {
                 taskArgs.maxOutOffset = (taskArgs.qCoord + taskArgs.halfBlockQOffset) * qHeads + qHeadId;
             }
 
-            int32_t batchOffset = 0;
-            for (int bId = 0; bId < batchId; bId++) {
-                batchOffset += sharedKvLensGm.GetValue(bId);
+            // qTaskId advances monotonically, so batchId is non-decreasing per core:
+            // cache the cumulative kv offset instead of re-reading sharedKvLensGm O(batch) times.
+            if (batchId != lastOffsetBatchId) {
+                int32_t batchOffset = 0;
+                for (int32_t bId = 0; bId < batchId; bId++) {
+                    batchOffset += sharedKvLensGm.GetValue(bId);
+                }
+                cachedKvBatchOffset = batchOffset;
+                lastOffsetBatchId = batchId;
             }
 
-            taskArgs.kvBatchOffset = batchOffset;
+            taskArgs.kvBatchOffset = cachedKvBatchOffset;
         }
 
         CATLASS_DEVICE void GetKvTaskInfo(SharedInfer::TaskArgs &taskArgs, int32_t kvBlockId, int32_t kvBlockNum, int32_t taskId) {

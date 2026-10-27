@@ -41,9 +41,36 @@ add_ops_compile_options(
             -Wno-deprecated-declarations
             -Werror
             ${CATLASS_ARCH_DEF}
+            -I${CMAKE_CURRENT_LIST_DIR}/../op_kernel/catlass
             -I${CANN_3RD_LIB_PATH}/catlass/include
             -I${CMAKE_CURRENT_LIST_DIR}/../../../
 )
+
+# XA catlass override drift guard: the op_kernel/catlass/ headers shadow the
+# vendored catlass files below. If the vendored file changes (catlass upgrade),
+# the shadowed copy must be rebased onto the new upstream version and the
+# expected MD5 updated here; otherwise semantics silently drift. A5-only: the
+# shadowed headers are ascend950 specializations never included by A3 builds.
+if(_XA_IS_A5)
+set(XA_CATLASS_BASE "${CANN_3RD_LIB_PATH}/catlass/include/catlass/epilogue/block")
+foreach(_xa_pair IN ITEMS
+    "block_epilogue_xa_shared_softmax_ascend950.hpp;98c51df84c40a58038b65fcb30895ec6"
+    "block_epilogue_xa_combine_scale_ascend950.hpp;3d99937e03e45cccd650d45583c33a02")
+    list(GET _xa_pair 0 _xa_file)
+    list(GET _xa_pair 1 _xa_md5)
+    set(_xa_upstream "${XA_CATLASS_BASE}/${_xa_file}")
+    if(EXISTS "${_xa_upstream}")
+        file(MD5 "${_xa_upstream}" _xa_actual)
+        if(NOT _xa_actual STREQUAL _xa_md5)
+            message(FATAL_ERROR
+                "XAttention catlass override: upstream ${_xa_file} changed "
+                "(md5 ${_xa_actual}, expected ${_xa_md5}). Rebase "
+                "xllm_ops/x_attention/op_kernel/catlass/catlass/epilogue/block/${_xa_file} "
+                "onto the new upstream version, then update the expected MD5 in op_host/CMakeLists.txt.")
+        endif()
+    endif()
+endforeach()
+endif()
 
 # Generate per-build arch config header consumed by the host tiling sources
 # (x_attention_tiling.h includes xa_arch_config.h). A5 builds get

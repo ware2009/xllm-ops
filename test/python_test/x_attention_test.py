@@ -274,10 +274,15 @@ def parse_args(argv=None):
     parser.add_argument('--repeat', type=int, default=3)
     parser.add_argument('--op-api-lib')
     parser.add_argument('--op-api-header')
-    parser.add_argument('--atol', type=float, default=1e-3)
-    parser.add_argument('--rtol', type=float, default=1e-2)
+    parser.add_argument('--atol', type=float, default=None)
+    parser.add_argument('--rtol', type=float, default=None)
     parser.add_argument('--output', default='xattention_synthetic')
     args = parser.parse_args(argv)
+    # Tolerances follow test_x_attention_with_cpu.py: bf16 0.01/0.01, fp16 1e-3/1e-3.
+    if args.atol is None:
+        args.atol = 0.01 if args.dtype == 'bf16' else 0.001
+    if args.rtol is None:
+        args.rtol = 0.01 if args.dtype == 'bf16' else 0.001
     positive = ('batch', 'beam_width', 'q_heads', 'kv_heads', 'shared_length',
                 'max_decode_steps', 'decode_steps', 'repeat')
     if any(getattr(args, name) <= 0 for name in positive):
