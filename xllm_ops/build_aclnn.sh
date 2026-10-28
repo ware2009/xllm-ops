@@ -138,6 +138,7 @@ elif [[ "$SOC_VERSION" =~ ^(ascend)?910b ]]; then
         ### JD's in-house operators ####
         "beam_search_group"
         "x_attention"
+        "cross_attention"
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
@@ -225,6 +226,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
          ### JD's in-house operators ####
         "beam_search_group"
         "x_attention"
+        "cross_attention"
         "cache_unshared_kv"
         "causal_conv1d"
         "causal_conv1d_qkv"
@@ -342,6 +344,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "xllm_chunk_kda_fwd_prepare"
         "pre_process_fwd_kernel_merged"
         "merge_fwd_bwd_kernel"
+        "cross_attention"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend950"
